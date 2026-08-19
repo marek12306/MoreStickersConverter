@@ -1,10 +1,13 @@
 import Fastify from 'fastify';
 import path from 'path';
-import {DATA_DIR} from './telegramStickers.js';
+import {DATA_DIR, generateStickerPackFilePath} from './telegramStickers.js';
 import fs from 'fs';
 interface ParamsType {
   stickerPackName: string;
   filename: string;
+}
+interface StickerPackParamsType {
+  stickerPackName: string;
 }
 
 const app = Fastify();
@@ -51,6 +54,37 @@ app.get(
         .send(fileStream);
     } catch {
       await reply.code(500).send('Internal server error');
+    }
+  },
+);
+
+app.get<{Params: StickerPackParamsType}>(
+  '/stickerpack/telegram/:stickerPackName',
+  async (request, reply) => {
+    const {stickerPackName} = request.params;
+
+    const stickerPackFilePath =
+      generateStickerPackFilePath(stickerPackName);
+
+    try {
+      await fs.promises.access(stickerPackFilePath, fs.constants.R_OK);
+
+      const fileStream = fs.createReadStream(stickerPackFilePath, {
+        highWaterMark: 64 * 1024,
+      });
+
+      const safeFilename = stickerPackName.replace(/[^a-zA-Z0-9_-]/g, '_');
+
+      await reply
+        .type('application/octet-stream')
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${safeFilename}.stickerpack"`,
+        )
+        .header('Cache-Control', 'no-cache')
+        .send(fileStream);
+    } catch {
+      await reply.code(404).send('Sticker pack not found');
     }
   },
 );
