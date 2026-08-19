@@ -3,6 +3,7 @@
   "compilerOptions": {
     "target": "esnext",
     "module": "nodenext",
+    "lib": ["esnext"],
     "rootDir": ".",
     "outDir": "build"
   },

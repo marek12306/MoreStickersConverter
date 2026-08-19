@@ -1,13 +1,11 @@
 import {Input, Telegraf} from 'telegraf';
 import {message} from 'telegraf/filters';
 import {
-  DATA_DIR,
   downloadStickerPack,
   isStickerPackDownloaded,
   generateStickerPackDirPath,
-  generateStickerPackFilePath
+  generateStickerPackFilePath,
 } from './telegramStickers.js';
-import path from 'path';
 import fsp from 'fs/promises';
 
 const bot: Telegraf = new Telegraf(process.env.BOT_TOKEN!);
@@ -39,14 +37,20 @@ bot.on(message('sticker'), async ctx => {
     await downloadStickerPack(ctx.telegram, stickerSet);
   } catch (e) {
     try {
-      await fsp.rm(generateStickerPackDirPath(stickerSet.name), { recursive: true, force: true });
-    } catch (e) {}
+      await fsp.rm(generateStickerPackDirPath(stickerSet.name), {
+        recursive: true,
+        force: true,
+      });
+    } catch {
+      // ignore cleanup error
+    }
     try {
-      await fsp.rm(mcStickerPackPath, { force: true });
-    } catch (e) {}
+      await fsp.rm(mcStickerPackPath, {force: true});
+    } catch {
+      // ignore cleanup error
+    }
     await ctx.reply('StickerPack download error.');
   }
-  
   try {
     await fsp.access(mcStickerPackPath);
   } catch {

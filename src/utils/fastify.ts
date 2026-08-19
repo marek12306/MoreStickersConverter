@@ -1,9 +1,7 @@
 import Fastify from 'fastify';
 import path from 'path';
 import {DATA_DIR} from './telegramStickers.js';
-import fsp from 'fs/promises';
 import fs from 'fs';
-
 interface ParamsType {
   stickerPackName: string;
   filename: string;
@@ -27,10 +25,19 @@ app.get(
       return;
     }
 
-    if (!/^(?:web[pm]|tgs)$/i.test(fileExtension)) {
+    if (!/^(?:web[pm]|tgs|gif)$/i.test(fileExtension)) {
       await reply.code(400).send('Invalid file extension');
       return;
     }
+
+    const mimeTypes: Record<string, string> = {
+      gif: 'image/gif',
+      webp: 'image/webp',
+      webm: 'video/webm',
+      tgs: 'application/octet-stream',
+    };
+    const contentType =
+      mimeTypes[fileExtension.toLowerCase()] || 'application/octet-stream';
 
     const stickerFilePath = path.join(DATA_DIR, stickerPackName, filename);
 
@@ -39,9 +46,7 @@ app.get(
         highWaterMark: 64 * 1024,
       });
       await reply
-        .type(
-          fileExtension === 'webp' ? 'image/webp' : 'application/octet-stream',
-        )
+        .type(contentType)
         .header('Cache-Control', 'public, max-age=31536000')
         .send(fileStream);
     } catch {

@@ -15,6 +15,7 @@ COPY src /app/src
 RUN pnpm run build && ls -laR /app/build
 
 FROM node:alpine
+RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY --from=build /app/build /app
 COPY --from=prod-deps /app/node_modules /app/node_modules

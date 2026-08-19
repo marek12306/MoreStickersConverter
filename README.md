@@ -9,8 +9,9 @@ This project includes both the Telegram bot logic and the HTTP server used to ho
 
 ## ✨ Features
 
-* Receive Telegram stickers from users
+* Receive Telegram stickers from users (static WebP, animated TGS, and video WebM)
 * Automatically download sticker assets
+* Server-side conversion of Telegram WebM video stickers to animated GIF (with adaptive compression targeting ~5 MB and a hard limit below 10 MB)
 * Convert stickers into `.stickerpack` format
 * Host sticker images through the built-in HTTP server
 * Stickerpacks reference external URLs instead of embedding images
@@ -53,5 +54,6 @@ You can build the image locally or use the prebuilt image from `ghcr.io/lekoowo/
 
 ## Notes
 
+* **Video Stickers & FFmpeg**: Telegram WebM video stickers are converted server-side to animated GIF using FFmpeg. FFmpeg is a required runtime dependency (included automatically in the Docker image).
 * Since stickerpacks rely on externally hosted images, make sure your server's external URL is reachable.
 * If using a reverse proxy, ensure that HTTPS is properly configured to avoid client-side loading errors.
