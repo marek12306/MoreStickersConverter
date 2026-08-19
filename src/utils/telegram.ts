@@ -10,7 +10,18 @@ import fsp from 'fs/promises';
 
 const bot: Telegraf = new Telegraf(process.env.BOT_TOKEN!);
 
+const allowedTelegramUserIds = new Set(
+  (process.env.ALLOWED_TELEGRAM_USER_IDS ?? '')
+    .split(',')
+    .map(id => id.trim())
+    .filter(Boolean),
+);
+
 bot.on(message('sticker'), async ctx => {
+  if (!ctx.from || !allowedTelegramUserIds.has(String(ctx.from.id))) {
+    return;
+  }
+
   // Get the sticker pack name
   const stickerPackName = ctx.message.sticker!.set_name;
   if (!stickerPackName) {
