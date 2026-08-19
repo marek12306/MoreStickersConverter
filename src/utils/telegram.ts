@@ -39,7 +39,10 @@ bot.on(message('sticker'), async ctx => {
       await ctx.reply('Error: Sticker pack not found.');
       return;
     }
-    await ctx.replyWithDocument(Input.fromLocalFile(mcStickerPackPath));
+    const stickerPackUrl =
+      `${process.env.EXTERNAL_URL}/stickerpack/telegram/${encodeURIComponent(stickerSet.name)}`;
+    
+    await ctx.reply(stickerPackUrl);
     return;
   }
 
@@ -68,7 +71,10 @@ bot.on(message('sticker'), async ctx => {
     await ctx.reply('Error: Sticker pack download error.');
     return;
   }
-  await ctx.replyWithDocument(Input.fromLocalFile(mcStickerPackPath));
+  const stickerPackUrl =
+  `${process.env.EXTERNAL_URL}/stickerpack/telegram/${encodeURIComponent(stickerSet.name)}`;
+
+  await ctx.reply(stickerPackUrl);
 });
 
 export {bot};
