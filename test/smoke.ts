@@ -945,19 +945,90 @@ console.log('Verified: legacy cache correctly detected and invalidated');
 
 const additionalCacheCases = [
   {
-    name: 'LegacyTgsPack',
-    sticker: {filename: 'sticker.tgs', isAnimated: true},
+    name: 'LegacyRawWebmNoFlag',
+    sticker: {filename: 'sticker.webm'},
     expectedLegacy: true,
   },
   {
-    name: 'LegacyGifPack',
-    sticker: {filename: 'sticker.gif', isAnimated: true},
+    name: 'LegacyRawTgsNoFlag',
+    sticker: {filename: 'sticker.tgs'},
     expectedLegacy: true,
+  },
+  {
+    name: 'AnimatedTgsWithReadyFlag',
+    sticker: {
+      filename: 'sticker.tgs',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'AnimatedWebpWithReadyFlag',
+    sticker: {
+      filename: 'sticker.webp',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'AnimatedPngWithReadyFlag',
+    sticker: {
+      filename: 'sticker.png',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'AnimatedGifFilenameWithTgsImage',
+    sticker: {
+      filename: 'sticker.gif',
+      image: 'https://example.test/sticker.tgs',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'AnimatedTgsFilenameWithGifImage',
+    sticker: {
+      filename: 'sticker.tgs',
+      image: 'https://example.test/sticker.gif',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'AnimatedGifFilenameWithWebpImage',
+    sticker: {
+      filename: 'sticker.gif',
+      image: 'https://example.test/sticker.webp',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'AnimatedUpperGifWithReadyFlag',
+    sticker: {
+      filename: 'sticker.GIF',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: false,
   },
   {
     name: 'StaticWebpPack',
     sticker: {filename: 'sticker.webp', isAnimated: false},
     expectedLegacy: false,
+  },
+  {
+    name: 'LegacyGifPack',
+    sticker: {filename: 'sticker.gif', isAnimated: true},
+    expectedLegacy: true,
   },
   {
     name: 'ReadyGifPack',
@@ -980,7 +1051,134 @@ for (const cacheCase of additionalCacheCases) {
     `${cacheCase.name} legacy state must match the manifest contract`,
   );
 }
-console.log('Verified: legacy TGS and stale GIF manifests are invalidated');
+
+// Test Logo Invariant Cases
+const logoCacheCases = [
+  {
+    name: 'LegacyTgsLogoModernStickersPack',
+    pack: {
+      logo: {
+        filename: 'logo.tgs',
+        image: 'https://example.test/logo.tgs',
+        isAnimated: true,
+        readyToUpload: true,
+      },
+      stickers: [
+        {
+          filename: 'sticker.gif',
+          image: 'https://example.test/sticker.gif',
+          isAnimated: true,
+          readyToUpload: true,
+        },
+      ],
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'RawTgsLogoModernStickersPack',
+    pack: {
+      logo: {
+        filename: 'logo.tgs',
+      },
+      stickers: [
+        {
+          filename: 'sticker.gif',
+          image: 'https://example.test/sticker.gif',
+          isAnimated: true,
+          readyToUpload: true,
+        },
+      ],
+    },
+    expectedLegacy: true,
+  },
+  {
+    name: 'ModernLogoModernStickersPack',
+    pack: {
+      logo: {
+        filename: 'logo.gif',
+        image: 'https://example.test/logo.gif',
+        isAnimated: true,
+        readyToUpload: true,
+      },
+      stickers: [
+        {
+          filename: 'sticker.gif',
+          image: 'https://example.test/sticker.gif',
+          isAnimated: true,
+          readyToUpload: true,
+        },
+      ],
+    },
+    expectedLegacy: false,
+  },
+];
+for (const logoCase of logoCacheCases) {
+  await fsp.writeFile(
+    generateStickerPackFilePath(logoCase.name),
+    JSON.stringify(logoCase.pack),
+  );
+  assert.equal(
+    await isLegacyStickerPack(logoCase.name),
+    logoCase.expectedLegacy,
+    `${logoCase.name} logo legacy state must match expected ${logoCase.expectedLegacy}`,
+  );
+}
+console.log(
+  'Verified: legacy TGS, non-GIF, logo, and stale GIF manifests are invalidated',
+);
+
+const staleAnimatedTgsPackName = 'LegacyAnimatedTgsInvariantPack';
+const staleAnimatedTgsPackDir = generateStickerPackDirPath(
+  staleAnimatedTgsPackName,
+);
+const staleAnimatedTgsPackFile = generateStickerPackFilePath(
+  staleAnimatedTgsPackName,
+);
+await fsp.mkdir(staleAnimatedTgsPackDir, {recursive: true});
+await fsp.writeFile(path.join(staleAnimatedTgsPackDir, 'sticker.tgs'), 'dummy');
+await fsp.writeFile(
+  staleAnimatedTgsPackFile,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${staleAnimatedTgsPackName}`,
+    title: 'Legacy Animated TGS Invariant Pack',
+    logo: {
+      id: `MoreStickers:Telegram:Sticker:${staleAnimatedTgsPackName}:sticker1`,
+      image: `https://stickers.example.com/sticker/telegram/${staleAnimatedTgsPackName}/sticker1.tgs`,
+      title: '😀',
+      stickerPackId: `MoreStickers:Telegram:Pack:${staleAnimatedTgsPackName}`,
+      filename: 'sticker.tgs',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${staleAnimatedTgsPackName}:sticker1`,
+        image: `https://stickers.example.com/sticker/telegram/${staleAnimatedTgsPackName}/sticker1.tgs`,
+        title: '😀',
+        stickerPackId: `MoreStickers:Telegram:Pack:${staleAnimatedTgsPackName}`,
+        filename: 'sticker.tgs',
+        isAnimated: true,
+        readyToUpload: true,
+      },
+    ],
+  }),
+);
+assert.equal(
+  await isStickerPackDownloaded(staleAnimatedTgsPackName),
+  false,
+  'Animated TGS with readyToUpload:true must still invalidate the cache',
+);
+assert.equal(
+  fs.existsSync(staleAnimatedTgsPackDir),
+  false,
+  'Legacy animated TGS pack directory must be removed',
+);
+assert.equal(
+  fs.existsSync(staleAnimatedTgsPackFile),
+  false,
+  'Legacy animated TGS manifest must be removed',
+);
+console.log('Verified: stale animated TGS cache is invalidated');
 
 const staleGifPackName = 'LegacyGifInvalidationPack';
 const staleGifPackDir = generateStickerPackDirPath(staleGifPackName);
@@ -1009,7 +1207,6 @@ assert.equal(
   'Stale animated GIF manifest must be removed',
 );
 console.log('Verified: stale animated GIF cache is invalidated');
-
 // Test 6: Modern Pack Cache (WebP / GIF)
 console.log('Testing modern pack cache...');
 const modernPackName = 'ModernTestPack';

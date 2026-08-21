@@ -103,6 +103,34 @@ export async function fetchStickerWithRetry(
   );
 }
 
+function isLegacySticker(sticker: McSticker): boolean {
+  if (!sticker || typeof sticker !== 'object') {
+    return false;
+  }
+  const filename = sticker.filename?.toLowerCase();
+  const image = sticker.image?.toLowerCase();
+
+  const hasRawAnimatedSource =
+    filename?.endsWith('.webm') ||
+    filename?.endsWith('.tgs') ||
+    image?.endsWith('.webm') ||
+    image?.endsWith('.tgs');
+
+  const hasNonGifAnimatedOutput =
+    sticker.isAnimated === true &&
+    ((filename !== undefined && !filename.endsWith('.gif')) ||
+      (image !== undefined && !image.endsWith('.gif')));
+
+  const hasLegacyAnimatedManifest =
+    sticker.isAnimated === true && sticker.readyToUpload !== true;
+
+  return Boolean(
+    hasRawAnimatedSource ||
+      hasNonGifAnimatedOutput ||
+      hasLegacyAnimatedManifest,
+  );
+}
+
 export async function isLegacyStickerPack(
   stickerSetName: string,
 ): Promise<boolean> {
@@ -110,20 +138,11 @@ export async function isLegacyStickerPack(
   try {
     const rawData = await fsp.readFile(mcStickerPackPath, 'utf8');
     const pack = JSON.parse(rawData) as StickerPack;
+    if (pack.logo && isLegacySticker(pack.logo)) {
+      return true;
+    }
     if (Array.isArray(pack.stickers)) {
-      return pack.stickers.some(sticker => {
-        const filename = sticker.filename?.toLowerCase();
-        const image = sticker.image?.toLowerCase();
-        const hasUnconvertedAnimation =
-          filename?.endsWith('.webm') ||
-          filename?.endsWith('.tgs') ||
-          image?.endsWith('.webm') ||
-          image?.endsWith('.tgs');
-        return (
-          hasUnconvertedAnimation ||
-          (sticker.isAnimated === true && sticker.readyToUpload !== true)
-        );
-      });
+      return pack.stickers.some(isLegacySticker);
     }
     return false;
   } catch {
