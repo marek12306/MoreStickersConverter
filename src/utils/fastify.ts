@@ -63,8 +63,7 @@ app.get<{Params: StickerPackParamsType}>(
   async (request, reply) => {
     const {stickerPackName} = request.params;
 
-    const stickerPackFilePath =
-      generateStickerPackFilePath(stickerPackName);
+    const stickerPackFilePath = generateStickerPackFilePath(stickerPackName);
 
     try {
       await fs.promises.access(stickerPackFilePath, fs.constants.R_OK);

@@ -8,6 +8,7 @@ import {Telegram} from 'telegraf';
 import {StickerPack, Sticker as McSticker} from './mcStickerPack.js';
 import {Sticker, StickerSet} from 'telegraf/types';
 import {convertWebmToGif} from './webmToGif.js';
+import {convertTgsToGif} from './tgsToGif.js';
 const DATA_DIR = path.join(path.resolve(process.env.DATA_DIR!), 'telegram');
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '5', 10);
 const MC_STICKER_PACK_ID_PREFIX = 'MoreStickers:Telegram:Pack';
@@ -40,6 +41,7 @@ export function generateStickerPackFilePath(stickerSetName: string) {
 
 export interface StickerMediaInfo {
   isVideoSticker: boolean;
+  isTgsSticker: boolean;
   outputFileType: string;
   isAnimated: boolean;
 }
@@ -51,11 +53,16 @@ export function getStickerMediaInfo(
   const normalizedSourceFileType = sourceFileType.toLowerCase();
   const isVideoSticker =
     Boolean(sticker.is_video) || normalizedSourceFileType === 'webm';
+  const isTgsSticker =
+    !isVideoSticker &&
+    (Boolean(sticker.is_animated) || normalizedSourceFileType === 'tgs');
+  const isAnimated = isVideoSticker || isTgsSticker;
 
   return {
     isVideoSticker,
-    outputFileType: isVideoSticker ? 'gif' : normalizedSourceFileType,
-    isAnimated: Boolean(sticker.is_animated || isVideoSticker),
+    isTgsSticker,
+    outputFileType: isAnimated ? 'gif' : normalizedSourceFileType,
+    isAnimated,
   };
 }
 
@@ -104,11 +111,19 @@ export async function isLegacyStickerPack(
     const rawData = await fsp.readFile(mcStickerPackPath, 'utf8');
     const pack = JSON.parse(rawData) as StickerPack;
     if (Array.isArray(pack.stickers)) {
-      return pack.stickers.some(
-        sticker =>
-          sticker.filename?.toLowerCase().endsWith('.webm') ||
-          sticker.image?.toLowerCase().endsWith('.webm'),
-      );
+      return pack.stickers.some(sticker => {
+        const filename = sticker.filename?.toLowerCase();
+        const image = sticker.image?.toLowerCase();
+        const hasUnconvertedAnimation =
+          filename?.endsWith('.webm') ||
+          filename?.endsWith('.tgs') ||
+          image?.endsWith('.webm') ||
+          image?.endsWith('.tgs');
+        return (
+          hasUnconvertedAnimation ||
+          (sticker.isAnimated === true && sticker.readyToUpload !== true)
+        );
+      });
     }
     return false;
   } catch {
@@ -163,7 +178,7 @@ async function downloadSingleSticker(
 ): Promise<void> {
   const stickerFile = await telegram.getFile(sticker.file_id);
   const sourceFileType = stickerFile.file_path?.split('.').pop() || '';
-  const {isVideoSticker} = getStickerMediaInfo(sticker, sourceFileType);
+  const mediaInfo = getStickerMediaInfo(sticker, sourceFileType);
   const stickerPackDirPath = generateStickerPackDirPath(stickerSet.name);
 
   const fileLink = await telegram.getFileLink(stickerFile.file_id);
@@ -172,10 +187,11 @@ async function downloadSingleSticker(
     sticker.file_unique_id,
   );
 
-  if (isVideoSticker) {
-    const tempWebmPath = path.join(
+  if (mediaInfo.isAnimated) {
+    const sourceExtension = mediaInfo.isVideoSticker ? 'webm' : 'tgs';
+    const tempSourcePath = path.join(
       stickerPackDirPath,
-      `${sticker.file_unique_id}.source.${randomUUID()}.webm`,
+      `${sticker.file_unique_id}.source.${randomUUID()}.${sourceExtension}`,
     );
     const finalGifPath = path.join(
       stickerPackDirPath,
@@ -185,27 +201,27 @@ async function downloadSingleSticker(
     try {
       await pipeline(
         Readable.fromWeb(response.body!),
-        fs.createWriteStream(tempWebmPath),
+        fs.createWriteStream(tempSourcePath),
       );
-
-      await convertWebmToGif(tempWebmPath, finalGifPath);
-    } finally {
-      try {
-        await fsp.unlink(tempWebmPath);
-      } catch {
-        // ignore cleanup error
+      if (mediaInfo.isVideoSticker) {
+        await convertWebmToGif(tempSourcePath, finalGifPath);
+      } else {
+        await convertTgsToGif(tempSourcePath, finalGifPath);
       }
+    } finally {
+      await fsp.unlink(tempSourcePath).catch(() => undefined);
     }
-  } else {
-    const stickerFilePath = path.join(
-      stickerPackDirPath,
-      `${sticker.file_unique_id}.${sourceFileType}`,
-    );
-    await pipeline(
-      Readable.fromWeb(response.body!),
-      fs.createWriteStream(stickerFilePath),
-    );
+    return;
   }
+
+  const stickerFilePath = path.join(
+    stickerPackDirPath,
+    `${sticker.file_unique_id}.${mediaInfo.outputFileType}`,
+  );
+  await pipeline(
+    Readable.fromWeb(response.body!),
+    fs.createWriteStream(stickerFilePath),
+  );
 }
 
 async function downloadWorker(
@@ -258,6 +274,7 @@ async function toMcStickerPack(
       stickerPackId: toMcStickerPackId(stickerSet.name),
       filename: `${sticker.file_unique_id}.${outputFileType}`,
       isAnimated,
+      ...(isAnimated ? {readyToUpload: true} : {}),
     } as McSticker;
   });
   const stickers = await Promise.all(stickerPs);

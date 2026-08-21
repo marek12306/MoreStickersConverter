@@ -19,6 +19,7 @@
             nodejs_22
             pnpm
             ffmpeg
+            lottieconverter
           ];
         };
       });

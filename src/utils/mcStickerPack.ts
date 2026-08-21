@@ -5,6 +5,7 @@ export interface Sticker {
   stickerPackId: StickerPackMeta['id'];
   filename?: string;
   isAnimated?: boolean;
+  readyToUpload?: boolean;
 }
 
 export interface StickerPackMeta {
