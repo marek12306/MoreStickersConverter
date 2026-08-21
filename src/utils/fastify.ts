@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import cors from '@fastify/cors';
 import path from 'path';
 import {DATA_DIR, generateStickerPackFilePath} from './telegramStickers.js';
 import fs from 'fs';
@@ -11,6 +12,11 @@ interface StickerPackParamsType {
 }
 
 const app = Fastify();
+
+await app.register(cors, {
+  origin: '*',
+  methods: ['GET', 'HEAD', 'OPTIONS'],
+});
 
 app.get(
   '/sticker/telegram/:stickerPackName/:filename',

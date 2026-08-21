@@ -1271,24 +1271,51 @@ assert.ok(
 );
 console.log('Verified: modern pack cache preserved');
 
-// Test 7: Fastify endpoint with GIF and MIME types
-console.log('Testing Fastify endpoint for .gif...');
+// Test 7: Fastify endpoint with GIF, manifests, and CORS
+console.log('Testing Fastify endpoints and CORS...');
 const packName = 'TestPackHttp';
 const packDir = generateStickerPackDirPath(packName);
+const manifestFilePath = generateStickerPackFilePath(packName);
 await fsp.mkdir(packDir, {recursive: true});
 
 const sampleGifDest = path.join(packDir, 'test_sticker.gif');
 await fsp.copyFile(testGifPath, sampleGifDest);
+await fsp.writeFile(
+  manifestFilePath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${packName}`,
+    title: 'Test Pack Http',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${packName}:test_sticker`,
+        image: `https://stickers.example.com/sticker/telegram/${packName}/test_sticker.gif`,
+        title: '😀',
+        stickerPackId: `MoreStickers:Telegram:Pack:${packName}`,
+        filename: 'test_sticker.gif',
+        isAnimated: true,
+        readyToUpload: true,
+      },
+    ],
+  }),
+);
 
 const gifResponse = await app.inject({
   method: 'GET',
   url: `/sticker/telegram/${packName}/test_sticker.gif`,
+  headers: {
+    origin: 'https://discord.com',
+  },
 });
 
 assert.equal(
   gifResponse.statusCode,
   200,
   `Expected 200 for .gif, got ${gifResponse.statusCode}`,
+);
+assert.equal(
+  gifResponse.headers['access-control-allow-origin'],
+  '*',
+  `Expected Access-Control-Allow-Origin: *, got ${gifResponse.headers['access-control-allow-origin']}`,
 );
 assert.equal(
   gifResponse.headers['content-type'],
@@ -1300,8 +1327,185 @@ assert.equal(
   'public, max-age=31536000',
   `Expected cache-control header, got ${gifResponse.headers['cache-control']}`,
 );
-console.log('Verified: Fastify correctly serves .gif with image/gif');
 
+const gifHeadResponse = await app.inject({
+  method: 'HEAD',
+  url: `/sticker/telegram/${packName}/test_sticker.gif`,
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+
+assert.equal(
+  gifHeadResponse.statusCode,
+  200,
+  `Expected 200 for HEAD .gif, got ${gifHeadResponse.statusCode}`,
+);
+assert.equal(
+  gifHeadResponse.headers['access-control-allow-origin'],
+  '*',
+  `Expected Access-Control-Allow-Origin: *, got ${gifHeadResponse.headers['access-control-allow-origin']}`,
+);
+assert.equal(
+  gifHeadResponse.headers['content-type'],
+  'image/gif',
+  `Expected Content-Type image/gif for HEAD, got ${gifHeadResponse.headers['content-type']}`,
+);
+assert.equal(
+  gifHeadResponse.headers['cache-control'],
+  'public, max-age=31536000',
+  `Expected cache-control header for HEAD, got ${gifHeadResponse.headers['cache-control']}`,
+);
+assert.equal(
+  gifHeadResponse.body,
+  '',
+  `Expected empty body for HEAD, got length ${gifHeadResponse.body.length}`,
+);
+
+const gifOptionsResponse = await app.inject({
+  method: 'OPTIONS',
+  url: `/sticker/telegram/${packName}/test_sticker.gif`,
+  headers: {
+    origin: 'https://discord.com',
+    'access-control-request-method': 'GET',
+  },
+});
+
+assert.equal(
+  gifOptionsResponse.statusCode,
+  204,
+  `Expected 204 for OPTIONS .gif, got ${gifOptionsResponse.statusCode}`,
+);
+assert.equal(
+  gifOptionsResponse.headers['access-control-allow-origin'],
+  '*',
+  `Expected Access-Control-Allow-Origin: *, got ${gifOptionsResponse.headers['access-control-allow-origin']}`,
+);
+const assetAllowedMethods = (
+  (gifOptionsResponse.headers['access-control-allow-methods'] as string) || ''
+)
+  .split(',')
+  .map(m => m.trim().toUpperCase());
+assert.ok(
+  assetAllowedMethods.includes('GET'),
+  'Access-Control-Allow-Methods must include GET',
+);
+assert.ok(
+  assetAllowedMethods.includes('HEAD'),
+  'Access-Control-Allow-Methods must include HEAD',
+);
+assert.ok(
+  assetAllowedMethods.includes('OPTIONS'),
+  'Access-Control-Allow-Methods must include OPTIONS',
+);
+
+const manifestResponse = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+
+assert.equal(
+  manifestResponse.statusCode,
+  200,
+  `Expected 200 for manifest GET, got ${manifestResponse.statusCode}`,
+);
+assert.equal(
+  manifestResponse.headers['access-control-allow-origin'],
+  '*',
+  `Expected Access-Control-Allow-Origin: *, got ${manifestResponse.headers['access-control-allow-origin']}`,
+);
+assert.equal(
+  manifestResponse.headers['content-type'],
+  'application/octet-stream',
+  `Expected Content-Type application/octet-stream for manifest, got ${manifestResponse.headers['content-type']}`,
+);
+assert.equal(
+  manifestResponse.headers['cache-control'],
+  'no-cache',
+  `Expected cache-control: no-cache for manifest, got ${manifestResponse.headers['cache-control']}`,
+);
+assert.equal(
+  manifestResponse.headers['content-disposition'],
+  `attachment; filename="${packName}.stickerpack"`,
+  `Expected Content-Disposition header for manifest, got ${manifestResponse.headers['content-disposition']}`,
+);
+
+const manifestHeadResponse = await app.inject({
+  method: 'HEAD',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+
+assert.equal(
+  manifestHeadResponse.statusCode,
+  200,
+  `Expected 200 for manifest HEAD, got ${manifestHeadResponse.statusCode}`,
+);
+assert.equal(
+  manifestHeadResponse.headers['access-control-allow-origin'],
+  '*',
+  `Expected Access-Control-Allow-Origin: *, got ${manifestHeadResponse.headers['access-control-allow-origin']}`,
+);
+assert.equal(
+  manifestHeadResponse.headers['content-type'],
+  'application/octet-stream',
+  `Expected Content-Type application/octet-stream for manifest HEAD, got ${manifestHeadResponse.headers['content-type']}`,
+);
+assert.equal(
+  manifestHeadResponse.headers['cache-control'],
+  'no-cache',
+  `Expected cache-control: no-cache for manifest HEAD, got ${manifestHeadResponse.headers['cache-control']}`,
+);
+assert.equal(
+  manifestHeadResponse.body,
+  '',
+  `Expected empty body for manifest HEAD, got length ${manifestHeadResponse.body.length}`,
+);
+
+const manifestOptionsResponse = await app.inject({
+  method: 'OPTIONS',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    origin: 'https://discord.com',
+    'access-control-request-method': 'GET',
+  },
+});
+
+assert.equal(
+  manifestOptionsResponse.statusCode,
+  204,
+  `Expected 204 for manifest OPTIONS, got ${manifestOptionsResponse.statusCode}`,
+);
+assert.equal(
+  manifestOptionsResponse.headers['access-control-allow-origin'],
+  '*',
+  `Expected Access-Control-Allow-Origin: *, got ${manifestOptionsResponse.headers['access-control-allow-origin']}`,
+);
+const manifestAllowedMethods = (
+  (manifestOptionsResponse.headers['access-control-allow-methods'] as string) ||
+  ''
+)
+  .split(',')
+  .map(m => m.trim().toUpperCase());
+assert.ok(
+  manifestAllowedMethods.includes('GET'),
+  'Manifest Access-Control-Allow-Methods must include GET',
+);
+assert.ok(
+  manifestAllowedMethods.includes('HEAD'),
+  'Manifest Access-Control-Allow-Methods must include HEAD',
+);
+assert.ok(
+  manifestAllowedMethods.includes('OPTIONS'),
+  'Manifest Access-Control-Allow-Methods must include OPTIONS',
+);
+
+console.log('Verified: Fastify correctly serves .gif and manifest with CORS');
 // Test 8: Fastify invalid extension real request & assertion
 console.log('Testing Fastify endpoint for invalid extension .exe...');
 const invalidResponse = await app.inject({

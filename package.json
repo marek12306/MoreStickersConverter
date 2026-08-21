@@ -20,6 +20,7 @@
     "typescript": "^5.6.3"
   },
   "dependencies": {
+    "@fastify/cors": "^11.3.0",
     "fastify": "^5.0.0",
     "telegraf": "^4.16.3"
   },
