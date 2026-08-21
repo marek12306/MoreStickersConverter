@@ -11,8 +11,9 @@ export interface GifEncodingProfile {
 
 export const GIF_TARGET_BYTES = 5_000_000;
 export const GIF_SAFE_HARD_LIMIT_BYTES = 9_500_000;
+export const GIF_DIMENSION_SCALE = 0.5;
 
-export const GIF_ENCODING_PROFILES: GifEncodingProfile[] = [
+const BASE_GIF_ENCODING_PROFILES: GifEncodingProfile[] = [
   {maxDimension: 384, fps: 24, maxColors: 192, bayerScale: 3},
   {maxDimension: 320, fps: 20, maxColors: 160, bayerScale: 3},
   {maxDimension: 288, fps: 18, maxColors: 128, bayerScale: 3},
@@ -24,6 +25,15 @@ export const GIF_ENCODING_PROFILES: GifEncodingProfile[] = [
   {maxDimension: 96, fps: 6, maxColors: 32, bayerScale: 5},
   {maxDimension: 80, fps: 5, maxColors: 24, bayerScale: 5},
 ];
+
+export const GIF_ENCODING_PROFILES: GifEncodingProfile[] =
+  BASE_GIF_ENCODING_PROFILES.map(profile => ({
+    ...profile,
+    maxDimension: Math.max(
+      1,
+      Math.round(profile.maxDimension * GIF_DIMENSION_SCALE),
+    ),
+  }));
 
 const TGS_FPS_BY_PROFILE = [20, 20, 20, 10, 10, 10, 10, 5, 5, 5] as const;
 

@@ -4,13 +4,19 @@ import {
   type ConversionResult,
   type GifEncoder,
   type GifEncodingProfile,
+  GIF_DIMENSION_SCALE,
   GIF_ENCODING_PROFILES,
   GIF_SAFE_HARD_LIMIT_BYTES,
   GIF_TARGET_BYTES,
 } from './gifConversion.js';
 
 export type {ConversionResult, GifEncoder, GifEncodingProfile};
-export {GIF_ENCODING_PROFILES, GIF_SAFE_HARD_LIMIT_BYTES, GIF_TARGET_BYTES};
+export {
+  GIF_DIMENSION_SCALE,
+  GIF_ENCODING_PROFILES,
+  GIF_SAFE_HARD_LIMIT_BYTES,
+  GIF_TARGET_BYTES,
+};
 export const GIF_HARD_LIMIT_BYTES = 10_000_000;
 
 export function buildFfmpegFilter(profile: GifEncodingProfile): string {

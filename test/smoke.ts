@@ -19,8 +19,10 @@ process.env.PORT = '3000';
 import type {GifEncoder} from '../src/utils/webmToGif.js';
 import type {Telegram} from 'telegraf';
 const {
+  buildFfmpegFilter,
   convertWebmToGif,
   convertWebmToGifWithEncoder,
+  GIF_DIMENSION_SCALE,
   GIF_ENCODING_PROFILES,
   GIF_TARGET_BYTES,
   GIF_SAFE_HARD_LIMIT_BYTES,
@@ -47,15 +49,17 @@ const {app} = await import('../src/utils/fastify.js');
 
 console.log('--- Starting Smoke Tests in Nix Environment ---');
 
-const profile160 = GIF_ENCODING_PROFILES.find(
-  profile => profile.maxDimension === 160,
+assert.equal(GIF_DIMENSION_SCALE, 0.5, 'GIF dimension scale must be 0.5');
+assert.deepEqual(
+  GIF_ENCODING_PROFILES.map(profile => profile.maxDimension),
+  [192, 160, 144, 128, 112, 96, 80, 64, 48, 40],
+  'GIF profiles must use half-size output dimensions',
 );
-assert.deepEqual(profile160, {
-  maxDimension: 160,
-  fps: 10,
-  maxColors: 64,
-  bayerScale: 4,
-});
+assert.deepEqual(
+  TGS_GIF_ENCODING_PROFILES.map(profile => profile.maxDimension),
+  GIF_ENCODING_PROFILES.map(profile => profile.maxDimension),
+  'TGS and WebM GIF profiles must use the same scaled dimensions',
+);
 assert.equal(
   TGS_GIF_ENCODING_PROFILES.length,
   GIF_ENCODING_PROFILES.length,
@@ -83,6 +87,18 @@ for (const profile of TGS_GIF_ENCODING_PROFILES) {
     `TGS FPS ${profile.fps} must divide Telegram's 60 FPS source`,
   );
 }
+
+const firstWebmProfile = GIF_ENCODING_PROFILES[0];
+assert.equal(firstWebmProfile.maxDimension, 192);
+const firstWebmFilter = buildFfmpegFilter(firstWebmProfile);
+assert.ok(
+  firstWebmFilter.includes('min(192,iw)'),
+  `Expected WebM filter to use scaled max dimension 192, got ${firstWebmFilter}`,
+);
+assert.ok(
+  firstWebmFilter.includes('min(192,ih)'),
+  `Expected WebM filter to use scaled max dimension 192, got ${firstWebmFilter}`,
+);
 
 // Test 1: Unit Tests for getStickerMediaInfo
 console.log('Testing getStickerMediaInfo...');
@@ -509,11 +525,20 @@ assert.equal(probeResult.status, 0, 'ffprobe failed on generated GIF');
 const probeData = JSON.parse(probeResult.stdout.toString('utf8'));
 const stream = probeData.streams[0];
 assert.equal(stream.codec_name, 'gif', 'Output file is not GIF codec');
+const webmOutputWidth = Number(stream.width);
+const webmOutputHeight = Number(stream.height);
+assert.ok(
+  webmOutputWidth <= conversionResult.profile.maxDimension,
+  `WebM GIF width (${webmOutputWidth}) exceeds profile limit (${conversionResult.profile.maxDimension})`,
+);
+assert.ok(
+  webmOutputHeight <= conversionResult.profile.maxDimension,
+  `WebM GIF height (${webmOutputHeight}) exceeds profile limit (${conversionResult.profile.maxDimension})`,
+);
 assert.ok(
   Number(stream.nb_read_frames) > 1,
   `GIF must be animated with multiple frames, got: ${stream.nb_read_frames}`,
 );
-
 // Verify Pixel (0,0) is Transparent (alpha = 0)
 const transparentPixelResult = spawnSync('ffmpeg', [
   '-v',
@@ -542,14 +567,16 @@ assert.equal(
   `Expected alpha = 0 at transparent corner (0,0), got ${transparentPixelResult.stdout[3]}`,
 );
 
-// Verify Pixel (150,150) is Opaque Red (alpha = 255)
+const centerX = Math.floor(webmOutputWidth / 2);
+const centerY = Math.floor(webmOutputHeight / 2);
+// Verify Pixel (centerX,centerY) is Opaque Red (alpha = 255)
 const opaquePixelResult = spawnSync('ffmpeg', [
   '-v',
   'error',
   '-i',
   testGifPath,
   '-vf',
-  'select=eq(n\\,0),format=rgba,crop=1:1:150:150',
+  `select=eq(n\\,0),format=rgba,crop=1:1:${centerX}:${centerY}`,
   '-frames:v',
   '1',
   '-f',
@@ -561,15 +588,14 @@ const opaquePixelResult = spawnSync('ffmpeg', [
 assert.equal(
   opaquePixelResult.status,
   0,
-  'FFmpeg pixel extraction failed at (150,150)',
+  `FFmpeg pixel extraction failed at (${centerX},${centerY})`,
 );
 assert.equal(opaquePixelResult.stdout.length, 4, 'Expected 4 bytes RGBA');
 assert.equal(
   opaquePixelResult.stdout[3],
   255,
-  `Expected alpha = 255 at opaque center (150,150), got ${opaquePixelResult.stdout[3]}`,
+  `Expected alpha = 255 at opaque center (${centerX},${centerY}), got ${opaquePixelResult.stdout[3]}`,
 );
-
 console.log(
   `Verified GIF: codec=${stream.codec_name}, dimensions=${stream.width}x${stream.height}, frames=${stream.nb_read_frames}, transparent pixel alpha=0, opaque pixel alpha=255`,
 );
@@ -731,7 +757,13 @@ if (lottieConverterUnavailable) {
       );
       const normConv = spawnSync(
         'lottieconverter',
-        [normalizedInputPath, normOutPath, 'gif', '384x384', String(fps)],
+        [
+          normalizedInputPath,
+          normOutPath,
+          'gif',
+          `${GIF_ENCODING_PROFILES[0].maxDimension}x${GIF_ENCODING_PROFILES[0].maxDimension}`,
+          String(fps),
+        ],
         {encoding: 'utf8'},
       );
       assert.equal(
@@ -828,6 +860,14 @@ if (lottieConverterUnavailable) {
   const outputHeight = Number(tgsStream.height);
   assert.ok(outputWidth > 0, 'TGS GIF width must be positive');
   assert.ok(outputHeight > 0, 'TGS GIF height must be positive');
+  assert.ok(
+    outputWidth <= tgsResult.profile.maxDimension,
+    `TGS GIF width (${outputWidth}) must be <= profile maxDimension (${tgsResult.profile.maxDimension})`,
+  );
+  assert.ok(
+    outputHeight <= tgsResult.profile.maxDimension,
+    `TGS GIF height (${outputHeight}) must be <= profile maxDimension (${tgsResult.profile.maxDimension})`,
+  );
   assert.ok(
     Number(tgsStream.nb_read_frames) > 1,
     `TGS GIF must contain multiple frames, got ${tgsStream.nb_read_frames}`,
