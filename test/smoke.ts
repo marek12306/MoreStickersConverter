@@ -1419,8 +1419,14 @@ assert.equal(
 );
 assert.equal(
   manifestResponse.headers['content-type'],
-  'application/octet-stream',
-  `Expected Content-Type application/octet-stream for manifest, got ${manifestResponse.headers['content-type']}`,
+  'application/json; charset=utf-8',
+  `Expected Content-Type application/json; charset=utf-8 for manifest, got ${manifestResponse.headers['content-type']}`,
+);
+const parsedManifest = JSON.parse(manifestResponse.body);
+assert.equal(
+  parsedManifest.id,
+  `MoreStickers:Telegram:Pack:${packName}`,
+  'Manifest body must parse as valid JSON matching pack id',
 );
 assert.equal(
   manifestResponse.headers['cache-control'],
@@ -1453,8 +1459,8 @@ assert.equal(
 );
 assert.equal(
   manifestHeadResponse.headers['content-type'],
-  'application/octet-stream',
-  `Expected Content-Type application/octet-stream for manifest HEAD, got ${manifestHeadResponse.headers['content-type']}`,
+  'application/json; charset=utf-8',
+  `Expected Content-Type application/json; charset=utf-8 for manifest HEAD, got ${manifestHeadResponse.headers['content-type']}`,
 );
 assert.equal(
   manifestHeadResponse.headers['cache-control'],
@@ -1465,6 +1471,11 @@ assert.equal(
   manifestHeadResponse.body,
   '',
   `Expected empty body for manifest HEAD, got length ${manifestHeadResponse.body.length}`,
+);
+assert.equal(
+  manifestHeadResponse.headers['content-disposition'],
+  `attachment; filename="${packName}.stickerpack"`,
+  `Expected Content-Disposition header for manifest HEAD, got ${manifestHeadResponse.headers['content-disposition']}`,
 );
 
 const manifestOptionsResponse = await app.inject({

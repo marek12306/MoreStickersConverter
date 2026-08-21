@@ -81,7 +81,7 @@ app.get<{Params: StickerPackParamsType}>(
       const safeFilename = stickerPackName.replace(/[^a-zA-Z0-9_-]/g, '_');
 
       await reply
-        .type('application/octet-stream')
+        .type('application/json; charset=utf-8')
         .header(
           'Content-Disposition',
           `attachment; filename="${safeFilename}.stickerpack"`,
