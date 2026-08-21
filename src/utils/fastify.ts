@@ -1,7 +1,11 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import path from 'path';
-import {DATA_DIR, generateStickerPackFilePath} from './telegramStickers.js';
+import {
+  DATA_DIR,
+  generateStickerPackFilePath,
+  generateStickerPreviewFilePath,
+} from './telegramStickers.js';
 import fs from 'fs';
 interface ParamsType {
   stickerPackName: string;
@@ -65,6 +69,62 @@ app.get(
       });
       await reply
         .type(contentType)
+        .header('Cache-Control', 'public, max-age=31536000')
+        .send(fileStream);
+    } catch {
+      await reply.code(500).send('Internal server error');
+    }
+  },
+);
+app.get(
+  '/preview/telegram/:stickerPackName/:filename',
+  async (request, reply) => {
+    const {stickerPackName, filename} = request.params as unknown as ParamsType;
+
+    const extension = path.extname(filename);
+    const stickerId = path.basename(filename, extension);
+    const fileExtension = extension.slice(1).toLowerCase();
+
+    if (!/^[a-z0-9_]+$/i.test(stickerPackName)) {
+      await reply.code(400).send('Invalid sticker pack name');
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/i.test(stickerId)) {
+      await reply.code(400).send('Invalid sticker id');
+      return;
+    }
+
+    if (fileExtension !== 'webp') {
+      await reply.code(400).send('Invalid file extension');
+      return;
+    }
+
+    const canonicalFilename = `${stickerId}.${fileExtension}`;
+
+    if (
+      path.basename(filename) !== filename ||
+      filename.toLowerCase() !== canonicalFilename.toLowerCase()
+    ) {
+      await reply.code(400).send('Invalid filename');
+      return;
+    }
+
+    const previewFilePath = generateStickerPreviewFilePath(
+      stickerPackName,
+      stickerId,
+    );
+
+    if (!fs.existsSync(previewFilePath)) {
+      await reply.code(404).send('Preview not found');
+      return;
+    }
+
+    try {
+      const fileStream = fs.createReadStream(previewFilePath, {
+        highWaterMark: 64 * 1024,
+      });
+      await reply
+        .type('image/webp')
         .header('Cache-Control', 'public, max-age=31536000')
         .send(fileStream);
     } catch {

@@ -1,6 +1,7 @@
 export interface Sticker {
   id: string;
   image: string;
+  previewImage?: string;
   title: string;
   stickerPackId: StickerPackMeta['id'];
   filename?: string;

@@ -9,6 +9,7 @@ import {StickerPack, Sticker as McSticker} from './mcStickerPack.js';
 import {Sticker, StickerSet} from 'telegraf/types';
 import {convertWebmToGif} from './webmToGif.js';
 import {convertTgsToGif} from './tgsToGif.js';
+import {generatePreview} from './stickerPreview.js';
 const DATA_DIR = path.join(path.resolve(process.env.DATA_DIR!), 'telegram');
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || '5', 10);
 const MC_STICKER_PACK_ID_PREFIX = 'MoreStickers:Telegram:Pack';
@@ -29,6 +30,26 @@ function generateExternalUrl(
   fileExtension: string,
 ) {
   return `${EXTERNAL_URL}/sticker/telegram/${stickerPackName}/${stickerId}.${fileExtension}`;
+}
+function generatePreviewExternalUrl(
+  stickerPackName: string,
+  stickerId: string,
+) {
+  return `${EXTERNAL_URL}/preview/telegram/${stickerPackName}/${stickerId}.webp`;
+}
+
+export function generateStickerPreviewDirPath(stickerSetName: string) {
+  return path.join(generateStickerPackDirPath(stickerSetName), 'previews');
+}
+
+export function generateStickerPreviewFilePath(
+  stickerSetName: string,
+  stickerId: string,
+) {
+  return path.join(
+    generateStickerPreviewDirPath(stickerSetName),
+    `${stickerId}.webp`,
+  );
 }
 
 export function generateStickerPackDirPath(stickerSetName: string) {
@@ -227,6 +248,11 @@ async function downloadSingleSticker(
       } else {
         await convertTgsToGif(tempSourcePath, finalGifPath);
       }
+      const previewPath = generateStickerPreviewFilePath(
+        stickerSet.name,
+        sticker.file_unique_id,
+      );
+      await generatePreview(finalGifPath, previewPath);
     } finally {
       await fsp.unlink(tempSourcePath).catch(() => undefined);
     }
@@ -241,6 +267,11 @@ async function downloadSingleSticker(
     Readable.fromWeb(response.body!),
     fs.createWriteStream(stickerFilePath),
   );
+  const previewPath = generateStickerPreviewFilePath(
+    stickerSet.name,
+    sticker.file_unique_id,
+  );
+  await generatePreview(stickerFilePath, previewPath);
 }
 
 async function downloadWorker(
@@ -258,6 +289,8 @@ async function downloadWorker(
 async function downloadStickerPack(telegram: Telegram, stickerSet: StickerSet) {
   const stickerSetDir = generateStickerPackDirPath(stickerSet.name);
   await fsp.mkdir(stickerSetDir, {recursive: true});
+  const previewDir = generateStickerPreviewDirPath(stickerSet.name);
+  await fsp.mkdir(previewDir, {recursive: true});
   const queue = stickerSet.stickers.slice();
 
   const downloadPromises = Array.from({length: CONCURRENCY}, () =>
@@ -288,6 +321,10 @@ async function toMcStickerPack(
         stickerSet.name,
         sticker.file_unique_id,
         outputFileType,
+      ),
+      previewImage: generatePreviewExternalUrl(
+        stickerSet.name,
+        sticker.file_unique_id,
       ),
       title: sticker.emoji ?? '',
       stickerPackId: toMcStickerPackId(stickerSet.name),

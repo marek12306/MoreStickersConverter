@@ -37,10 +37,20 @@ const {
   prepareTgsForLottieConverter,
 } = await import('../src/utils/tgsToGif.js');
 const {
+  buildPreviewFilter,
+  generatePreview,
+  generatePreviewWithEncoder,
+  PREVIEW_TARGET_BYTES,
+  PREVIEW_MAX_BYTES,
+  PREVIEW_PROFILES,
+} = await import('../src/utils/stickerPreview.js');
+const {
   isLegacyStickerPack,
   isStickerPackDownloaded,
   generateStickerPackDirPath,
   generateStickerPackFilePath,
+  generateStickerPreviewDirPath,
+  generateStickerPreviewFilePath,
   getStickerMediaInfo,
   fetchStickerWithRetry,
   toMcStickerPack,
@@ -64,6 +74,32 @@ assert.equal(
   TGS_GIF_ENCODING_PROFILES.length,
   GIF_ENCODING_PROFILES.length,
   'TGS and WebM GIF profile lists must have matching lengths',
+);
+assert.equal(
+  PREVIEW_TARGET_BYTES,
+  12 * 1024,
+  'Preview target bytes must be 12 KiB',
+);
+assert.equal(PREVIEW_MAX_BYTES, 24 * 1024, 'Preview max bytes must be 24 KiB');
+assert.deepEqual(
+  PREVIEW_PROFILES,
+  [
+    {maxDimension: 96, quality: 60},
+    {maxDimension: 96, quality: 50},
+    {maxDimension: 80, quality: 50},
+    {maxDimension: 80, quality: 40},
+    {maxDimension: 64, quality: 40},
+  ],
+  'Preview profiles must match specification',
+);
+const firstPreviewFilter = buildPreviewFilter(PREVIEW_PROFILES[0]);
+assert.ok(
+  firstPreviewFilter.includes('min(96,iw)'),
+  `Expected preview filter to use max dimension 96, got ${firstPreviewFilter}`,
+);
+assert.ok(
+  firstPreviewFilter.includes('min(96,ih)'),
+  `Expected preview filter to use max dimension 96, got ${firstPreviewFilter}`,
 );
 assert.deepEqual(
   GIF_ENCODING_PROFILES.map(profile => profile.fps),
@@ -349,6 +385,39 @@ for (const sticker of [manifestWebm, manifestTgs]) {
   assert.equal(sticker.isAnimated, true);
   assert.equal(sticker.readyToUpload, true);
 }
+for (const sticker of [manifestWebm, manifestTgs, manifestWebp]) {
+  assert.ok(
+    sticker.previewImage?.endsWith('.webp'),
+    `Sticker previewImage must end in .webp, got ${sticker.previewImage}`,
+  );
+  assert.ok(
+    sticker.previewImage?.includes('/preview/telegram/'),
+    `Sticker previewImage must include /preview/telegram/, got ${sticker.previewImage}`,
+  );
+}
+assert.equal(
+  manifest.logo.previewImage,
+  manifest.stickers[0].previewImage,
+  'Logo previewImage must equal first sticker previewImage',
+);
+assert.equal(
+  typeof serializedManifest.stickers[0].previewImage,
+  'string',
+  'Serialized sticker previewImage must be a string',
+);
+assert.ok(
+  serializedManifest.stickers[0].previewImage.endsWith('.webp'),
+  'Serialized sticker previewImage must end with .webp',
+);
+assert.equal(
+  typeof serializedManifest.logo.previewImage,
+  'string',
+  'Serialized logo previewImage must be a string',
+);
+assert.ok(
+  serializedManifest.logo.previewImage.endsWith('.webp'),
+  'Serialized logo previewImage must end with .webp',
+);
 assert.equal(
   manifestWebm.id,
   `MoreStickers:Telegram:Sticker:${manifestPackName}:webm-id`,
@@ -361,7 +430,9 @@ assert.ok(manifestWebp.filename?.endsWith('.webp'));
 assert.ok(manifestWebp.image.endsWith('.webp'));
 assert.equal(manifestWebp.isAnimated, false);
 assert.equal(Object.hasOwn(manifestWebp, 'readyToUpload'), false);
-console.log('Verified: Telegram manifests expose final GIFs and static WebP');
+console.log(
+  'Verified: Telegram manifests expose final GIFs, static WebP, and WebP previews',
+);
 // Test 2: HTTP error retry and response body cancellation
 console.log('Testing fetchStickerWithRetry...');
 
@@ -1790,6 +1861,389 @@ assert.equal(
 
 console.log(
   'Verified: Fastify rejects invalid/raw extensions (.webm, .tgs, .exe, .gif.exe, .gif.webp, no-ext, path-component) with 400',
+);
+console.log('Testing deterministic preview profile selection...');
+const previewTestDir = path.join(tempDir, 'preview-deterministic-tests');
+await fsp.mkdir(previewTestDir, {recursive: true});
+
+// Case A: Profile 0 produces 20 KiB (> target, <= max), Profile 1 produces 10 KiB (<= target)
+const caseAInput = path.join(previewTestDir, 'caseA-in.webp');
+await fsp.writeFile(caseAInput, 'test-in');
+const caseAOutput = path.join(previewTestDir, 'caseA-out.webp');
+const encoderA = async (
+  _input: string,
+  candidate: string,
+  profile: (typeof PREVIEW_PROFILES)[number],
+) => {
+  const profileIdx = PREVIEW_PROFILES.indexOf(profile);
+  const size = profileIdx === 0 ? 20 * 1024 : 10 * 1024;
+  await fsp.writeFile(candidate, Buffer.alloc(size));
+};
+const resultA = await generatePreviewWithEncoder(
+  caseAInput,
+  caseAOutput,
+  encoderA,
+);
+assert.equal(resultA.profileIndex, 1, 'Case A: must accept profile 1');
+assert.equal(
+  resultA.sizeBytes,
+  10 * 1024,
+  'Case A: output size must be 10 KiB',
+);
+assert.ok(
+  resultA.sizeBytes <= PREVIEW_TARGET_BYTES,
+  'Case A: output must be <= PREVIEW_TARGET_BYTES',
+);
+assert.ok(fs.existsSync(caseAOutput), 'Case A: output file must exist');
+const filesA = await fsp.readdir(previewTestDir);
+assert.equal(
+  filesA.filter(f => f.includes('.preview-candidate-')).length,
+  0,
+  'Case A: no candidate files remaining',
+);
+
+// Case B: all profiles > target (12 KiB) but <= max (24 KiB) -> best fallback accepted
+const caseBOutput = path.join(previewTestDir, 'caseB-out.webp');
+const profileSizesB = [22 * 1024, 20 * 1024, 18 * 1024, 19 * 1024, 21 * 1024];
+const encoderB = async (
+  _input: string,
+  candidate: string,
+  profile: (typeof PREVIEW_PROFILES)[number],
+) => {
+  const profileIdx = PREVIEW_PROFILES.indexOf(profile);
+  await fsp.writeFile(candidate, Buffer.alloc(profileSizesB[profileIdx]));
+};
+const resultB = await generatePreviewWithEncoder(
+  caseAInput,
+  caseBOutput,
+  encoderB,
+);
+assert.equal(
+  resultB.profileIndex,
+  2,
+  'Case B: must accept profile index 2 (smallest fallback 18 KiB)',
+);
+assert.equal(
+  resultB.sizeBytes,
+  18 * 1024,
+  'Case B: output size must be 18 KiB',
+);
+assert.ok(
+  resultB.sizeBytes <= PREVIEW_MAX_BYTES,
+  'Case B: output must be <= PREVIEW_MAX_BYTES',
+);
+assert.ok(fs.existsSync(caseBOutput), 'Case B: output file must exist');
+const filesB = await fsp.readdir(previewTestDir);
+assert.equal(
+  filesB.filter(f => f.includes('.preview-candidate-')).length,
+  0,
+  'Case B: no candidate files remaining',
+);
+
+// Case C: all profiles > 24 KiB -> throw error, no output, all candidates cleaned up
+const caseCOutput = path.join(previewTestDir, 'caseC-out.webp');
+const encoderC = async (_input: string, candidate: string) => {
+  await fsp.writeFile(candidate, Buffer.alloc(25 * 1024));
+};
+await assert.rejects(
+  async () => {
+    await generatePreviewWithEncoder(caseAInput, caseCOutput, encoderC);
+  },
+  /exceeded the preview size limit/,
+  'Case C: must reject when all profiles exceed PREVIEW_MAX_BYTES',
+);
+assert.equal(
+  fs.existsSync(caseCOutput),
+  false,
+  'Case C: output file must not exist',
+);
+const filesC = await fsp.readdir(previewTestDir);
+assert.equal(
+  filesC.filter(f => f.includes('.preview-candidate-')).length,
+  0,
+  'Case C: no candidate files remaining after rejection',
+);
+console.log(
+  'Verified: deterministic preview profile selection and cleanup pass',
+);
+
+console.log('Testing real GIF and WebP preview generation with FFmpeg...');
+// Real GIF -> WebP preview
+const gifPreviewOutput = path.join(tempDir, 'real_gif_preview.webp');
+const gifPreviewResult = await generatePreview(testGifPath, gifPreviewOutput);
+assert.ok(fs.existsSync(gifPreviewOutput), 'GIF preview file must exist');
+assert.ok(
+  gifPreviewResult.sizeBytes <= PREVIEW_MAX_BYTES,
+  'GIF preview must be <= 24 KiB',
+);
+
+const probeGifPreview = spawnSync('ffprobe', [
+  '-v',
+  'error',
+  '-select_streams',
+  'v:0',
+  '-show_entries',
+  'stream=codec_name,width,height',
+  '-of',
+  'json',
+  gifPreviewOutput,
+]);
+assert.equal(probeGifPreview.status, 0, 'ffprobe failed on GIF preview');
+const gifPreviewProbe = JSON.parse(probeGifPreview.stdout.toString('utf8'))
+  .streams[0];
+assert.equal(
+  gifPreviewProbe.codec_name,
+  'webp',
+  'GIF preview must be WebP codec',
+);
+const gifPrevWidth = Number(gifPreviewProbe.width);
+const gifPrevHeight = Number(gifPreviewProbe.height);
+assert.ok(
+  gifPrevWidth > 0 && gifPrevWidth <= 96,
+  `GIF preview width (${gifPrevWidth}) must be <= 96`,
+);
+assert.ok(
+  gifPrevHeight > 0 && gifPrevHeight <= 96,
+  `GIF preview height (${gifPrevHeight}) must be <= 96`,
+);
+
+// Check transparency of GIF preview
+const cornerAlphaResult = spawnSync('ffmpeg', [
+  '-v',
+  'error',
+  '-i',
+  gifPreviewOutput,
+  '-vf',
+  'format=rgba,crop=1:1:0:0',
+  '-frames:v',
+  '1',
+  '-f',
+  'rawvideo',
+  '-pix_fmt',
+  'rgba',
+  'pipe:1',
+]);
+assert.equal(
+  cornerAlphaResult.status,
+  0,
+  'FFmpeg pixel extraction failed at (0,0)',
+);
+assert.equal(
+  cornerAlphaResult.stdout[3],
+  0,
+  'GIF preview corner (0,0) must be transparent (alpha=0)',
+);
+
+const centerPrevX = Math.floor(gifPrevWidth / 2);
+const centerPrevY = Math.floor(gifPrevHeight / 2);
+const centerAlphaResult = spawnSync('ffmpeg', [
+  '-v',
+  'error',
+  '-i',
+  gifPreviewOutput,
+  '-vf',
+  `format=rgba,crop=1:1:${centerPrevX}:${centerPrevY}`,
+  '-frames:v',
+  '1',
+  '-f',
+  'rawvideo',
+  '-pix_fmt',
+  'rgba',
+  'pipe:1',
+]);
+assert.equal(
+  centerAlphaResult.status,
+  0,
+  'FFmpeg pixel extraction failed at center',
+);
+assert.equal(
+  centerAlphaResult.stdout[3],
+  255,
+  `GIF preview center (${centerPrevX},${centerPrevY}) must be opaque (alpha=255)`,
+);
+
+// Real static WebP -> WebP preview
+const realWebpInput = path.join(tempDir, 'real_input_512.webp');
+const genWebpRes = spawnSync('ffmpeg', [
+  '-y',
+  '-v',
+  'error',
+  '-f',
+  'lavfi',
+  '-i',
+  'color=c=red:size=512x512:duration=1',
+  '-frames:v',
+  '1',
+  '-c:v',
+  'libwebp',
+  realWebpInput,
+]);
+assert.equal(genWebpRes.status, 0, 'Failed to create test 512x512 WebP');
+const webpPreviewOutput = path.join(tempDir, 'real_webp_preview.webp');
+const webpPreviewResult = await generatePreview(
+  realWebpInput,
+  webpPreviewOutput,
+);
+assert.ok(fs.existsSync(webpPreviewOutput), 'WebP preview file must exist');
+assert.ok(
+  webpPreviewResult.sizeBytes <= PREVIEW_MAX_BYTES,
+  'WebP preview must be <= 24 KiB',
+);
+
+const probeWebpPreview = spawnSync('ffprobe', [
+  '-v',
+  'error',
+  '-select_streams',
+  'v:0',
+  '-show_entries',
+  'stream=codec_name,width,height',
+  '-of',
+  'json',
+  webpPreviewOutput,
+]);
+assert.equal(probeWebpPreview.status, 0, 'ffprobe failed on WebP preview');
+const webpPreviewProbe = JSON.parse(probeWebpPreview.stdout.toString('utf8'))
+  .streams[0];
+assert.equal(
+  webpPreviewProbe.codec_name,
+  'webp',
+  'WebP preview must be WebP codec',
+);
+const webpPrevWidth = Number(webpPreviewProbe.width);
+const webpPrevHeight = Number(webpPreviewProbe.height);
+assert.ok(
+  webpPrevWidth > 0 && webpPrevWidth <= 96,
+  `WebP preview width (${webpPrevWidth}) must be <= 96`,
+);
+assert.ok(
+  webpPrevHeight > 0 && webpPrevHeight <= 96,
+  `WebP preview height (${webpPrevHeight}) must be <= 96`,
+);
+console.log(
+  'Verified: real GIF and WebP preview generation with transparency and size bounds',
+);
+
+console.log(
+  'Testing Fastify preview endpoint /preview/telegram/:pack/:filename...',
+);
+const previewPackDir = generateStickerPreviewDirPath(packName);
+await fsp.mkdir(previewPackDir, {recursive: true});
+const previewFilePathInPack = generateStickerPreviewFilePath(
+  packName,
+  'test_sticker',
+);
+await fsp.copyFile(gifPreviewOutput, previewFilePathInPack);
+
+// GET preview
+const previewGetResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${packName}/test_sticker.webp`,
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+assert.equal(
+  previewGetResponse.statusCode,
+  200,
+  'Expected 200 for preview GET',
+);
+assert.equal(
+  previewGetResponse.headers['content-type'],
+  'image/webp',
+  'Expected image/webp Content-Type for preview',
+);
+assert.equal(
+  previewGetResponse.headers['cache-control'],
+  'public, max-age=31536000',
+  'Expected 1-year cache-control for preview',
+);
+assert.equal(
+  previewGetResponse.headers['access-control-allow-origin'],
+  '*',
+  'Expected CORS * for preview',
+);
+
+// HEAD preview
+const previewHeadResponse = await app.inject({
+  method: 'HEAD',
+  url: `/preview/telegram/${packName}/test_sticker.webp`,
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+assert.equal(
+  previewHeadResponse.statusCode,
+  200,
+  'Expected 200 for preview HEAD',
+);
+assert.equal(
+  previewHeadResponse.body,
+  '',
+  'Expected empty body for preview HEAD',
+);
+
+// OPTIONS preview
+const previewOptionsResponse = await app.inject({
+  method: 'OPTIONS',
+  url: `/preview/telegram/${packName}/test_sticker.webp`,
+  headers: {
+    origin: 'https://discord.com',
+    'access-control-request-method': 'GET',
+  },
+});
+assert.equal(
+  previewOptionsResponse.statusCode,
+  204,
+  'Expected 204 for preview OPTIONS',
+);
+
+// Missing preview -> 404
+const missingPreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${packName}/non_existent_sticker.webp`,
+});
+assert.equal(
+  missingPreviewResponse.statusCode,
+  404,
+  'Expected 404 for missing preview',
+);
+assert.equal(missingPreviewResponse.body, 'Preview not found');
+
+// Invalid extension -> 400
+const invalidExtPreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${packName}/test_sticker.gif`,
+});
+assert.equal(
+  invalidExtPreviewResponse.statusCode,
+  400,
+  'Expected 400 for .gif on preview route',
+);
+
+// Double extension -> 400
+const doubleExtPreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${packName}/test_sticker.webp.exe`,
+});
+assert.equal(
+  doubleExtPreviewResponse.statusCode,
+  400,
+  'Expected 400 for double extension on preview route',
+);
+
+// Path component -> 400
+const pathCompPreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${packName}/nested%2Ftest_sticker.webp`,
+});
+assert.equal(
+  pathCompPreviewResponse.statusCode,
+  400,
+  'Expected 400 for path component on preview route',
+);
+
+console.log(
+  'Verified: Fastify preview route serves WebP with CORS and rejects invalid/missing requests',
 );
 // Test 9: Error handling on invalid/corrupt input
 console.log('Testing convertWebmToGif error handling with invalid input...');
