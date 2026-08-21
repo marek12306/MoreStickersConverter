@@ -22,7 +22,10 @@ app.get(
   '/sticker/telegram/:stickerPackName/:filename',
   async (request, reply) => {
     const {stickerPackName, filename} = request.params as unknown as ParamsType;
-    const [stickerId, fileExtension] = filename.split('.', 2);
+
+    const extension = path.extname(filename);
+    const stickerId = path.basename(filename, extension);
+    const fileExtension = extension.slice(1).toLowerCase();
 
     // Sanitize stickerPackName and stickerId
     if (!/^[a-z0-9_]+$/i.test(stickerPackName)) {
@@ -34,8 +37,18 @@ app.get(
       return;
     }
 
-    if (!/^(?:webp|gif)$/i.test(fileExtension)) {
+    if (!/^(?:webp|gif)$/.test(fileExtension)) {
       await reply.code(400).send('Invalid file extension');
+      return;
+    }
+
+    const canonicalFilename = `${stickerId}.${fileExtension}`;
+
+    if (
+      path.basename(filename) !== filename ||
+      filename.toLowerCase() !== canonicalFilename.toLowerCase()
+    ) {
+      await reply.code(400).send('Invalid filename');
       return;
     }
 
@@ -43,9 +56,7 @@ app.get(
       gif: 'image/gif',
       webp: 'image/webp',
     };
-    const contentType =
-      mimeTypes[fileExtension.toLowerCase()] || 'application/octet-stream';
-
+    const contentType = mimeTypes[fileExtension] || 'application/octet-stream';
     const stickerFilePath = path.join(DATA_DIR, stickerPackName, filename);
 
     try {

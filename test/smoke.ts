@@ -1623,8 +1623,82 @@ assert.equal(
   400,
   `Expected 400 for invalid extension, got ${invalidResponse.statusCode}`,
 );
+console.log('Testing Fastify endpoint for uppercase extension .GIF...');
+const upperGifPath = path.join(packDir, 'upper.GIF');
+await fsp.copyFile(testGifPath, upperGifPath);
+const upperGifResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/upper.GIF`,
+});
+assert.equal(
+  upperGifResponse.statusCode,
+  200,
+  `Expected 200 for upper.GIF, got ${upperGifResponse.statusCode}`,
+);
+assert.equal(
+  upperGifResponse.headers['content-type'],
+  'image/gif',
+  `Expected Content-Type image/gif for upper.GIF, got ${upperGifResponse.headers['content-type']}`,
+);
+
+console.log('Testing Fastify rejection of double extension bypass.gif.exe...');
+const bypassExePath = path.join(packDir, 'bypass.gif.exe');
+await fsp.writeFile(bypassExePath, 'must-not-be-served');
+assert.ok(
+  fs.existsSync(bypassExePath),
+  'Bypass exe file must physically exist before request',
+);
+const bypassExeResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/bypass.gif.exe`,
+});
+assert.equal(
+  bypassExeResponse.statusCode,
+  400,
+  `Expected 400 for bypass.gif.exe, got ${bypassExeResponse.statusCode}`,
+);
+
+console.log('Testing Fastify rejection of double extension bypass.gif.webp...');
+const bypassWebpPath = path.join(packDir, 'bypass.gif.webp');
+await fsp.writeFile(bypassWebpPath, 'must-not-be-served');
+assert.ok(
+  fs.existsSync(bypassWebpPath),
+  'Bypass webp file must physically exist before request',
+);
+const bypassWebpResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/bypass.gif.webp`,
+});
+assert.equal(
+  bypassWebpResponse.statusCode,
+  400,
+  `Expected 400 for bypass.gif.webp, got ${bypassWebpResponse.statusCode}`,
+);
+
+console.log('Testing Fastify rejection of filename without extension...');
+const noExtResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/sticker_without_ext`,
+});
+assert.equal(
+  noExtResponse.statusCode,
+  400,
+  `Expected 400 for filename without extension, got ${noExtResponse.statusCode}`,
+);
+
+console.log('Testing Fastify rejection of path-component filename...');
+const pathComponentResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/nested%2Ftest_sticker.gif`,
+});
+assert.equal(
+  pathComponentResponse.statusCode,
+  400,
+  `Expected 400 for path-component filename, got ${pathComponentResponse.statusCode}`,
+);
+
 console.log(
-  'Verified: Fastify rejects invalid/raw extensions (.webm, .tgs, .exe) with 400',
+  'Verified: Fastify rejects invalid/raw extensions (.webm, .tgs, .exe, .gif.exe, .gif.webp, no-ext, path-component) with 400',
 );
 // Test 9: Error handling on invalid/corrupt input
 console.log('Testing convertWebmToGif error handling with invalid input...');
