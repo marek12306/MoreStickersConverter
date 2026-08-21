@@ -245,7 +245,6 @@ const manifestStickerSet = {
       file_unique_id: 'webm-id',
       is_video: true,
       is_animated: false,
-      emoji: '🎉',
       width: 512,
       height: 512,
       type: 'regular',
@@ -275,6 +274,59 @@ const manifestStickerSet = {
 const manifest = await toMcStickerPack(manifestTelegram, manifestStickerSet);
 const [manifestWebm, manifestTgs, manifestWebp] = manifest.stickers;
 
+// No-emoji fallback and logo test
+assert.equal(
+  manifestWebm.title,
+  '',
+  'Sticker without emoji must use an empty string title',
+);
+assert.equal(typeof manifestWebm.title, 'string');
+assert.equal(
+  manifest.logo.title,
+  '',
+  'Logo sticker without emoji must use an empty string title',
+);
+
+// Normal emoji preserved
+assert.equal(
+  manifestTgs.title,
+  '🎊',
+  'Sticker with emoji must preserve its emoji title',
+);
+assert.equal(
+  manifestWebp.title,
+  '🐱',
+  'Sticker with emoji must preserve its emoji title',
+);
+
+// Serialized JSON manifest test
+const serializedManifest = JSON.parse(JSON.stringify(manifest));
+assert.equal(
+  serializedManifest.stickers[0].title,
+  '',
+  'Serialized sticker without emoji must have empty string title',
+);
+assert.equal(
+  Object.hasOwn(serializedManifest.stickers[0], 'title'),
+  true,
+  'Serialized sticker must contain title property',
+);
+assert.equal(
+  serializedManifest.logo.title,
+  '',
+  'Serialized logo without emoji must have empty string title',
+);
+assert.equal(
+  Object.hasOwn(serializedManifest.logo, 'title'),
+  true,
+  'Serialized logo must contain title property',
+);
+assert.equal(
+  serializedManifest.stickers[1].title,
+  '🎊',
+  'Serialized sticker with emoji must preserve title',
+);
+
 for (const sticker of [manifestWebm, manifestTgs]) {
   assert.ok(sticker.filename?.endsWith('.gif'));
   assert.ok(sticker.image.endsWith('.gif'));
@@ -294,7 +346,6 @@ assert.ok(manifestWebp.image.endsWith('.webp'));
 assert.equal(manifestWebp.isAnimated, false);
 assert.equal(Object.hasOwn(manifestWebp, 'readyToUpload'), false);
 console.log('Verified: Telegram manifests expose final GIFs and static WebP');
-
 // Test 2: HTTP error retry and response body cancellation
 console.log('Testing fetchStickerWithRetry...');
 

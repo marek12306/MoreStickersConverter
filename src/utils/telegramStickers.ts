@@ -289,7 +289,7 @@ async function toMcStickerPack(
         sticker.file_unique_id,
         outputFileType,
       ),
-      title: sticker.emoji,
+      title: sticker.emoji ?? '',
       stickerPackId: toMcStickerPackId(stickerSet.name),
       filename: `${sticker.file_unique_id}.${outputFileType}`,
       isAnimated,
