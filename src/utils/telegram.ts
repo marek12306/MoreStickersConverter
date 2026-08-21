@@ -6,19 +6,16 @@ import {
   generateStickerPackDirPath,
   generateStickerPackFilePath,
 } from './telegramStickers.js';
+import {
+  handleVisibilityCommand,
+  isAllowedTelegramUser,
+} from './stickerPackVisibilityCommands.js';
 import fsp from 'fs/promises';
 
 const bot: Telegraf = new Telegraf(process.env.BOT_TOKEN!);
 
-const allowedTelegramUserIds = new Set(
-  (process.env.ALLOWED_TELEGRAM_USER_IDS ?? '')
-    .split(',')
-    .map(id => id.trim())
-    .filter(Boolean),
-);
-
 bot.on(message('sticker'), async ctx => {
-  if (!ctx.from || !allowedTelegramUserIds.has(String(ctx.from.id))) {
+  if (!ctx.from || !isAllowedTelegramUser(ctx.from.id)) {
     return;
   }
 
@@ -73,6 +70,14 @@ bot.on(message('sticker'), async ctx => {
   const stickerPackUrl = `${process.env.EXTERNAL_URL}/stickerpack/telegram/${encodeURIComponent(stickerSet.name)}`;
 
   await ctx.reply(stickerPackUrl);
+});
+
+bot.command('public', async ctx => {
+  await handleVisibilityCommand(ctx, 'public');
+});
+
+bot.command('unlisted', async ctx => {
+  await handleVisibilityCommand(ctx, 'unlisted');
 });
 
 export {bot};

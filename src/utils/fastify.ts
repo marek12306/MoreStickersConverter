@@ -6,6 +6,7 @@ import {
   generateStickerPackFilePath,
   generateStickerPreviewFilePath,
 } from './telegramStickers.js';
+import {getPublicStickerPacks} from './stickerPackCatalog.js';
 import fs from 'fs';
 interface ParamsType {
   stickerPackName: string;
@@ -162,5 +163,14 @@ app.get<{Params: StickerPackParamsType}>(
     }
   },
 );
+
+app.get('/api/stickerpacks', async (_request, reply) => {
+  const packs = await getPublicStickerPacks();
+
+  await reply
+    .type('application/json; charset=utf-8')
+    .header('Cache-Control', 'no-cache')
+    .send(packs);
+});
 
 export {app};

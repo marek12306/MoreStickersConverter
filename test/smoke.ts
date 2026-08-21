@@ -14,8 +14,8 @@ process.env.DATA_DIR = tempDir;
 process.env.CONCURRENCY = '2';
 process.env.EXTERNAL_URL = 'https://stickers.example.com';
 process.env.BOT_TOKEN = '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11';
+process.env.ALLOWED_TELEGRAM_USER_IDS = '123456789,987654321';
 process.env.PORT = '3000';
-
 import type {GifEncoder} from '../src/utils/webmToGif.js';
 import type {Telegram} from 'telegraf';
 const {
@@ -55,6 +55,23 @@ const {
   fetchStickerWithRetry,
   toMcStickerPack,
 } = await import('../src/utils/telegramStickers.js');
+const {
+  DEFAULT_STICKER_PACK_METADATA,
+  getStickerPackMetadata,
+  getStickerPackMetadataPath,
+  generateStickerPackMetadataPath,
+  isValidStickerPackName,
+  normalizeStoredMetadata,
+  updateStickerPackMetadata,
+} = await import('../src/utils/stickerPackMetadata.js');
+const {getPublicStickerPacks} = await import(
+  '../src/utils/stickerPackCatalog.js'
+);
+const {
+  handleVisibilityCommand,
+  isAllowedTelegramUser,
+  resolveStickerPackNameFromCommand,
+} = await import('../src/utils/stickerPackVisibilityCommands.js');
 const {app} = await import('../src/utils/fastify.js');
 
 console.log('--- Starting Smoke Tests in Nix Environment ---');
@@ -2765,6 +2782,693 @@ assert.deepEqual(
 );
 console.log(
   'Verified: TGS normalization logic, duration handling, and edge cases pass',
+);
+
+console.log('Testing StickerPack Metadata module...');
+assert.deepEqual(
+  DEFAULT_STICKER_PACK_METADATA,
+  {visibility: 'unlisted'},
+  'Default sticker pack metadata must be unlisted',
+);
+assert.equal(
+  getStickerPackMetadataPath('test_pack'),
+  generateStickerPackMetadataPath('test_pack'),
+  'getStickerPackMetadataPath and generateStickerPackMetadataPath must return identical paths',
+);
+assert.ok(
+  getStickerPackMetadataPath('test_pack').endsWith('test_pack.meta.json'),
+  'Metadata path must end with <pack>.meta.json',
+);
+assert.equal(isValidStickerPackName('Valid_Pack_123'), true);
+assert.equal(isValidStickerPackName('../traversal'), false);
+assert.equal(isValidStickerPackName('pack with space'), false);
+assert.equal(isValidStickerPackName('pack.meta.json'), false);
+
+assert.deepEqual(normalizeStoredMetadata(null), {});
+assert.deepEqual(normalizeStoredMetadata('string'), {});
+assert.deepEqual(normalizeStoredMetadata([]), {});
+assert.deepEqual(normalizeStoredMetadata({}), {});
+assert.deepEqual(normalizeStoredMetadata({visibility: 'public'}), {
+  visibility: 'public',
+});
+assert.deepEqual(normalizeStoredMetadata({visibility: 'unlisted'}), {
+  visibility: 'unlisted',
+});
+assert.deepEqual(normalizeStoredMetadata({visibility: 'invalid'}), {});
+
+// Case 1: Missing .meta.json
+const case1Meta = await getStickerPackMetadata('NonExistentMetaPack');
+assert.deepEqual(
+  case1Meta,
+  {visibility: 'unlisted'},
+  'Case 1: missing .meta.json must resolve to unlisted',
+);
+
+// Case 2: JSON {"visibility": "public"}
+const case2Path = getStickerPackMetadataPath('PublicMetaPack');
+await fsp.writeFile(case2Path, JSON.stringify({visibility: 'public'}));
+const case2Meta = await getStickerPackMetadata('PublicMetaPack');
+assert.deepEqual(
+  case2Meta,
+  {visibility: 'public'},
+  'Case 2: public visibility must resolve to public',
+);
+
+// Case 3: JSON {"visibility": "unlisted"}
+const case3Path = getStickerPackMetadataPath('UnlistedMetaPack');
+await fsp.writeFile(case3Path, JSON.stringify({visibility: 'unlisted'}));
+const case3Meta = await getStickerPackMetadata('UnlistedMetaPack');
+assert.deepEqual(
+  case3Meta,
+  {visibility: 'unlisted'},
+  'Case 3: unlisted visibility must resolve to unlisted',
+);
+
+// Case 4: JSON {"visibility": "invalid"}
+const case4Path = getStickerPackMetadataPath('InvalidMetaPack');
+await fsp.writeFile(case4Path, JSON.stringify({visibility: 'invalid'}));
+const case4Meta = await getStickerPackMetadata('InvalidMetaPack');
+assert.deepEqual(
+  case4Meta,
+  {visibility: 'unlisted'},
+  'Case 4: invalid visibility must resolve to unlisted',
+);
+
+// Case 5: Valid JSON object without visibility
+const case5Path = getStickerPackMetadataPath('FutureMetaPack');
+await fsp.writeFile(case5Path, JSON.stringify({someFutureField: 123}));
+const case5Meta = await getStickerPackMetadata('FutureMetaPack');
+assert.deepEqual(
+  case5Meta,
+  {visibility: 'unlisted'},
+  'Case 5: JSON without visibility must resolve to unlisted',
+);
+
+// Case 6: Preserving unknown fields on update
+const case6Path = getStickerPackMetadataPath('PreserveMetaPack');
+await fsp.writeFile(
+  case6Path,
+  JSON.stringify({
+    visibility: 'unlisted',
+    featured: true,
+    tags: ['anime'],
+  }),
+);
+await updateStickerPackMetadata('PreserveMetaPack', {visibility: 'public'});
+const rawCase6 = JSON.parse(await fsp.readFile(case6Path, 'utf8'));
+assert.equal(
+  rawCase6.visibility,
+  'public',
+  'Case 6: visibility updated to public',
+);
+assert.equal(rawCase6.featured, true, 'Case 6: featured field preserved');
+assert.deepEqual(rawCase6.tags, ['anime'], 'Case 6: tags field preserved');
+const resolvedCase6 = await getStickerPackMetadata('PreserveMetaPack');
+assert.deepEqual(
+  resolvedCase6,
+  {visibility: 'public'},
+  'Case 6: resolved metadata returns typed public',
+);
+
+// Malformed JSON handling
+const malformedPath = getStickerPackMetadataPath('MalformedMetaPack');
+await fsp.writeFile(malformedPath, '{ this is not valid json');
+const malformedRes = await getStickerPackMetadata('MalformedMetaPack');
+assert.deepEqual(
+  malformedRes,
+  {visibility: 'unlisted'},
+  'Malformed metadata must not throw and must resolve to unlisted',
+);
+await updateStickerPackMetadata('MalformedMetaPack', {visibility: 'public'});
+const repairedRaw = JSON.parse(await fsp.readFile(malformedPath, 'utf8'));
+assert.equal(
+  repairedRaw.visibility,
+  'public',
+  'Update on malformed metadata repairs to valid JSON',
+);
+
+// Explicit file creation
+await updateStickerPackMetadata('CreatedPublicPack', {visibility: 'public'});
+assert.ok(fs.existsSync(getStickerPackMetadataPath('CreatedPublicPack')));
+assert.deepEqual(
+  JSON.parse(
+    await fsp.readFile(getStickerPackMetadataPath('CreatedPublicPack'), 'utf8'),
+  ),
+  {visibility: 'public'},
+);
+await updateStickerPackMetadata('CreatedUnlistedPack', {
+  visibility: 'unlisted',
+});
+assert.ok(fs.existsSync(getStickerPackMetadataPath('CreatedUnlistedPack')));
+assert.deepEqual(
+  JSON.parse(
+    await fsp.readFile(
+      getStickerPackMetadataPath('CreatedUnlistedPack'),
+      'utf8',
+    ),
+  ),
+  {visibility: 'unlisted'},
+);
+
+// Concurrent updates with preserved unknown fields and deterministic ordering
+const concurrentPath = getStickerPackMetadataPath('ConcurrentPack');
+await fsp.writeFile(
+  concurrentPath,
+  JSON.stringify({
+    visibility: 'unlisted',
+    featured: true,
+    tags: ['anime'],
+  }),
+);
+const concurrentResults = await Promise.all([
+  updateStickerPackMetadata('ConcurrentPack', {visibility: 'public'}),
+  updateStickerPackMetadata('ConcurrentPack', {visibility: 'unlisted'}),
+  updateStickerPackMetadata('ConcurrentPack', {visibility: 'public'}),
+]);
+assert.equal(
+  concurrentResults[0].visibility,
+  'public',
+  'Concurrent update 0 must return public',
+);
+assert.equal(
+  concurrentResults[1].visibility,
+  'unlisted',
+  'Concurrent update 1 must return unlisted',
+);
+assert.equal(
+  concurrentResults[2].visibility,
+  'public',
+  'Concurrent update 2 must return public',
+);
+assert.ok(fs.existsSync(concurrentPath));
+const concurrentRaw = JSON.parse(await fsp.readFile(concurrentPath, 'utf8'));
+assert.equal(
+  concurrentRaw.visibility,
+  'public',
+  'Final raw visibility must be public',
+);
+assert.equal(concurrentRaw.featured, true, 'Featured field must be preserved');
+assert.deepEqual(concurrentRaw.tags, ['anime'], 'Tags field must be preserved');
+
+// Non-ENOENT read error during update must throw instead of resetting
+const dirAsMetaPack = 'DirAsMetaPack';
+const dirAsMetaPath = getStickerPackMetadataPath(dirAsMetaPack);
+await fsp.mkdir(dirAsMetaPath);
+await assert.rejects(
+  async () => {
+    await updateStickerPackMetadata(dirAsMetaPack, {visibility: 'public'});
+  },
+  /EISDIR|EPERM|EACCES|illegal operation/i,
+  'Non-ENOENT read error must be rethrown and not swallowed as empty metadata',
+);
+await fsp.rmdir(dirAsMetaPath);
+
+// Pack name rejection
+await assert.rejects(
+  async () => {
+    await updateStickerPackMetadata('../traversal', {visibility: 'public'});
+  },
+  /Invalid sticker pack name/,
+  'Invalid pack name must be rejected by updateStickerPackMetadata',
+);
+console.log('Verified: StickerPack Metadata module passes all invariant tests');
+
+console.log('Testing Public Catalog and GET /api/stickerpacks...');
+const publicPack1Name = 'PublicCatalogPack';
+const publicPack1ManifestPath = generateStickerPackFilePath(publicPack1Name);
+await fsp.writeFile(
+  publicPack1ManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${publicPack1Name}`,
+    title: 'Public Catalog Pack',
+    stickers: [
+      {
+        id: 's1',
+        image: `https://stickers.example.com/sticker/telegram/${publicPack1Name}/s1.gif`,
+        previewImage: `https://stickers.example.com/preview/telegram/${publicPack1Name}/s1.webp`,
+      },
+    ],
+    logo: {
+      id: 'logo',
+      image: `https://stickers.example.com/sticker/telegram/${publicPack1Name}/logo.gif`,
+      previewImage: `https://stickers.example.com/preview/telegram/${publicPack1Name}/logo.webp`,
+    },
+  }),
+);
+await fsp.writeFile(
+  getStickerPackMetadataPath(publicPack1Name),
+  JSON.stringify({visibility: 'public'}),
+);
+
+const publicPack2Name = 'PublicCatalogNoPreviewPack';
+const publicPack2ManifestPath = generateStickerPackFilePath(publicPack2Name);
+await fsp.writeFile(
+  publicPack2ManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${publicPack2Name}`,
+    title: 'Public Catalog No Preview Pack',
+    stickers: [
+      {
+        id: 's1',
+        image: `https://stickers.example.com/sticker/telegram/${publicPack2Name}/s1.gif`,
+      },
+      {
+        id: 's2',
+        image: `https://stickers.example.com/sticker/telegram/${publicPack2Name}/s2.gif`,
+      },
+    ],
+    logo: {
+      id: 'logo',
+      image: `https://stickers.example.com/sticker/telegram/${publicPack2Name}/logo.gif`,
+    },
+  }),
+);
+await fsp.writeFile(
+  getStickerPackMetadataPath(publicPack2Name),
+  JSON.stringify({visibility: 'public'}),
+);
+
+const unlistedPackName = 'UnlistedCatalogPack';
+const unlistedPackManifestPath = generateStickerPackFilePath(unlistedPackName);
+await fsp.writeFile(
+  unlistedPackManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${unlistedPackName}`,
+    title: 'Unlisted Catalog Pack',
+    stickers: [{id: 'u1'}],
+    logo: {
+      id: 'logo',
+      image: `https://stickers.example.com/sticker/telegram/${unlistedPackName}/logo.gif`,
+    },
+  }),
+);
+await fsp.writeFile(
+  getStickerPackMetadataPath(unlistedPackName),
+  JSON.stringify({visibility: 'unlisted'}),
+);
+
+const noMetaPackName = 'NoMetadataCatalogPack';
+const noMetaPackManifestPath = generateStickerPackFilePath(noMetaPackName);
+await fsp.writeFile(
+  noMetaPackManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${noMetaPackName}`,
+    title: 'No Metadata Catalog Pack',
+    stickers: [{id: 'n1'}],
+    logo: {
+      id: 'logo',
+      image: `https://stickers.example.com/sticker/telegram/${noMetaPackName}/logo.gif`,
+    },
+  }),
+);
+
+const brokenPublicPackName = 'BrokenPublicCatalogPack';
+const brokenPublicManifestPath =
+  generateStickerPackFilePath(brokenPublicPackName);
+await fsp.writeFile(brokenPublicManifestPath, 'not valid json');
+await fsp.writeFile(
+  getStickerPackMetadataPath(brokenPublicPackName),
+  JSON.stringify({visibility: 'public'}),
+);
+
+const brokenMetaPackName = 'BrokenMetaPublicCatalogPack';
+const brokenMetaManifestPath = generateStickerPackFilePath(brokenMetaPackName);
+await fsp.writeFile(
+  brokenMetaManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${brokenMetaPackName}`,
+    title: 'Broken Meta Pack',
+    stickers: [{id: 'bm1'}],
+    logo: {
+      id: 'logo',
+      image: `https://stickers.example.com/sticker/telegram/${brokenMetaPackName}/logo.gif`,
+    },
+  }),
+);
+await fsp.writeFile(
+  getStickerPackMetadataPath(brokenMetaPackName),
+  '{ not valid json',
+);
+
+const catalogPacks = await getPublicStickerPacks();
+assert.equal(
+  catalogPacks.length,
+  2,
+  'Catalog must contain exactly the 2 valid public packs',
+);
+assert.deepEqual(
+  catalogPacks.map(p => p.name),
+  [publicPack2Name, publicPack1Name],
+  'Catalog must sort packs alphabetically by name',
+);
+
+const pubSummary1 = catalogPacks.find(p => p.name === publicPack1Name)!;
+assert.equal(pubSummary1.id, `MoreStickers:Telegram:Pack:${publicPack1Name}`);
+assert.equal(pubSummary1.title, 'Public Catalog Pack');
+assert.equal(pubSummary1.stickerCount, 1);
+assert.equal(
+  pubSummary1.url,
+  `https://stickers.example.com/stickerpack/telegram/${publicPack1Name}`,
+);
+assert.equal(
+  pubSummary1.preview,
+  `https://stickers.example.com/preview/telegram/${publicPack1Name}/logo.webp`,
+  'Public pack with previewImage must use previewImage',
+);
+
+const pubSummary2 = catalogPacks.find(p => p.name === publicPack2Name)!;
+assert.equal(pubSummary2.stickerCount, 2);
+assert.equal(
+  pubSummary2.preview,
+  `https://stickers.example.com/sticker/telegram/${publicPack2Name}/logo.gif`,
+  'Public pack without previewImage must fallback to logo.image',
+);
+
+const apiResponse = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+assert.equal(
+  apiResponse.statusCode,
+  200,
+  'GET /api/stickerpacks must return 200',
+);
+assert.equal(
+  apiResponse.headers['content-type'],
+  'application/json; charset=utf-8',
+  'GET /api/stickerpacks Content-Type must be application/json; charset=utf-8',
+);
+assert.equal(
+  apiResponse.headers['cache-control'],
+  'no-cache',
+  'GET /api/stickerpacks Cache-Control must be no-cache',
+);
+assert.equal(
+  apiResponse.headers['access-control-allow-origin'],
+  '*',
+  'GET /api/stickerpacks must include CORS *',
+);
+const apiPacks = JSON.parse(apiResponse.body);
+assert.equal(
+  apiPacks.length,
+  2,
+  'API response must contain exactly 2 public packs',
+);
+assert.deepEqual(
+  apiPacks.map((p: {name: string}) => p.name),
+  [publicPack2Name, publicPack1Name],
+);
+
+// Direct unlisted access
+const unlistedManifestResp = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${unlistedPackName}`,
+});
+assert.equal(
+  unlistedManifestResp.statusCode,
+  200,
+  'Unlisted pack direct manifest GET must return 200',
+);
+assert.equal(
+  unlistedManifestResp.headers['content-type'],
+  'application/json; charset=utf-8',
+);
+assert.ok(
+  String(unlistedManifestResp.headers['content-disposition']).includes(
+    `${unlistedPackName}.stickerpack`,
+  ),
+);
+const parsedUnlistedManifest = JSON.parse(unlistedManifestResp.body);
+assert.equal(
+  parsedUnlistedManifest.id,
+  `MoreStickers:Telegram:Pack:${unlistedPackName}`,
+);
+
+// Dynamic update without server restart
+await updateStickerPackMetadata(unlistedPackName, {visibility: 'public'});
+const dynamicPublicResp = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+});
+const dynamicPublicPacks = JSON.parse(dynamicPublicResp.body);
+assert.equal(
+  dynamicPublicPacks.some((p: {name: string}) => p.name === unlistedPackName),
+  true,
+  'Dynamically public pack must appear in catalog without restart',
+);
+await updateStickerPackMetadata(unlistedPackName, {visibility: 'unlisted'});
+const dynamicUnlistedResp = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+});
+const dynamicUnlistedPacks = JSON.parse(dynamicUnlistedResp.body);
+assert.equal(
+  dynamicUnlistedPacks.some((p: {name: string}) => p.name === unlistedPackName),
+  false,
+  'Dynamically unlisted pack must disappear from catalog without restart',
+);
+console.log(
+  'Verified: Public Catalog and /api/stickerpacks endpoint pass all tests',
+);
+
+console.log('Testing Telegram visibility commands resolver and handlers...');
+const cmdTestPackName = 'CommandTestPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(cmdTestPackName),
+  JSON.stringify({id: `MoreStickers:Telegram:Pack:${cmdTestPackName}`}),
+);
+const replyTestPackName = 'ReplyTestPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(replyTestPackName),
+  JSON.stringify({id: `MoreStickers:Telegram:Pack:${replyTestPackName}`}),
+);
+const explicitTestPackName = 'ExplicitTestPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(explicitTestPackName),
+  JSON.stringify({id: `MoreStickers:Telegram:Pack:${explicitTestPackName}`}),
+);
+const otherTestPackName = 'OtherTestPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(otherTestPackName),
+  JSON.stringify({id: `MoreStickers:Telegram:Pack:${otherTestPackName}`}),
+);
+
+function createMockContext(options: {
+  userId?: string | number;
+  args?: string[];
+  replyTo?: {sticker?: {set_name?: string}; [key: string]: unknown};
+}) {
+  const replies: string[] = [];
+  const ctx = {
+    from: options.userId !== undefined ? {id: options.userId} : undefined,
+    args: options.args,
+    message: {
+      reply_to_message: options.replyTo,
+    },
+    reply: async (msg: string) => {
+      replies.push(msg);
+    },
+    replies,
+  };
+  return ctx;
+}
+
+const allowedUserId = '123456789';
+assert.equal(isAllowedTelegramUser(allowedUserId), true);
+assert.equal(isAllowedTelegramUser(987654321), true);
+assert.equal(isAllowedTelegramUser('999999_unauthorized'), false);
+assert.equal(isAllowedTelegramUser(undefined), false);
+
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(createMockContext({args: ['ValidPack']})),
+  {success: true, packName: 'ValidPack'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({args: ['Pack1', 'Pack2']}),
+  ),
+  {success: false, error: 'too_many_args'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({args: ['../invalid_pack']}),
+  ),
+  {success: false, error: 'invalid_arg'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({replyTo: {sticker: {set_name: 'RepliedPack'}}}),
+  ),
+  {success: true, packName: 'RepliedPack'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({replyTo: {sticker: {set_name: '../invalid'}}}),
+  ),
+  {success: false, error: 'invalid_arg'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({replyTo: {sticker: {}}}),
+  ),
+  {success: false, error: 'invalid_reply_sticker'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(createMockContext({replyTo: {text: 'hi'}})),
+  {success: false, error: 'no_target'},
+);
+// Case A: /public CommandTestPack explicit
+const ctxA = createMockContext({
+  userId: allowedUserId,
+  args: [cmdTestPackName],
+});
+const handledA = await handleVisibilityCommand(ctxA, 'public');
+assert.equal(handledA, true);
+assert.equal(ctxA.replies[0], `Pack "${cmdTestPackName}" is now public.`);
+assert.equal(
+  (await getStickerPackMetadata(cmdTestPackName)).visibility,
+  'public',
+);
+
+// Case B: /unlisted CommandTestPack explicit
+const ctxB = createMockContext({
+  userId: allowedUserId,
+  args: [cmdTestPackName],
+});
+const handledB = await handleVisibilityCommand(ctxB, 'unlisted');
+assert.equal(handledB, true);
+assert.equal(ctxB.replies[0], `Pack "${cmdTestPackName}" is now unlisted.`);
+assert.equal(
+  (await getStickerPackMetadata(cmdTestPackName)).visibility,
+  'unlisted',
+);
+assert.ok(
+  fs.existsSync(getStickerPackMetadataPath(cmdTestPackName)),
+  'Metadata sidecar must still exist after /unlisted',
+);
+
+// Case C: /public reply to sticker
+const ctxC = createMockContext({
+  userId: allowedUserId,
+  replyTo: {sticker: {set_name: replyTestPackName}},
+});
+const handledC = await handleVisibilityCommand(ctxC, 'public');
+assert.equal(handledC, true);
+assert.equal(ctxC.replies[0], `Pack "${replyTestPackName}" is now public.`);
+assert.equal(
+  (await getStickerPackMetadata(replyTestPackName)).visibility,
+  'public',
+);
+
+// Case D: /unlisted reply to sticker
+const ctxD = createMockContext({
+  userId: allowedUserId,
+  replyTo: {sticker: {set_name: replyTestPackName}},
+});
+const handledD = await handleVisibilityCommand(ctxD, 'unlisted');
+assert.equal(handledD, true);
+assert.equal(ctxD.replies[0], `Pack "${replyTestPackName}" is now unlisted.`);
+assert.equal(
+  (await getStickerPackMetadata(replyTestPackName)).visibility,
+  'unlisted',
+);
+
+// Case E: Explicit argument precedence over reply
+const ctxE = createMockContext({
+  userId: allowedUserId,
+  args: [explicitTestPackName],
+  replyTo: {sticker: {set_name: otherTestPackName}},
+});
+const handledE = await handleVisibilityCommand(ctxE, 'public');
+assert.equal(handledE, true);
+assert.equal(
+  (await getStickerPackMetadata(explicitTestPackName)).visibility,
+  'public',
+  'Explicit argument pack must be updated to public',
+);
+assert.equal(
+  (await getStickerPackMetadata(otherTestPackName)).visibility,
+  'unlisted',
+  'Replied sticker pack must remain untouched when explicit arg is provided',
+);
+
+// Case F: Reply to non-sticker message
+const ctxF = createMockContext({
+  userId: allowedUserId,
+  replyTo: {text: 'hello'},
+});
+const handledF = await handleVisibilityCommand(ctxF, 'public');
+assert.equal(handledF, false);
+assert.ok(
+  ctxF.replies[0].includes('Usage: /public'),
+  'Non-sticker reply must respond with usage message',
+);
+
+// Case G: Reply to sticker without set_name
+const ctxG = createMockContext({
+  userId: allowedUserId,
+  replyTo: {sticker: {}},
+});
+const handledG = await handleVisibilityCommand(ctxG, 'unlisted');
+assert.equal(handledG, false);
+assert.ok(
+  ctxG.replies[0].includes('Usage: /unlisted'),
+  'Sticker without set_name must respond with usage message',
+);
+
+// Case H: Nonexistent pack
+const ctxH = createMockContext({
+  userId: allowedUserId,
+  args: ['NonExistentLocalPack'],
+});
+const handledH = await handleVisibilityCommand(ctxH, 'public');
+assert.equal(handledH, false);
+assert.equal(
+  ctxH.replies[0],
+  'Sticker pack "NonExistentLocalPack" does not exist locally.',
+);
+assert.equal(
+  fs.existsSync(getStickerPackMetadataPath('NonExistentLocalPack')),
+  false,
+  'Nonexistent pack must not have a metadata file created',
+);
+
+// Case I: Unauthorized user
+const ctxI = createMockContext({
+  userId: '999999_unauthorized',
+  args: [cmdTestPackName],
+});
+const handledI = await handleVisibilityCommand(ctxI, 'public');
+assert.equal(handledI, false);
+assert.equal(
+  ctxI.replies.length,
+  0,
+  'Unauthorized command must be silently ignored',
+);
+
+// Case J: Too many args
+const ctxJ = createMockContext({
+  userId: allowedUserId,
+  args: ['Pack1', 'Pack2'],
+});
+const handledJ = await handleVisibilityCommand(ctxJ, 'public');
+assert.equal(handledJ, false);
+assert.ok(ctxJ.replies[0].includes('Usage: /public'));
+
+// Case K: Invalid pack name arg
+const ctxK = createMockContext({
+  userId: allowedUserId,
+  args: ['../traversal_pack'],
+});
+const handledK = await handleVisibilityCommand(ctxK, 'public');
+assert.equal(handledK, false);
+assert.ok(ctxK.replies[0].includes('Usage: /public'));
+
+console.log(
+  'Verified: Telegram visibility commands resolver and handlers pass all tests',
 );
 // Clean up temp dir
 await fsp.rm(tempDir, {recursive: true, force: true});
