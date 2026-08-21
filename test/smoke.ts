@@ -1517,7 +1517,102 @@ assert.ok(
 );
 
 console.log('Verified: Fastify correctly serves .gif and manifest with CORS');
-// Test 8: Fastify invalid extension real request & assertion
+
+// Test 8: Fastify static WebP and forbidden raw formats (.webm / .tgs / .exe)
+console.log('Testing Fastify endpoint for static .webp...');
+const webpFilePath = path.join(packDir, 'test_static.webp');
+await fsp.writeFile(webpFilePath, 'dummy-webp');
+const webpResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/test_static.webp`,
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+assert.equal(
+  webpResponse.statusCode,
+  200,
+  `Expected 200 for .webp, got ${webpResponse.statusCode}`,
+);
+assert.equal(
+  webpResponse.headers['content-type'],
+  'image/webp',
+  `Expected Content-Type image/webp, got ${webpResponse.headers['content-type']}`,
+);
+assert.equal(
+  webpResponse.headers['cache-control'],
+  'public, max-age=31536000',
+  `Expected cache-control header for .webp, got ${webpResponse.headers['cache-control']}`,
+);
+assert.equal(
+  webpResponse.headers['access-control-allow-origin'],
+  '*',
+  `Expected Access-Control-Allow-Origin: * for .webp, got ${webpResponse.headers['access-control-allow-origin']}`,
+);
+console.log('Verified: Fastify correctly serves static .webp');
+
+console.log('Testing Fastify rejection of raw .webm (with physical file)...');
+const rawWebmPath = path.join(packDir, 'legacy_raw.webm');
+await fsp.writeFile(rawWebmPath, 'dummy-webm');
+assert.ok(
+  fs.existsSync(rawWebmPath),
+  'Raw WebM file must physically exist before request',
+);
+const rawWebmResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/legacy_raw.webm`,
+});
+assert.equal(
+  rawWebmResponse.statusCode,
+  400,
+  `Expected 400 for raw .webm, got ${rawWebmResponse.statusCode}`,
+);
+assert.equal(
+  rawWebmResponse.body,
+  'Invalid file extension',
+  `Expected 'Invalid file extension' body for raw .webm, got ${rawWebmResponse.body}`,
+);
+const rawWebmHeadResponse = await app.inject({
+  method: 'HEAD',
+  url: `/sticker/telegram/${packName}/legacy_raw.webm`,
+});
+assert.equal(
+  rawWebmHeadResponse.statusCode,
+  400,
+  `Expected 400 for raw .webm HEAD, got ${rawWebmHeadResponse.statusCode}`,
+);
+
+console.log('Testing Fastify rejection of raw .tgs (with physical file)...');
+const rawTgsPath = path.join(packDir, 'legacy_raw.tgs');
+await fsp.writeFile(rawTgsPath, 'dummy-tgs');
+assert.ok(
+  fs.existsSync(rawTgsPath),
+  'Raw TGS file must physically exist before request',
+);
+const rawTgsResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/legacy_raw.tgs`,
+});
+assert.equal(
+  rawTgsResponse.statusCode,
+  400,
+  `Expected 400 for raw .tgs, got ${rawTgsResponse.statusCode}`,
+);
+assert.equal(
+  rawTgsResponse.body,
+  'Invalid file extension',
+  `Expected 'Invalid file extension' body for raw .tgs, got ${rawTgsResponse.body}`,
+);
+const rawTgsHeadResponse = await app.inject({
+  method: 'HEAD',
+  url: `/sticker/telegram/${packName}/legacy_raw.tgs`,
+});
+assert.equal(
+  rawTgsHeadResponse.statusCode,
+  400,
+  `Expected 400 for raw .tgs HEAD, got ${rawTgsHeadResponse.statusCode}`,
+);
+
 console.log('Testing Fastify endpoint for invalid extension .exe...');
 const invalidResponse = await app.inject({
   method: 'GET',
@@ -1528,8 +1623,9 @@ assert.equal(
   400,
   `Expected 400 for invalid extension, got ${invalidResponse.statusCode}`,
 );
-console.log('Verified: Fastify rejects invalid extension with 400');
-
+console.log(
+  'Verified: Fastify rejects invalid/raw extensions (.webm, .tgs, .exe) with 400',
+);
 // Test 9: Error handling on invalid/corrupt input
 console.log('Testing convertWebmToGif error handling with invalid input...');
 const invalidInputPath = path.join(tempDir, 'corrupt.webm');

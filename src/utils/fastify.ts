@@ -34,7 +34,7 @@ app.get(
       return;
     }
 
-    if (!/^(?:web[pm]|tgs|gif)$/i.test(fileExtension)) {
+    if (!/^(?:webp|gif)$/i.test(fileExtension)) {
       await reply.code(400).send('Invalid file extension');
       return;
     }
@@ -42,8 +42,6 @@ app.get(
     const mimeTypes: Record<string, string> = {
       gif: 'image/gif',
       webp: 'image/webp',
-      webm: 'video/webm',
-      tgs: 'application/octet-stream',
     };
     const contentType =
       mimeTypes[fileExtension.toLowerCase()] || 'application/octet-stream';
