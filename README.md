@@ -2,8 +2,6 @@
 >
 > This repository is a modified fork of the original **MoreStickersConverter** project.
 >
-> It extends the upstream project with support for animated Telegram stickers, hosted and automatically refreshable sticker packs, a public sticker pack catalog, access control, visibility management, improved downloads and caching, and better Docker support.
->
 > The original upstream README is preserved below for reference, so some parts may not fully reflect the behavior of this fork.
 >
 > Also, this project was vibecoded.
