@@ -2,126 +2,66 @@
 >
 > This repository is a modified fork of the original **MoreStickersConverter** project.
 >
-> The fork significantly extends the upstream version with support for modern Telegram sticker formats, hosted and dynamically refreshable sticker packs, a public sticker pack catalog, access control, visibility management, improved caching and download reliability, and additional runtime and testing infrastructure.
+> It extends the upstream project with support for animated Telegram stickers, hosted and automatically refreshable sticker packs, a public sticker pack catalog, access control, visibility management, improved downloads and caching, and better Docker support.
 >
-> The original upstream README is preserved below for reference. Some instructions or descriptions in the upstream documentation may not fully reflect the behavior of this fork.
+> The original upstream README is preserved below for reference, so some parts may not fully reflect the behavior of this fork.
 >
-> Also this project was vibecoded.
+> Also, this project was vibecoded.
 
 ## Changes in this fork
 
-### Telegram sticker format support
+### Better Telegram sticker support
 
-This fork expands Telegram sticker support beyond static WebP stickers:
+The fork supports all common Telegram sticker formats:
 
-* Static Telegram stickers are preserved as **WebP**.
-* Telegram video stickers in **WebM** format are converted server-side to animated **GIF** files using FFmpeg.
-* Telegram animated stickers in **TGS** format are converted server-side to animated **GIF** files using `lottieconverter`.
-* GIF conversion uses multiple encoding profiles and adaptive compression to target approximately **5 MB** while keeping generated files below the **10 MB limit**.
-* Animated stickers are marked as ready to upload in generated manifests.
-* WebP previews are generated automatically for both static and animated stickers.
+* Static **WebP** stickers are preserved as-is.
+* Video stickers in **WebM** format are converted to animated **GIFs**.
+* Animated **TGS** stickers are also converted to animated **GIFs**.
+* GIFs are automatically compressed to stay within practical upload limits.
+* Previews are generated automatically for both static and animated stickers.
 
-### Hosted sticker packs
+### Hosted and refreshable sticker packs
 
-Instead of sending the generated `.stickerpack` file directly through Telegram, the bot returns a URL to a hosted manifest:
+Sticker packs are now hosted by the converter instead of being sent as `.stickerpack` files directly through Telegram.
 
-```text
-/stickerpack/telegram/<pack-name>
-```
+Generated packs support automatic versioning and refreshing. When stickers are added, removed, reordered, renamed, or otherwise changed, the pack version is updated. If nothing changed, the existing version is kept.
 
-Sticker assets are hosted by the built-in HTTP server:
-
-```text
-/sticker/telegram/<pack-name>/<filename>
-```
-
-Generated previews are available through:
-
-```text
-/preview/telegram/<pack-name>/<sticker-id>.webp
-```
-
-Raw `.webm` and `.tgs` source files are not exposed as final sticker assets. Clients receive the converted `.gif` or original `.webp` files instead.
-
-### Dynamic sticker packs
-
-Generated manifests contain dynamic pack metadata that allows clients to retrieve updated versions of a sticker pack without importing a completely separate pack every time it changes.
-
-This includes:
-
-* automatic pack versioning,
-* a `refreshUrl` pointing to the latest hosted manifest,
-* version increments when sticker content changes,
-* stable versions when regenerated content is unchanged.
-
-Changes that can trigger a new version include:
-
-* stickers being added or removed,
-* sticker order changing,
-* sticker IDs changing,
-* sticker emoji or title changing.
-
-Manifest writes are performed atomically and serialized per pack to reduce the risk of corrupted data when multiple requests operate on the same sticker pack.
+This allows imported packs to stay connected to their latest generated version.
 
 ### Public sticker pack catalog
 
-The fork includes a built-in web interface available from:
+The fork includes a built-in web interface for browsing shared sticker packs.
 
-```text
-/
-```
+The catalog provides:
 
-It provides a public browser for sticker packs marked as visible.
-
-The catalog includes:
-
-* sticker pack previews,
+* pack previews,
 * sticker counts,
-* pack search,
-* sticker preview galleries,
-* direct pack URL copying.
+* search,
+* sticker galleries,
+* easy copying of sticker pack links.
 
-Public packs can also be queried through:
+Imported packs are **unlisted by default**.
 
-```text
-GET /api/stickerpacks
-```
-
-The catalog is generated from the current stored pack metadata, so visibility changes do not require restarting the service.
-
-### Public and unlisted packs
-
-Imported sticker packs are **unlisted by default**.
-
-Authorized users can control whether a pack appears in the public catalog with Telegram bot commands:
+Authorized users can make a pack public or unlisted again using:
 
 ```text
 /public <pack-name>
 /unlisted <pack-name>
 ```
 
-The commands can also be used by replying to a sticker belonging to the target pack.
+These commands can also be used by replying to a sticker from the target pack.
 
-An unlisted pack:
+Unlisted packs do not appear in the public catalog but remain accessible through their direct link.
 
-* does not appear in the public catalog,
-* remains available through its direct sticker pack URL.
+### Telegram access control
 
-### Telegram user access control
-
-Bot access can be restricted with:
+Bot access can be limited with:
 
 ```text
 ALLOWED_TELEGRAM_USER_IDS
 ```
 
-The value is a comma-separated list of Telegram user IDs allowed to:
-
-* import sticker packs,
-* use `/public`,
-* use `/unlisted`.
-
-Access control is deny-by-default. If `ALLOWED_TELEGRAM_USER_IDS` is empty or not configured, Telegram requests are ignored.
+Only listed Telegram users can import packs or change their visibility.
 
 Example:
 
@@ -129,21 +69,17 @@ Example:
 ALLOWED_TELEGRAM_USER_IDS=123456789,987654321
 ```
 
-### Parallel downloads
+If the allowlist is empty or not configured, Telegram requests are ignored.
 
-Sticker downloads can run concurrently.
+### Faster and more reliable downloads
 
-The number of download workers is controlled by:
+Sticker downloads can run in parallel, with the number of workers controlled by:
 
 ```text
 CONCURRENCY
 ```
 
-The default value is:
-
-```text
-5
-```
+The default is `5`.
 
 Example:
 
@@ -151,29 +87,19 @@ Example:
 CONCURRENCY=8
 ```
 
-The downloader also includes retry handling for failed Telegram file downloads and uses streaming pipelines with proper error propagation.
+Failed Telegram downloads are retried automatically, and download handling has been improved to avoid incomplete or corrupted files.
 
-### Cache handling
+### Improved caching
 
-The fork includes additional cache validation for previously generated sticker packs.
+Previously generated packs are reused when possible.
 
-Legacy cached packs that still reference unsupported animated source formats such as WebM or TGS are automatically considered outdated and regenerated using the current GIF-based format.
+Older cached packs using outdated WebM/TGS handling are detected automatically and regenerated using the current GIF-based format, while compatible WebP/GIF caches remain valid.
 
-Existing compatible WebP/GIF caches can continue to be reused.
+### Safer and more robust server
 
-### HTTP server improvements
+The built-in server has been improved with better request validation, safer file handling, correct asset metadata, caching support, and protection against malformed paths.
 
-The built-in HTTP server includes additional behavior required by hosted sticker packs and the public catalog:
-
-* CORS support,
-* appropriate MIME types,
-* cache headers for served assets,
-* stricter validation of pack names,
-* stricter validation of sticker IDs and filenames,
-* extension validation,
-* protection against malformed paths and path traversal.
-
-### Runtime requirements
+### Docker and runtime
 
 This fork requires:
 
@@ -181,54 +107,28 @@ This fork requires:
 * **FFmpeg**
 * **lottieconverter**
 
-The provided Docker image includes the required conversion tools.
+The provided Docker image uses **Node.js 22** and already includes the required conversion tools and public web interface.
 
-The Docker build environment uses **Node.js 22**.
-
-### Docker changes
-
-The Docker image additionally includes:
-
-* FFmpeg,
-* `lottieconverter`,
-* the public catalog frontend,
-* a build-time smoke test.
-
-Docker or Docker Compose is therefore the recommended deployment method if animated Telegram sticker conversion is required.
-
-### Development environment
-
-A Nix flake is included for reproducible local development with the required tools, including:
-
-* Node.js 22,
-* pnpm,
-* FFmpeg,
-* `lottieconverter`.
+A Nix development environment is also available with Node.js, pnpm, FFmpeg, and `lottieconverter`.
 
 ### Testing
 
-The fork includes an expanded smoke test suite.
+The fork includes an expanded smoke test suite covering the main functionality, including:
 
-Running:
+* WebM and TGS conversion,
+* GIF generation and size handling,
+* previews,
+* sticker pack generation and versioning,
+* caching,
+* public/unlisted packs,
+* Telegram authorization,
+* invalid input handling.
+
+Run the test suite with:
 
 ```bash
 pnpm test
 ```
-
-builds the project and executes tests covering areas such as:
-
-* WebM conversion,
-* TGS conversion,
-* GIF size handling,
-* preview generation,
-* manifest generation,
-* dynamic versioning,
-* cache behavior,
-* HTTP endpoints,
-* CORS,
-* pack visibility,
-* Telegram authorization,
-* malformed request handling.
 
 ---
 
