@@ -4,7 +4,7 @@
   "description": "",
   "main": "build/src/index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "pnpm run build && node build/test/smoke.js",
     "lint": "gts lint",
     "clean": "gts clean",
     "build": "tsc",
@@ -25,7 +25,7 @@
     "telegraf": "^4.16.3"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=20.0.0"
   },
   "type": "module"
 }

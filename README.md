@@ -23,13 +23,14 @@ This project includes both the Telegram bot logic and the HTTP server used to ho
 
 Before running the service, configure the following environment variables:
 
-| Variable         | Description                                                                                                                                                             |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **BOT_TOKEN**    | Telegram bot token                                                                                                                                                      |
-| **PORT**         | Port on which the built-in HTTP server will listen                                                                                                                      |
-| **DATA_DIR**     | Directory where all sticker data is stored                                                                                                                              |
-| **EXTERNAL_URL** | Public URL of this HTTP server. Required when running behind a reverse proxy. <br>Discord clients typically require HTTPS, otherwise a Mixed-Content warning may occur. |
-
+| Variable                      | Description                                                                                                                                                             |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **BOT_TOKEN**                 | Telegram bot token                                                                                                                                                      |
+| **PORT**                      | Port on which the built-in HTTP server will listen                                                                                                                      |
+| **DATA_DIR**                  | Directory where all sticker data is stored                                                                                                                              |
+| **EXTERNAL_URL**              | Public URL of this HTTP server. Required when running behind a reverse proxy. <br>Discord clients typically require HTTPS, otherwise a Mixed-Content warning may occur. |
+| **ALLOWED_TELEGRAM_USER_IDS** | Comma-separated Telegram user IDs allowed to use the bot (import stickers and manage pack visibility via `/public` and `/unlisted`). If empty or unset, all requests are ignored. |
+| **CONCURRENCY**               | Optional: positive integer specifying the number of parallel sticker download workers (default: `5`).                                                                   |
 ---
 
 ## 🐳 Recommended: Run with Docker
@@ -48,7 +49,7 @@ You can build the image locally or use the prebuilt image from `ghcr.io/lekoowo/
 
 1. Send a sticker to your Telegram bot
 2. The bot downloads the sticker file
-3. The bot generates and sends back a `.stickerpack` file
+3. The bot returns the sticker pack URL / hosted manifest URL (`/stickerpack/telegram/<pack>`)
 4. Sticker images are served by this project's HTTP server (they are **not embedded** inside the `.stickerpack` file)
 
 ---

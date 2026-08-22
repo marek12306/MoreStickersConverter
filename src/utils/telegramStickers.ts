@@ -11,7 +11,19 @@ import {convertWebmToGif} from './webmToGif.js';
 import {convertTgsToGif} from './tgsToGif.js';
 import {generatePreview} from './stickerPreview.js';
 const DATA_DIR = path.join(path.resolve(process.env.DATA_DIR!), 'telegram');
-const CONCURRENCY = parseInt(process.env.CONCURRENCY || '5', 10);
+
+export function parseDownloadConcurrency(rawValue: string | undefined): number {
+  if (rawValue === undefined || rawValue === '') {
+    return 5;
+  }
+  const parsed = Number(rawValue);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error('CONCURRENCY must be a positive integer');
+  }
+  return parsed;
+}
+
+const CONCURRENCY = parseDownloadConcurrency(process.env.CONCURRENCY);
 const MC_STICKER_PACK_ID_PREFIX = 'MoreStickers:Telegram:Pack';
 const MC_STICKER_ID_PREFIX = 'MoreStickers:Telegram:Sticker';
 const EXTERNAL_URL = process.env.EXTERNAL_URL!;

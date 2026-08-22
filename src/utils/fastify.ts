@@ -7,6 +7,7 @@ import {
   generateStickerPreviewFilePath,
 } from './telegramStickers.js';
 import {getPublicStickerPacks} from './stickerPackCatalog.js';
+import {isValidStickerPackName} from './stickerPackMetadata.js';
 import fs from 'fs';
 interface ParamsType {
   stickerPackName: string;
@@ -33,7 +34,7 @@ app.get(
     const fileExtension = extension.slice(1).toLowerCase();
 
     // Sanitize stickerPackName and stickerId
-    if (!/^[a-z0-9_]+$/i.test(stickerPackName)) {
+    if (!isValidStickerPackName(stickerPackName)) {
       await reply.code(400).send('Invalid sticker pack name');
       return;
     }
@@ -63,6 +64,21 @@ app.get(
     };
     const contentType = mimeTypes[fileExtension] || 'application/octet-stream';
     const stickerFilePath = path.join(DATA_DIR, stickerPackName, filename);
+    try {
+      await fs.promises.access(stickerFilePath, fs.constants.R_OK);
+    } catch (err: unknown) {
+      if (
+        typeof err === 'object' &&
+        err !== null &&
+        'code' in err &&
+        (err as {code: string}).code === 'ENOENT'
+      ) {
+        await reply.code(404).send('Sticker not found');
+        return;
+      }
+      await reply.code(500).send('Internal server error');
+      return;
+    }
 
     try {
       const fileStream = fs.createReadStream(stickerFilePath, {
@@ -86,7 +102,7 @@ app.get(
     const stickerId = path.basename(filename, extension);
     const fileExtension = extension.slice(1).toLowerCase();
 
-    if (!/^[a-z0-9_]+$/i.test(stickerPackName)) {
+    if (!isValidStickerPackName(stickerPackName)) {
       await reply.code(400).send('Invalid sticker pack name');
       return;
     }
@@ -139,11 +155,15 @@ app.get<{Params: StickerPackParamsType}>(
   async (request, reply) => {
     const {stickerPackName} = request.params;
 
+    if (!isValidStickerPackName(stickerPackName)) {
+      await reply.code(400).send('Invalid sticker pack name');
+      return;
+    }
+
     const stickerPackFilePath = generateStickerPackFilePath(stickerPackName);
 
     try {
       await fs.promises.access(stickerPackFilePath, fs.constants.R_OK);
-
       const fileStream = fs.createReadStream(stickerPackFilePath, {
         highWaterMark: 64 * 1024,
       });

@@ -53,6 +53,7 @@ const {
   generateStickerPreviewFilePath,
   getStickerMediaInfo,
   fetchStickerWithRetry,
+  parseDownloadConcurrency,
   toMcStickerPack,
 } = await import('../src/utils/telegramStickers.js');
 const {
@@ -151,6 +152,42 @@ assert.ok(
 assert.ok(
   firstWebmFilter.includes('min(192,ih)'),
   `Expected WebM filter to use scaled max dimension 192, got ${firstWebmFilter}`,
+);
+
+// Test 0.9: Concurrency configuration parser
+console.log('Testing parseDownloadConcurrency...');
+assert.equal(parseDownloadConcurrency(undefined), 5);
+assert.equal(parseDownloadConcurrency(''), 5);
+assert.equal(parseDownloadConcurrency('1'), 1);
+assert.equal(parseDownloadConcurrency('2'), 2);
+assert.equal(parseDownloadConcurrency('20'), 20);
+
+assert.throws(
+  () => parseDownloadConcurrency('0'),
+  /CONCURRENCY must be a positive integer/,
+);
+assert.throws(
+  () => parseDownloadConcurrency('-1'),
+  /CONCURRENCY must be a positive integer/,
+);
+assert.throws(
+  () => parseDownloadConcurrency('abc'),
+  /CONCURRENCY must be a positive integer/,
+);
+assert.throws(
+  () => parseDownloadConcurrency('2.5'),
+  /CONCURRENCY must be a positive integer/,
+);
+assert.throws(
+  () => parseDownloadConcurrency('Infinity'),
+  /CONCURRENCY must be a positive integer/,
+);
+assert.throws(
+  () => parseDownloadConcurrency('NaN'),
+  /CONCURRENCY must be a positive integer/,
+);
+console.log(
+  'Verified: parseDownloadConcurrency correctly validates environment values',
 );
 
 // Test 1: Unit Tests for getStickerMediaInfo
@@ -1697,6 +1734,62 @@ assert.ok(
 
 console.log('Verified: Fastify correctly serves .gif and manifest with CORS');
 
+// Manifest Path Traversal and Invalid Pack Name tests
+console.log(
+  'Testing Fastify manifest path traversal protection and validation...',
+);
+const escapedManifestPath = path.join(tempDir, 'escaped.telegram.stickerpack');
+await fsp.writeFile(
+  escapedManifestPath,
+  JSON.stringify({id: 'SHOULD-NOT-BE-SERVED', pack: 'escaped'}),
+);
+
+const traversalGet = await app.inject({
+  method: 'GET',
+  url: '/stickerpack/telegram/..%2Fescaped',
+});
+assert.equal(
+  traversalGet.statusCode,
+  400,
+  'Expected 400 for path traversal GET',
+);
+assert.equal(traversalGet.body, 'Invalid sticker pack name');
+assert.equal(
+  traversalGet.body.includes('SHOULD-NOT-BE-SERVED'),
+  false,
+  'Escaped manifest content must NOT be served',
+);
+
+const traversalHead = await app.inject({
+  method: 'HEAD',
+  url: '/stickerpack/telegram/..%2Fescaped',
+});
+assert.equal(
+  traversalHead.statusCode,
+  400,
+  'Expected 400 for path traversal HEAD',
+);
+
+const backslashGet = await app.inject({
+  method: 'GET',
+  url: '/stickerpack/telegram/..%5Cescaped',
+});
+assert.equal(
+  backslashGet.statusCode,
+  400,
+  'Expected 400 for backslash traversal GET',
+);
+assert.equal(backslashGet.body, 'Invalid sticker pack name');
+assert.equal(
+  backslashGet.body.includes('SHOULD-NOT-BE-SERVED'),
+  false,
+  'Escaped manifest content must NOT be served on backslash',
+);
+
+console.log(
+  'Verified: Fastify manifest endpoint rejects path traversal and invalid pack names',
+);
+
 // Test 8: Fastify static WebP and forbidden raw formats (.webm / .tgs / .exe)
 console.log('Testing Fastify endpoint for static .webp...');
 const webpFilePath = path.join(packDir, 'test_static.webp');
@@ -1730,6 +1823,37 @@ assert.equal(
 );
 console.log('Verified: Fastify correctly serves static .webp');
 
+console.log('Testing Fastify full asset missing file handling (404)...');
+const missingGifResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${packName}/missing_sticker.gif`,
+});
+assert.equal(
+  missingGifResponse.statusCode,
+  404,
+  `Expected 404 for missing .gif, got ${missingGifResponse.statusCode}`,
+);
+assert.equal(
+  missingGifResponse.body,
+  'Sticker not found',
+  `Expected 'Sticker not found' body for missing .gif, got ${missingGifResponse.body}`,
+);
+
+const missingWebpHeadResponse = await app.inject({
+  method: 'HEAD',
+  url: `/sticker/telegram/${packName}/missing_sticker.webp`,
+});
+assert.equal(
+  missingWebpHeadResponse.statusCode,
+  404,
+  `Expected 404 for missing .webp HEAD, got ${missingWebpHeadResponse.statusCode}`,
+);
+assert.equal(
+  missingWebpHeadResponse.body,
+  '',
+  `Expected empty body for missing .webp HEAD, got length ${missingWebpHeadResponse.body.length}`,
+);
+console.log('Verified: Fastify returns 404 for missing full assets (GET/HEAD)');
 console.log('Testing Fastify rejection of raw .webm (with physical file)...');
 const rawWebmPath = path.join(packDir, 'legacy_raw.webm');
 await fsp.writeFile(rawWebmPath, 'dummy-webm');

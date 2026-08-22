@@ -1,4 +1,4 @@
-import {Input, Telegraf} from 'telegraf';
+import {Telegraf} from 'telegraf';
 import {message} from 'telegraf/filters';
 import {
   downloadStickerPack,
@@ -60,6 +60,7 @@ bot.on(message('sticker'), async ctx => {
       // ignore cleanup error
     }
     await ctx.reply('StickerPack download error.');
+    return;
   }
   try {
     await fsp.access(mcStickerPackPath);
