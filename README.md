@@ -1,12 +1,12 @@
 > [!IMPORTANT]
 >
-> ## About this fork
->
 > This repository is a modified fork of the original **MoreStickersConverter** project.
 >
 > The fork significantly extends the upstream version with support for modern Telegram sticker formats, hosted and dynamically refreshable sticker packs, a public sticker pack catalog, access control, visibility management, improved caching and download reliability, and additional runtime and testing infrastructure.
 >
 > The original upstream README is preserved below for reference. Some instructions or descriptions in the upstream documentation may not fully reflect the behavior of this fork.
+>
+> Also this project was vibecoded.
 
 ## Changes in this fork
 
@@ -231,10 +231,6 @@ builds the project and executes tests covering areas such as:
 * malformed request handling.
 
 ---
-
-## Upstream README
-
-The original project documentation follows below.
 
 # MoreStickersConverter
 
