@@ -173,4 +173,18 @@ app.get('/api/stickerpacks', async (_request, reply) => {
     .send(packs);
 });
 
+const browserIndexPath = path.resolve('public/index.html');
+
+app.get('/', async (_request, reply) => {
+  try {
+    const html = await fs.promises.readFile(browserIndexPath, 'utf8');
+    await reply
+      .type('text/html; charset=utf-8')
+      .header('Cache-Control', 'no-cache')
+      .send(html);
+  } catch {
+    await reply.code(500).send('Browser page unavailable');
+  }
+});
+
 export {app};

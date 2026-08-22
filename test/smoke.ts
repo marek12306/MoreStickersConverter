@@ -3234,6 +3234,182 @@ console.log(
   'Verified: Public Catalog and /api/stickerpacks endpoint pass all tests',
 );
 
+console.log('Testing Public Browser GET / HTML endpoint...');
+const rootGetResponse = await app.inject({
+  method: 'GET',
+  url: '/',
+  headers: {
+    origin: 'https://discord.com',
+  },
+});
+assert.equal(rootGetResponse.statusCode, 200, 'GET / must return status 200');
+assert.equal(
+  rootGetResponse.headers['content-type'],
+  'text/html; charset=utf-8',
+  'GET / Content-Type must be text/html; charset=utf-8',
+);
+assert.equal(
+  rootGetResponse.headers['cache-control'],
+  'no-cache',
+  'GET / Cache-Control must be no-cache',
+);
+assert.equal(
+  rootGetResponse.headers['access-control-allow-origin'],
+  '*',
+  'GET / must include CORS header Access-Control-Allow-Origin: *',
+);
+
+const rootHtml = rootGetResponse.body;
+assert.ok(
+  rootHtml.includes('MoreStickersConverter'),
+  'HTML must contain MoreStickersConverter brand',
+);
+assert.ok(
+  rootHtml.includes('id="search"'),
+  'HTML must contain search input id="search"',
+);
+assert.ok(
+  rootHtml.includes('id="tag"'),
+  'HTML must contain tag select id="tag"',
+);
+assert.ok(
+  rootHtml.includes('id="grid"'),
+  'HTML must contain grid section id="grid"',
+);
+assert.ok(
+  rootHtml.includes('id="overlay"'),
+  'HTML must contain drawer overlay id="overlay"',
+);
+assert.ok(
+  rootHtml.includes('CATALOG_API_URL'),
+  'HTML must define CATALOG_API_URL',
+);
+assert.ok(
+  rootHtml.includes('/api/stickerpacks'),
+  'HTML must use /api/stickerpacks endpoint',
+);
+
+// Verify proper Unicode characters from mockup are preserved via ASCII-safe HTML entities / JS escapes
+assert.ok(
+  rootHtml.includes('<span>&#8981;</span>'),
+  'HTML must preserve the mockup search icon via &#8981;',
+);
+assert.ok(
+  rootHtml.includes('Loading&hellip;'),
+  'HTML must preserve the initial loading ellipsis via &hellip;',
+);
+assert.ok(
+  rootHtml.includes('aria-label="Close">&times;</button>'),
+  'HTML must preserve the drawer close symbol via &times;',
+);
+assert.ok(
+  rootHtml.includes('Loading pack manifest\\u2026'),
+  'HTML must preserve the drawer loading ellipsis via \\u2026',
+);
+assert.ok(
+  rootHtml.includes('Loading catalog\\u2026'),
+  'HTML must preserve the catalog loading ellipsis via \\u2026',
+);
+
+// Verify no mojibake / question mark placeholder corruption
+assert.equal(
+  rootHtml.includes('<span>???</span>'),
+  false,
+  'HTML must NOT contain <span>???</span>',
+);
+assert.equal(
+  rootHtml.includes('Loading???'),
+  false,
+  'HTML must NOT contain Loading???',
+);
+assert.equal(
+  rootHtml.includes('Loading pack manifest???'),
+  false,
+  'HTML must NOT contain Loading pack manifest???',
+);
+assert.equal(
+  rootHtml.includes('Loading catalog???'),
+  false,
+  'HTML must NOT contain Loading catalog???',
+);
+assert.equal(
+  rootHtml.includes('aria-label="Close">??</button>'),
+  false,
+  'Close button must not contain question-mark corruption',
+);
+
+// Verify production mock data is removed
+assert.equal(
+  rootHtml.includes('USE_MOCK_DATA'),
+  false,
+  'HTML must NOT contain USE_MOCK_DATA',
+);
+assert.equal(
+  rootHtml.includes('MOCK_PACKS'),
+  false,
+  'HTML must NOT contain MOCK_PACKS',
+);
+assert.equal(
+  rootHtml.includes('svgPreview'),
+  false,
+  'HTML must NOT contain svgPreview mock helper',
+);
+
+console.log('Testing Public Browser HEAD / endpoint...');
+const rootHeadResponse = await app.inject({
+  method: 'HEAD',
+  url: '/',
+});
+assert.equal(rootHeadResponse.statusCode, 200, 'HEAD / must return status 200');
+assert.equal(rootHeadResponse.body, '', 'HEAD / body must be empty');
+assert.equal(
+  rootHeadResponse.headers['content-type'],
+  'text/html; charset=utf-8',
+  'HEAD / Content-Type must be text/html; charset=utf-8',
+);
+assert.equal(
+  rootHeadResponse.headers['cache-control'],
+  'no-cache',
+  'HEAD / Cache-Control must be no-cache',
+);
+
+console.log('Testing Public Browser OPTIONS / endpoint...');
+const rootOptionsResponse = await app.inject({
+  method: 'OPTIONS',
+  url: '/',
+  headers: {
+    origin: 'https://discord.com',
+    'access-control-request-method': 'GET',
+  },
+});
+assert.equal(
+  rootOptionsResponse.statusCode,
+  204,
+  'OPTIONS / must return status 204',
+);
+assert.equal(
+  rootOptionsResponse.headers['access-control-allow-origin'],
+  '*',
+  'OPTIONS / must include Access-Control-Allow-Origin: *',
+);
+const allowMethods = String(
+  rootOptionsResponse.headers['access-control-allow-methods'] || '',
+);
+assert.ok(
+  allowMethods.includes('GET'),
+  'OPTIONS / Allow Methods must include GET',
+);
+assert.ok(
+  allowMethods.includes('HEAD'),
+  'OPTIONS / Allow Methods must include HEAD',
+);
+assert.ok(
+  allowMethods.includes('OPTIONS'),
+  'OPTIONS / Allow Methods must include OPTIONS',
+);
+
+console.log('Verified: Public Browser GET/HEAD/OPTIONS / pass all tests');
+
 console.log('Testing Telegram visibility commands resolver and handlers...');
 const cmdTestPackName = 'CommandTestPack';
 await fsp.writeFile(

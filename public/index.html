@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MoreStickersConverter</title>
+<style>
+:root{
+  color-scheme:dark;
+  --bg:#0d0f12;
+  --panel:#13161a;
+  --panel2:#171b20;
+  --line:#242931;
+  --line2:#343a44;
+  --text:#f4f5f7;
+  --muted:#8b949e;
+  --muted2:#66707b;
+  --green:#68d391
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0;
+  min-height:100vh;
+  background:var(--bg);
+  color:var(--text);
+  font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
+}
+button,input,select{font:inherit}
+.shell{width:min(1120px,calc(100% - 32px));margin:auto}
+
+header{
+  position:sticky;
+  top:0;
+  z-index:20;
+  background:rgba(13,15,18,.94);
+  backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line)
+}
+.topbar{height:62px;display:flex;align-items:center;gap:12px}
+.brand{display:flex;align-items:center}
+.mark{
+  width:30px;height:30px;border-radius:8px;
+  display:grid;place-items:center;
+  font-size:16px;font-weight:700;
+  background:var(--text);color:var(--bg);
+  box-shadow:none
+}
+.brand b{display:block;font-size:14px}
+.brand span{display:none}
+.spacer{flex:1}
+
+.btn{
+  min-height:34px;
+  border-radius:8px;
+  border:1px solid var(--line);
+  padding:0 11px;
+  color:var(--muted);
+  background:transparent;
+  cursor:pointer
+}
+.btn:hover{color:var(--text);background:var(--panel)}
+.btn.primary{
+  color:var(--bg);
+  background:var(--text);
+  border-color:var(--text);
+  font-weight:600
+}
+
+main{padding:38px 0 68px}
+.hero{
+  display:block;
+  margin-bottom:28px
+}
+.pill{
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  padding:0;
+  border:0;
+  border-radius:0;
+  color:var(--muted);
+  background:transparent;
+  font-size:12px;
+  margin-bottom:12px
+}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:none}
+h1{
+  margin:0;
+  max-width:760px;
+  font-size:clamp(30px,5vw,46px);
+  line-height:1.05;
+  letter-spacing:-.04em
+}
+.hero p{
+  margin:12px 0 0;
+  color:var(--muted);
+  font-size:14px;
+  max-width:620px
+}
+.stats{
+  display:flex;
+  gap:18px;
+  margin-top:18px
+}
+.stat{
+  padding:0;
+  border:0;
+  border-radius:0;
+  background:transparent
+}
+.stat b{display:inline;font-size:13px;letter-spacing:0}
+.stat span{margin-left:5px;color:var(--muted2);font-size:11px}
+
+.toolbar{
+  position:static;
+  display:grid;
+  grid-template-columns:minmax(220px,1fr) auto;
+  gap:8px;
+  padding:0;
+  border:0;
+  border-radius:0;
+  background:transparent;
+  backdrop-filter:none;
+  margin-bottom:20px
+}
+.search{position:relative}
+.search span{
+  position:absolute;
+  left:12px;top:50%;
+  transform:translateY(-50%);
+  opacity:.45
+}
+.ctrl{
+  width:100%;
+  min-height:38px;
+  border-radius:8px;
+  border:1px solid var(--line);
+  background:var(--panel);
+  color:var(--text);
+  outline:0
+}
+.search input{padding:0 11px 0 36px}
+.ctrl:focus{border-color:#4d5560;box-shadow:none}
+select.ctrl{padding:0 30px 0 10px}
+
+.meta{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  margin:0 0 10px;
+  color:var(--muted2);
+  font-size:11px
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:repeat(5,minmax(0,1fr));
+  gap:10px
+}
+.card{
+  min-width:0;
+  border:1px solid var(--line);
+  border-radius:12px;
+  overflow:hidden;
+  background:var(--panel);
+  cursor:pointer;
+  transition:.15s
+}
+.card:hover{
+  transform:translateY(-1px);
+  border-color:var(--line2);
+  background:var(--panel2)
+}
+.preview{
+  aspect-ratio:1;
+  display:grid;
+  place-items:center;
+  background:#101318;
+  border-bottom:1px solid var(--line)
+}
+.preview img{
+  width:70%;height:70%;
+  object-fit:contain;
+  filter:none;
+  transition:.15s
+}
+.card:hover .preview img{transform:scale(1.02)}
+.body{padding:10px 11px 11px}
+.row{display:flex;gap:8px;align-items:center}
+.title{min-width:0;flex:1;display:flex;align-items:center}
+.title b,.title span{
+  display:block;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis
+}
+.title b{font-size:13px;font-weight:600}
+.title span{margin-top:2px;color:var(--muted2);font-size:10px}
+
+.copy-link{
+  flex:none;
+  width:26px;
+  height:26px;
+  display:grid;
+  place-items:center;
+  padding:0;
+  border:1px solid var(--line);
+  border-radius:7px;
+  background:transparent;
+  color:var(--muted2);
+  cursor:pointer;
+  align-self:center
+}
+.copy-link:hover{
+  color:var(--text);
+  background:var(--panel2);
+  border-color:var(--line2)
+}
+.copy-link svg{
+  width:13px;
+  height:13px;
+  pointer-events:none
+}
+
+.count{
+  padding:0;
+  border:0;
+  border-radius:0;
+  color:var(--muted2);
+  background:transparent;
+  font-size:10px
+}
+.tags{display:none}
+
+.empty{
+  grid-column:1/-1;
+  padding:52px 18px;
+  text-align:center;
+  border:1px dashed var(--line);
+  border-radius:12px;
+  color:var(--muted)
+}
+.empty b{display:block;color:var(--text);margin-bottom:4px}
+
+.overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  z-index:50;
+  background:rgba(0,0,0,.66);
+  backdrop-filter:none
+}
+.overlay.open{display:block}
+.drawer{
+  position:absolute;
+  right:0;top:0;
+  height:100%;
+  width:min(600px,100%);
+  overflow:auto;
+  border-left:1px solid var(--line);
+  background:var(--bg);
+  box-shadow:none
+}
+.dhead{
+  position:sticky;top:0;z-index:3;
+  height:52px;
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  padding:0 18px;
+  border-bottom:0;
+  background:#181c22;
+  backdrop-filter:none
+}
+.close{
+  width:32px;height:32px;
+  border-radius:8px;
+  border:1px solid var(--line);
+  background:transparent;
+  color:var(--muted);
+  font-size:18px;
+  cursor:pointer
+}
+.close:hover{color:var(--text);background:var(--panel)}
+.dcontent{padding:0 18px 34px}
+.packhero{
+  display:grid;
+  grid-template-columns:92px minmax(0,1fr) auto;
+  gap:16px;
+  align-items:center;
+  padding:14px 18px 20px;
+  margin:0 -18px 18px;
+  background:#181c22;
+  border-bottom:1px solid var(--line)
+}
+.heroimg{
+  width:92px;
+  aspect-ratio:1;
+  display:grid;
+  place-items:center;
+  border:1px solid #313741;
+  border-radius:12px;
+  background:#20252c
+}
+.heroimg img{width:74%;height:74%;object-fit:contain}
+.packhero h2{margin:0;font-size:22px;letter-spacing:-.025em}
+.packhero p{margin:6px 0 0;color:var(--muted)}
+.herocopy{min-width:0}
+.herocopy h2{
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis
+}
+.hero-copy{
+  min-height:36px;
+  padding:0 12px;
+  border:1px solid #3a414c;
+  border-radius:9px;
+  background:#22272f;
+  color:var(--text);
+  font-weight:600;
+  white-space:nowrap;
+  cursor:pointer
+}
+.hero-copy:hover{background:#292f38}
+.stickers{
+  display:grid;
+  grid-template-columns:repeat(5,minmax(0,1fr));
+  gap:7px
+}
+.st{
+  aspect-ratio:1;
+  display:grid;
+  place-items:center;
+  border:1px solid var(--line);
+  border-radius:9px;
+  background:var(--panel)
+}
+.st img{width:76%;height:76%;object-fit:contain}
+.loading{grid-column:1/-1;padding:26px;text-align:center;color:var(--muted)}
+
+footer{
+  border-top:1px solid var(--line);
+  padding:20px 0 30px;
+  color:var(--muted2);
+  font-size:11px
+}
+
+@media(max-width:960px){
+  .grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+}
+@media(max-width:760px){
+  .shell{width:min(100% - 22px,1120px)}
+  main{padding-top:28px}
+  .toolbar{grid-template-columns:1fr 1fr}
+  .search{grid-column:1/-1}
+  .grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@media(max-width:560px){
+  .topbar .btn:not(.primary){display:none}
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .stats{gap:12px;flex-wrap:wrap}
+  .packhero{grid-template-columns:76px minmax(0,1fr)}.hero-copy{grid-column:1/-1;justify-self:start}
+  .packhero h2{font-size:19px}.heroimg{width:76px}
+  .stickers{grid-template-columns:repeat(4,minmax(0,1fr))}
+}
+@media(max-width:390px){
+  .toolbar{grid-template-columns:1fr}
+  .search{grid-column:auto}
+  .stickers{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+</style>
+</head>
+<body>
+<header><div class="shell topbar"><div class="brand"><div><b>MoreStickersConverter</b></div></div><div class="spacer"></div></div></header>
+<main class="shell">
+<section class="toolbar"><div class="search"><span>&#8981;</span><input id="search" class="ctrl" placeholder="Search..."></div><select id="tag" class="ctrl"><option value="">All tags</option></select></section>
+<div class="meta"><span id="resultCount">Loading&hellip;</span></div><section class="grid" id="grid"></section></main>
+<div class="overlay" id="overlay"><aside class="drawer"><div class="dhead"><button class="close" id="close" aria-label="Close">&times;</button></div><div class="dcontent" id="dcontent"></div></aside></div>
+<script>
+const CATALOG_API_URL = '/api/stickerpacks';
+let all = [], filtered = [];
+const $ = q => document.querySelector(q);
+const esc = v => String(v ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+
+async function load() {
+  const r = await fetch(CATALOG_API_URL, {
+    headers: {
+      Accept: 'application/json',
+    },
+  });
+  if (!r.ok) throw new Error('Catalog request failed: ' + r.status);
+  return r.json();
+}
+
+function tags() {
+  for (const t of [...new Set(all.flatMap(p => p.tags || []))].sort()) {
+    $('#tag').insertAdjacentHTML('beforeend', `<option value="${esc(t)}">#${esc(t)}</option>`);
+  }
+}
+
+function apply() {
+  const q = $('#search').value.trim().toLowerCase(), tag = $('#tag').value;
+  filtered = all.filter(p => {
+    const hay = [p.title, p.name, p.id, ...(p.tags || [])].join(' ').toLowerCase();
+    return (!q || hay.includes(q)) && (!tag || (p.tags || []).includes(tag));
+  });
+  filtered.sort((a, b) => a.title.localeCompare(b.title, 'pl'));
+  render();
+}
+
+async function copyPackUrl(url) {
+  const u = new URL(url || '', location.href).href;
+  try {
+    await navigator.clipboard.writeText(u);
+  } catch {
+    prompt('Copy URL:', u);
+  }
+}
+
+function render() {
+  $('#resultCount').textContent = `${filtered.length} ${filtered.length === 1 ? 'pack' : 'packs'}`;
+  if (!filtered.length) {
+    $('#grid').innerHTML = '<div class="empty"><b>No matching packs</b>Try changing your search or filter.</div>';
+    return;
+  }
+  $('#grid').innerHTML = filtered.map(p => `<article class="card" tabindex="0" data-id="${esc(p.id)}"><div class="preview"><img src="${esc(p.preview)}" alt="" loading="lazy" decoding="async"></div><div class="body"><div class="row"><div class="title"><b>${esc(p.title)}</b></div><button class="copy-link" type="button" data-copy-url="${esc(p.url || '')}" title="Copy pack URL" aria-label="Copy pack URL"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button></div><div class="tags">${(p.tags || []).slice(0, 3).map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div></div></article>`).join('');
+  document.querySelectorAll('.card').forEach(c => {
+    const o = () => openPack(c.dataset.id);
+    c.onclick = o;
+    c.onkeydown = e => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        o();
+      }
+    };
+  });
+  document.querySelectorAll('.copy-link').forEach(b => {
+    b.onclick = e => {
+      e.stopPropagation();
+      copyPackUrl(b.dataset.copyUrl);
+    };
+    b.onkeydown = e => e.stopPropagation();
+  });
+}
+
+async function openPack(id) {
+  const p = all.find(x => x.id === id);
+  if (!p) return;
+  $('#overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+  $('#dcontent').innerHTML = '<div class="loading">Loading pack manifest\u2026</div>';
+  let m = p;
+  try {
+    if (!p.stickers && p.url) {
+      const r = await fetch(p.url, {
+        headers: {
+          Accept: 'application/json',
+        },
+      });
+      if (!r.ok) throw new Error('Manifest request failed: ' + r.status);
+      m = { ...p, ...(await r.json()) };
+    }
+    drawPack(p, m);
+  } catch (e) {
+    $('#dcontent').innerHTML = `<div class="empty"><b>Failed to load pack manifest</b>${esc(String(e))}</div>`;
+  }
+}
+
+function drawPack(p, m) {
+  const list = m.stickers || [];
+  const prev = p.preview || m.logo?.previewImage || m.logo?.image || '';
+  $('#dcontent').innerHTML = `<section class="packhero"><div class="heroimg"><img src="${esc(prev)}" alt=""></div><div class="herocopy"><h2>${esc(p.title || m.title || p.name)}</h2><p>${Number(p.stickerCount || list.length || 0)} stickers</p></div><button class="hero-copy" id="copy" type="button">Copy pack URL</button></section><div class="stickers">${list.length ? list.map(x => `<div class="st" title="${esc(x.title || '')}"><img src="${esc(x.previewImage || x.image || '')}" alt="${esc(x.title || '')}" loading="lazy" decoding="async"></div>`).join('') : '<div class="loading">No stickers available.</div>'}</div>`;
+  $('#copy').onclick = () => copyPackUrl(p.url || '');
+}
+
+function close() {
+  $('#overlay').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+$('#search').oninput = apply;
+$('#tag').onchange = apply;
+$('#close').onclick = close;
+$('#overlay').onclick = e => {
+  if (e.target.id === 'overlay') close();
+};
+document.onkeydown = e => {
+  if (e.key === 'Escape') close();
+};
+
+(async () => {
+  try {
+    $('#grid').innerHTML = '<div class="loading">Loading catalog\u2026</div>';
+    all = await load();
+    tags();
+    apply();
+  } catch (e) {
+    $('#grid').innerHTML = `<div class="empty"><b>Failed to load catalog</b>${esc(String(e))}</div>`;
+  }
+})();
+</script>
+</body>
+</html>

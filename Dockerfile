@@ -20,5 +20,6 @@ RUN apk add --no-cache ffmpeg lottieconverter
 WORKDIR /app
 COPY --from=build /app/build /app
 COPY --from=prod-deps /app/node_modules /app/node_modules
+COPY public /app/public
 RUN REQUIRE_LOTTIECONVERTER=1 node test/smoke.js
 CMD [ "node", "src/index.js" ]
