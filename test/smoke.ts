@@ -45,6 +45,7 @@ const {
   PREVIEW_PROFILES,
 } = await import('../src/utils/stickerPreview.js');
 const {
+  DATA_DIR,
   isLegacyStickerPack,
   isStickerPackDownloaded,
   generateStickerPackDirPath,
@@ -56,9 +57,12 @@ const {
   parseDownloadConcurrency,
   generateStickerPackExternalUrl,
   getStickerContentSignature,
+  getTelegramStickerContentSignature,
   resolveStickerPackVersion,
+  validateLocalStickerPackManifest,
   writeStickerPackManifestAtomically,
   enqueueManifestPublish,
+  enqueueStickerPackOperation,
   readManifestOrUndefined,
   toMcStickerPack,
 } = await import('../src/utils/telegramStickers.js');
@@ -79,6 +83,18 @@ const {
   isAllowedTelegramUser,
   resolveStickerPackNameFromCommand,
 } = await import('../src/utils/stickerPackVisibilityCommands.js');
+const {formatCommandUsage, formatUptime} = await import(
+  '../src/utils/telegramCommandUtils.js'
+);
+const {
+  handleCheckCommand,
+  handleInfoCommand,
+  handlePackCommand,
+  handleRefreshCommand,
+  handleStatsCommand,
+  handleStatusCommand,
+  importOrGetStickerPack,
+} = await import('../src/utils/stickerPackCommands.js');
 const {app} = await import('../src/utils/fastify.js');
 
 console.log('--- Starting Smoke Tests in Nix Environment ---');
@@ -3964,15 +3980,24 @@ await fsp.writeFile(
 function createMockContext(options: {
   userId?: string | number;
   args?: string[];
+  payload?: string;
+  telegram?: unknown;
   replyTo?: {sticker?: {set_name?: string}; [key: string]: unknown};
+  message?: unknown;
 }) {
   const replies: string[] = [];
   const ctx = {
     from: options.userId !== undefined ? {id: options.userId} : undefined,
     args: options.args,
-    message: {
-      reply_to_message: options.replyTo,
-    },
+    payload: options.payload,
+    telegram: options.telegram as Telegram,
+    message:
+      options.message ??
+      (options.replyTo
+        ? {
+            reply_to_message: options.replyTo,
+          }
+        : undefined),
     reply: async (msg: string) => {
       replies.push(msg);
     },
@@ -4175,7 +4200,1723 @@ assert.ok(ctxK.replies[0].includes('Usage: /public'));
 console.log(
   'Verified: Telegram visibility commands resolver and handlers pass all tests',
 );
-// Clean up temp dir
-await fsp.rm(tempDir, {recursive: true, force: true});
 
+console.log('Testing Telegram command utilities...');
+assert.equal(
+  formatCommandUsage('pack'),
+  'Usage: /pack <pack-name>\nor reply with /pack to a sticker from the pack.',
+);
+assert.equal(
+  formatCommandUsage('/info'),
+  'Usage: /info <pack-name>\nor reply with /info to a sticker from the pack.',
+);
+assert.equal(formatUptime(0), '0s');
+assert.equal(formatUptime(45), '45s');
+assert.equal(formatUptime(120), '2m');
+assert.equal(formatUptime(3660), '1h 1m');
+assert.equal(formatUptime(180000), '2d 2h');
+
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({payload: 'PayloadPack'}),
+  ),
+  {success: true, packName: 'PayloadPack'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({message: {text: '/pack TextPack'}}),
+  ),
+  {success: true, packName: 'TextPack'},
+);
+assert.deepEqual(
+  resolveStickerPackNameFromCommand(
+    createMockContext({message: {text: '/pack P1 P2'}}),
+  ),
+  {success: false, error: 'too_many_args'},
+);
+assert.equal(
+  getTelegramStickerContentSignature('PackX', [
+    {
+      file_id: 'f1',
+      file_unique_id: 'u1',
+      emoji: '🐱',
+      is_animated: false,
+      is_video: false,
+      width: 512,
+      height: 512,
+      type: 'regular',
+    },
+  ]),
+  JSON.stringify([['MoreStickers:Telegram:Sticker:PackX:u1', '🐱']]),
+);
+
+assert.equal(validateLocalStickerPackManifest(null), null);
+assert.equal(validateLocalStickerPackManifest({id: 'x'}), null);
+assert.equal(
+  validateLocalStickerPackManifest({id: 'x', stickers: [null]}),
+  null,
+);
+assert.equal(
+  validateLocalStickerPackManifest({
+    id: 'x',
+    stickers: [{id: 's1', title: 't'}],
+  }) !== null,
+  true,
+);
+console.log('Testing /pack command...');
+const packTestName = 'PackTestSample';
+const packManifestPath = generateStickerPackFilePath(packTestName);
+const packTestDir = generateStickerPackDirPath(packTestName);
+await fsp.mkdir(packTestDir, {recursive: true});
+await fsp.writeFile(
+  path.join(packTestDir, 'unique-id-1.webp'),
+  Buffer.from('fake-webp'),
+);
+await fsp.mkdir(path.join(packTestDir, 'previews'), {recursive: true});
+await fsp.writeFile(
+  path.join(packTestDir, 'previews', 'unique-id-1.webp'),
+  Buffer.from('fake-preview'),
+);
+await fsp.writeFile(
+  packManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${packTestName}`,
+    title: 'Pack Test Sample',
+    logo: {
+      id: `MoreStickers:Telegram:Sticker:${packTestName}:unique-id-1`,
+      image: `https://stickers.example.com/sticker/telegram/${packTestName}/unique-id-1.webp`,
+      title: '🎉',
+      stickerPackId: `MoreStickers:Telegram:Pack:${packTestName}`,
+      filename: 'unique-id-1.webp',
+      isAnimated: false,
+    },
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${packTestName}:unique-id-1`,
+        image: `https://stickers.example.com/sticker/telegram/${packTestName}/unique-id-1.webp`,
+        title: '🎉',
+        stickerPackId: `MoreStickers:Telegram:Pack:${packTestName}`,
+        filename: 'unique-id-1.webp',
+        isAnimated: false,
+      },
+    ],
+    dynamic: {
+      version: 1,
+      refreshUrl: `https://stickers.example.com/stickerpack/telegram/${packTestName}`,
+    },
+  }),
+);
+let getStickerSetCalled = false;
+const mockTelegram = {
+  getStickerSet: async (name: string) => {
+    getStickerSetCalled = true;
+    if (name === 'NonExistentTgPack') {
+      throw new Error('400: Bad Request: STICKERSET_INVALID');
+    }
+    return {
+      name,
+      title: `Title of ${name}`,
+      stickers: [
+        {
+          file_id: 'file-id-1',
+          file_unique_id: 'unique-id-1',
+          emoji: '🎉',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    };
+  },
+  getFileLink: async () => new URL('https://example.com/file.webp'),
+} as unknown as Telegram;
+// Case 1: Already downloaded local pack -> returns URL without downloading
+const ctxPack1 = createMockContext({
+  userId: allowedUserId,
+  args: [packTestName],
+  telegram: mockTelegram,
+});
+getStickerSetCalled = false;
+const handledPack1 = await handlePackCommand(ctxPack1);
+assert.equal(handledPack1, true);
+assert.equal(getStickerSetCalled, true);
+assert.equal(
+  ctxPack1.replies[0],
+  `https://stickers.example.com/stickerpack/telegram/${packTestName}`,
+);
+
+// Case 1b: Real-method reply binding regression test (issue #1)
+const thisBoundReplies: string[] = [];
+const thisBoundCtx = {
+  from: {id: allowedUserId},
+  args: [packTestName],
+  telegram: mockTelegram,
+  replies: thisBoundReplies,
+  async reply(this: {replies: string[]}, text: string) {
+    this.replies.push(text);
+  },
+};
+const handledThisBound = await handlePackCommand(thisBoundCtx);
+assert.equal(handledThisBound, true);
+assert.equal(
+  thisBoundReplies[0],
+  `https://stickers.example.com/stickerpack/telegram/${packTestName}`,
+);
+
+// Case 1c: Missing local pack -> downloaded and manifest created
+const missingPackName = 'MissingPackToDownload';
+const mockDownloadTelegram = {
+  getStickerSet: async (name: string) => ({
+    name,
+    title: 'Missing Pack Title',
+    stickers: [
+      {
+        file_id: 'missing-file-1',
+        file_unique_id: 'missing-unique-1',
+        emoji: '🐱',
+        is_animated: false,
+        is_video: false,
+      },
+    ],
+  }),
+  getFileLink: async () => new URL('https://example.com/missing.webp'),
+  getFile: async () => ({file_path: 'documents/missing.webp'}),
+} as unknown as Telegram;
+
+const sampleWebpBuffer = spawnSync('ffmpeg', [
+  '-f',
+  'lavfi',
+  '-i',
+  'color=c=blue:size=64x64:duration=1',
+  '-vframes',
+  '1',
+  '-c:v',
+  'libwebp',
+  '-f',
+  'webp',
+  'pipe:1',
+]).stdout;
+
+const originalGlobalFetch = globalThis.fetch;
+globalThis.fetch = (async () => {
+  return new Response(sampleWebpBuffer, {
+    status: 200,
+    headers: {'Content-Type': 'image/webp'},
+  });
+}) as unknown as typeof fetch;
+
+try {
+  const ctxMissingPack = createMockContext({
+    userId: allowedUserId,
+    args: [missingPackName],
+    telegram: mockDownloadTelegram,
+  });
+  const handledMissingPack = await handlePackCommand(ctxMissingPack);
+  assert.equal(handledMissingPack, true);
+  assert.ok(
+    fs.existsSync(generateStickerPackFilePath(missingPackName)),
+    'Manifest must exist after downloading missing pack',
+  );
+  assert.equal(
+    ctxMissingPack.replies[ctxMissingPack.replies.length - 1],
+    `https://stickers.example.com/stickerpack/telegram/${missingPackName}`,
+  );
+
+  // Case 1d: Download failure during /pack
+  const failingDownloadPackName = 'FailingDownloadPack';
+  const mockFailingDownloadTg = {
+    getStickerSet: async (name: string) => ({
+      name,
+      title: 'Failing Download Pack',
+      stickers: [
+        {
+          file_id: 'fail-file',
+          file_unique_id: 'fail-unique',
+          emoji: '💥',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+    getFileLink: async () => new URL('https://example.com/fail.webp'),
+    getFile: async () => {
+      throw new Error('Telegram getFile network failure');
+    },
+  } as unknown as Telegram;
+
+  const ctxFailDownload = createMockContext({
+    userId: allowedUserId,
+    args: [failingDownloadPackName],
+    telegram: mockFailingDownloadTg,
+  });
+  const handledFailDownload = await handlePackCommand(ctxFailDownload);
+  assert.equal(handledFailDownload, false);
+  assert.ok(ctxFailDownload.replies.some(r => r.includes('error')));
+  assert.equal(
+    fs.existsSync(generateStickerPackFilePath(failingDownloadPackName)),
+    false,
+  );
+} finally {
+  globalThis.fetch = originalGlobalFetch;
+}
+
+// Case 1e: Reply to sticker with /pack
+const ctxPackReply = createMockContext({
+  userId: allowedUserId,
+  replyTo: {sticker: {set_name: packTestName}},
+  telegram: mockTelegram,
+});
+const handledPackReply = await handlePackCommand(ctxPackReply);
+assert.equal(handledPackReply, true);
+assert.equal(
+  ctxPackReply.replies[0],
+  `https://stickers.example.com/stickerpack/telegram/${packTestName}`,
+);
+
+// Case 2: Telegram error (sticker set not found)
+const ctxPack2 = createMockContext({
+  userId: allowedUserId,
+  args: ['NonExistentTgPack'],
+  telegram: mockTelegram,
+});
+const handledPack2 = await handlePackCommand(ctxPack2);
+assert.equal(handledPack2, false);
+assert.equal(
+  ctxPack2.replies[0],
+  'Error: Telegram sticker pack "NonExistentTgPack" not found.',
+);
+
+// Case 2b: importOrGetStickerPack direct helper call with ReplyContext
+const directReplies: string[] = [];
+const handledDirect = await importOrGetStickerPack(mockTelegram, packTestName, {
+  async reply(msg: string) {
+    directReplies.push(msg);
+  },
+});
+assert.equal(handledDirect, true);
+assert.equal(
+  directReplies[0],
+  `https://stickers.example.com/stickerpack/telegram/${packTestName}`,
+);
+
+// Case 3: Unauthorized user
+const ctxPack3 = createMockContext({
+  userId: 'unauthorized_id',
+  args: [packTestName],
+  telegram: mockTelegram,
+});
+const handledPack3 = await handlePackCommand(ctxPack3);
+assert.equal(handledPack3, false);
+assert.equal(ctxPack3.replies.length, 0);
+
+// Case 4: Missing target usage message
+const ctxPack4 = createMockContext({
+  userId: allowedUserId,
+  telegram: mockTelegram,
+});
+const handledPack4 = await handlePackCommand(ctxPack4);
+assert.equal(handledPack4, false);
+assert.ok(ctxPack4.replies[0].includes('Usage: /pack'));
+console.log('Testing /refresh command...');
+const refreshPackName = 'RefreshTestPack';
+const refreshManifestPath = generateStickerPackFilePath(refreshPackName);
+const refreshDir = generateStickerPackDirPath(refreshPackName);
+await fsp.mkdir(refreshDir, {recursive: true});
+await fsp.writeFile(
+  path.join(refreshDir, 'unique-1.webp'),
+  Buffer.from('fake-webp'),
+);
+await fsp.mkdir(path.join(refreshDir, 'previews'), {recursive: true});
+await fsp.writeFile(
+  path.join(refreshDir, 'previews', 'unique-1.webp'),
+  Buffer.from('fake-preview'),
+);
+await fsp.writeFile(
+  refreshManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${refreshPackName}`,
+    title: 'Refresh Test Pack',
+    logo: {
+      id: `MoreStickers:Telegram:Sticker:${refreshPackName}:unique-1`,
+      image: `https://stickers.example.com/sticker/telegram/${refreshPackName}/unique-1.webp`,
+      title: '🐱',
+      stickerPackId: `MoreStickers:Telegram:Pack:${refreshPackName}`,
+    },
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${refreshPackName}:unique-1`,
+        image: `https://stickers.example.com/sticker/telegram/${refreshPackName}/unique-1.webp`,
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${refreshPackName}`,
+        filename: 'unique-1.webp',
+        isAnimated: false,
+      },
+    ],
+    dynamic: {
+      version: 3,
+      refreshUrl: `https://stickers.example.com/stickerpack/telegram/${refreshPackName}`,
+    },
+  }),
+);
+await updateStickerPackMetadata(refreshPackName, {visibility: 'public'});
+const mockRefreshTelegram = {
+  getStickerSet: async (name: string) => {
+    if (name === 'FailTgPack') {
+      throw new Error('Telegram API error');
+    }
+    return {
+      name,
+      title: 'Refresh Test Pack',
+      stickers: [
+        {
+          file_id: 'file-1',
+          file_unique_id: 'unique-1',
+          emoji: '🐱',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    };
+  },
+  getFileLink: async () => new URL('https://example.com/file.webp'),
+  getFile: async () => ({file_path: 'documents/file.webp'}),
+} as unknown as Telegram;
+
+const savedFetch = globalThis.fetch;
+globalThis.fetch = (async () => {
+  return new Response(sampleWebpBuffer, {
+    status: 200,
+    headers: {'Content-Type': 'image/webp'},
+  });
+}) as unknown as typeof fetch;
+try {
+  // Case 1: Refresh existing pack with same content -> retains version 3 and retains public visibility
+  const ctxRef1 = createMockContext({
+    userId: allowedUserId,
+    args: [refreshPackName],
+    telegram: mockRefreshTelegram,
+  });
+  const handledRef1 = await handleRefreshCommand(ctxRef1);
+  assert.equal(handledRef1, true);
+  assert.ok(ctxRef1.replies.some(r => r.includes('refreshed successfully')));
+  assert.ok(ctxRef1.replies.some(r => r.includes('Version: 3')));
+  assert.equal(
+    (await getStickerPackMetadata(refreshPackName)).visibility,
+    'public',
+    'Visibility must be preserved after refresh',
+  );
+
+  // Case 1b: Refresh pack with changed content -> increments version to 4
+  const mockChangedRefreshTelegram = {
+    getStickerSet: async (name: string) => ({
+      name,
+      title: 'Refresh Test Pack',
+      stickers: [
+        {
+          file_id: 'file-1',
+          file_unique_id: 'unique-1',
+          emoji: '🐱',
+          is_animated: false,
+          is_video: false,
+        },
+        {
+          file_id: 'file-2',
+          file_unique_id: 'unique-2',
+          emoji: '🐶',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+    getFileLink: async () => new URL('https://example.com/file2.webp'),
+    getFile: async () => ({file_path: 'documents/file2.webp'}),
+  } as unknown as Telegram;
+
+  const ctxRef1b = createMockContext({
+    userId: allowedUserId,
+    args: [refreshPackName],
+    telegram: mockChangedRefreshTelegram,
+  });
+  const handledRef1b = await handleRefreshCommand(ctxRef1b);
+  assert.equal(handledRef1b, true);
+  assert.ok(ctxRef1b.replies.some(r => r.includes('refreshed successfully')));
+  assert.ok(ctxRef1b.replies.some(r => r.includes('Version: 4')));
+
+  // Case 1c: Refresh download failure preserves previous valid manifest and metadata
+  const failRefreshPackName = 'RefreshDownloadFailPack';
+  const failRefreshManifestPath =
+    generateStickerPackFilePath(failRefreshPackName);
+  const initialFailManifestContent = JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${failRefreshPackName}`,
+    title: 'Initial Title',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${failRefreshPackName}:s1`,
+        image: 'url',
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${failRefreshPackName}`,
+        filename: 's1.webp',
+        isAnimated: false,
+      },
+    ],
+    dynamic: {
+      version: 2,
+      refreshUrl: `https://stickers.example.com/stickerpack/telegram/${failRefreshPackName}`,
+    },
+  });
+  await fsp.writeFile(failRefreshManifestPath, initialFailManifestContent);
+  await updateStickerPackMetadata(failRefreshPackName, {visibility: 'public'});
+
+  const mockFailingRefreshTg = {
+    getStickerSet: async (name: string) => ({
+      name,
+      title: 'Initial Title',
+      stickers: [
+        {
+          file_id: 'fail-file-id',
+          file_unique_id: 's1',
+          emoji: '🐱',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+    getFileLink: async () => new URL('https://example.com/fail.webp'),
+    getFile: async () => {
+      throw new Error('Download network error during refresh');
+    },
+  } as unknown as Telegram;
+
+  const ctxRefFail = createMockContext({
+    userId: allowedUserId,
+    args: [failRefreshPackName],
+    telegram: mockFailingRefreshTg,
+  });
+  const handledRefFail = await handleRefreshCommand(ctxRefFail);
+  assert.equal(handledRefFail, false);
+  assert.ok(ctxRefFail.replies[0].includes('Error:'));
+  assert.equal(
+    await fsp.readFile(failRefreshManifestPath, 'utf8'),
+    initialFailManifestContent,
+    'Previous manifest must not be modified or deleted on refresh failure',
+  );
+  assert.equal(
+    (await getStickerPackMetadata(failRefreshPackName)).visibility,
+    'public',
+    'Metadata must remain public after failed refresh',
+  );
+
+  // Case 1d: Reply to sticker with /refresh
+  const ctxRefReply = createMockContext({
+    userId: allowedUserId,
+    replyTo: {sticker: {set_name: refreshPackName}},
+    telegram: mockRefreshTelegram,
+  });
+  const handledRefReply = await handleRefreshCommand(ctxRefReply);
+  assert.equal(handledRefReply, true);
+  assert.ok(
+    ctxRefReply.replies.some(r => r.includes('refreshed successfully')),
+  );
+
+  // Case 2: Telegram error does not delete manifest or report success
+  const ctxRef2 = createMockContext({
+    userId: allowedUserId,
+    args: ['FailTgPack'],
+    telegram: mockRefreshTelegram,
+  });
+  const handledRef2 = await handleRefreshCommand(ctxRef2);
+  assert.equal(handledRef2, false);
+  assert.ok(ctxRef2.replies[0].includes('Error:'));
+
+  // Case 3: Mid-stream static download failure during /refresh
+  const midStreamPackName = 'MidStreamFailPack';
+  const midStreamPackDir = generateStickerPackDirPath(midStreamPackName);
+  const midStreamPreviewDir = generateStickerPreviewDirPath(midStreamPackName);
+  const midStreamManifestPath = generateStickerPackFilePath(midStreamPackName);
+
+  await fsp.mkdir(midStreamPackDir, {recursive: true});
+  await fsp.mkdir(midStreamPreviewDir, {recursive: true});
+
+  const originalAssetBytes = Buffer.from('ORIGINAL_VALID_ASSET_CONTENT_BYTES');
+  const originalPreviewBytes = Buffer.from('ORIGINAL_VALID_PREVIEW_BYTES');
+  const midStreamAssetPath = path.join(midStreamPackDir, 's1.webp');
+  const midStreamPreviewPath = path.join(midStreamPreviewDir, 's1.webp');
+
+  await fsp.writeFile(midStreamAssetPath, originalAssetBytes);
+  await fsp.writeFile(midStreamPreviewPath, originalPreviewBytes);
+
+  const originalManifestContent = JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${midStreamPackName}`,
+    title: 'Mid Stream Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${midStreamPackName}:s1`,
+        image: `https://stickers.example.com/sticker/telegram/${midStreamPackName}/s1.webp`,
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${midStreamPackName}`,
+        filename: 's1.webp',
+        isAnimated: false,
+      },
+    ],
+    dynamic: {
+      version: 3,
+      refreshUrl: `https://stickers.example.com/stickerpack/telegram/${midStreamPackName}`,
+    },
+  });
+  await fsp.writeFile(midStreamManifestPath, originalManifestContent);
+  await updateStickerPackMetadata(midStreamPackName, {visibility: 'public'});
+
+  const mockMidStreamTg = {
+    getStickerSet: async (name: string) => ({
+      name,
+      title: 'Mid Stream Pack',
+      stickers: [
+        {
+          file_id: 'file-mid-fail',
+          file_unique_id: 's1',
+          emoji: '🐱',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+    getFileLink: async () => new URL('https://example.com/mid-fail.webp'),
+    getFile: async () => ({file_path: 'documents/mid-fail.webp'}),
+  } as unknown as Telegram;
+
+  const savedFetchForMidStream = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () => {
+      const errorStream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(
+            new Uint8Array(Buffer.from('PARTIAL_INCOMING_BYTES_')),
+          );
+          controller.error(new Error('Network connection aborted mid-stream'));
+        },
+      });
+      return new Response(errorStream, {
+        status: 200,
+        headers: {'Content-Type': 'image/webp'},
+      });
+    }) as typeof fetch;
+
+    const ctxMidStream = createMockContext({
+      userId: allowedUserId,
+      args: [midStreamPackName],
+      telegram: mockMidStreamTg,
+    });
+    const handledMidStream = await handleRefreshCommand(ctxMidStream);
+    assert.equal(
+      handledMidStream,
+      false,
+      'Handler must return false on mid-stream failure',
+    );
+    assert.ok(
+      ctxMidStream.replies.some(r => r.includes('Error:')),
+      'Error message must be replied',
+    );
+    assert.equal(
+      await fsp.readFile(midStreamManifestPath, 'utf8'),
+      originalManifestContent,
+      'Manifest must be byte-for-byte unchanged',
+    );
+    assert.deepEqual(
+      await fsp.readFile(midStreamAssetPath),
+      originalAssetBytes,
+      'Existing asset must be byte-for-byte unchanged and not truncated',
+    );
+    assert.deepEqual(
+      await fsp.readFile(midStreamPreviewPath),
+      originalPreviewBytes,
+      'Existing preview must remain untouched',
+    );
+    assert.equal(
+      (await getStickerPackMetadata(midStreamPackName)).visibility,
+      'public',
+      'Metadata visibility must remain public',
+    );
+    const remainingFiles = await fsp.readdir(midStreamPackDir);
+    const tempDownloadFiles = remainingFiles.filter(
+      f => f.includes('download-') || f.endsWith('.tmp'),
+    );
+    assert.equal(
+      tempDownloadFiles.length,
+      0,
+      'No temporary download files must remain in pack dir',
+    );
+  } finally {
+    globalThis.fetch = savedFetchForMidStream;
+  }
+} finally {
+  globalThis.fetch = savedFetch;
+}
+console.log('Testing /check command...');
+const checkPackName = 'CheckTestPack';
+const checkManifestPath = generateStickerPackFilePath(checkPackName);
+const checkDir = generateStickerPackDirPath(checkPackName);
+await fsp.mkdir(checkDir, {recursive: true});
+await fsp.writeFile(
+  path.join(checkDir, 'asset-1.webp'),
+  Buffer.from('fake-asset'),
+);
+await fsp.mkdir(path.join(checkDir, 'previews'), {recursive: true});
+await fsp.writeFile(
+  path.join(checkDir, 'previews', 'asset-1.webp'),
+  Buffer.from('fake-preview'),
+);
+await fsp.writeFile(
+  checkManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${checkPackName}`,
+    title: 'Check Test Pack',
+    logo: {
+      id: `MoreStickers:Telegram:Sticker:${checkPackName}:asset-1`,
+      image: `https://stickers.example.com/sticker/telegram/${checkPackName}/asset-1.webp`,
+      title: '🐱',
+      stickerPackId: `MoreStickers:Telegram:Pack:${checkPackName}`,
+    },
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${checkPackName}:asset-1`,
+        image: `https://stickers.example.com/sticker/telegram/${checkPackName}/asset-1.webp`,
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${checkPackName}`,
+        filename: 'asset-1.webp',
+        isAnimated: false,
+      },
+    ],
+    dynamic: {
+      version: 2,
+      refreshUrl: `https://stickers.example.com/stickerpack/telegram/${checkPackName}`,
+    },
+  }),
+);
+await updateStickerPackMetadata(checkPackName, {visibility: 'public'});
+
+const mockCheckTelegram = {
+  getStickerSet: async (name: string) => {
+    if (name === checkPackName) {
+      return {
+        name: checkPackName,
+        title: 'Check Test Pack',
+        stickers: [
+          {
+            file_id: 'file-1',
+            file_unique_id: 'asset-1',
+            emoji: '🐱',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    }
+    if (name === 'OutdatedPack') {
+      return {
+        name: 'OutdatedPack',
+        title: 'Outdated Pack',
+        stickers: [
+          {
+            file_id: 'file-1',
+            file_unique_id: 'asset-1',
+            emoji: '🐱',
+            is_animated: false,
+            is_video: false,
+          },
+          {
+            file_id: 'file-2',
+            file_unique_id: 'asset-2',
+            emoji: '🐶',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    }
+    if (name === 'ChangedContentPack') {
+      return {
+        name: 'ChangedContentPack',
+        title: 'Changed Content Pack',
+        stickers: [
+          {
+            file_id: 'file-1',
+            file_unique_id: 'asset-changed-id',
+            emoji: '🐱',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    }
+    if (name === 'MissingPreviewPack') {
+      return {
+        name: 'MissingPreviewPack',
+        title: 'Missing Preview Pack',
+        stickers: [
+          {
+            file_id: 'file-1',
+            file_unique_id: 'preview-asset-1',
+            emoji: '🐱',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    }
+    if (name === 'MissingFilenamePack') {
+      return {
+        name: 'MissingFilenamePack',
+        title: 'Missing Filename Pack',
+        stickers: [
+          {
+            file_id: 'file-1',
+            file_unique_id: 'no-fn-1',
+            emoji: '🐱',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    }
+    throw new Error('Not found');
+  },
+} as unknown as Telegram;
+
+// Case 1: Healthy pack -> reports OK
+const manifestBeforeCheck = await fsp.readFile(checkManifestPath, 'utf8');
+const ctxCheck1 = createMockContext({
+  userId: allowedUserId,
+  args: [checkPackName],
+  telegram: mockCheckTelegram,
+});
+const handledCheck1 = await handleCheckCommand(ctxCheck1);
+assert.equal(handledCheck1, true);
+assert.ok(ctxCheck1.replies[0].includes('is OK and up to date'));
+assert.ok(ctxCheck1.replies[0].includes('Stickers: 1'));
+assert.ok(ctxCheck1.replies[0].includes('Version: 2'));
+assert.ok(ctxCheck1.replies[0].includes('Visibility: public'));
+
+// Read-only check assertion
+const manifestAfterCheck = await fsp.readFile(checkManifestPath, 'utf8');
+assert.equal(
+  manifestAfterCheck,
+  manifestBeforeCheck,
+  '/check command must be strictly read-only and never modify manifest',
+);
+
+// Case 1b: Reply to sticker with /check
+const ctxCheckReply = createMockContext({
+  userId: allowedUserId,
+  replyTo: {sticker: {set_name: checkPackName}},
+  telegram: mockCheckTelegram,
+});
+const handledCheckReply = await handleCheckCommand(ctxCheckReply);
+assert.equal(handledCheckReply, true);
+assert.ok(ctxCheckReply.replies[0].includes('is OK and up to date'));
+
+// Case 2: Outdated pack (Telegram has 2 stickers, local has 1)
+const outdatedPackName = 'OutdatedPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(outdatedPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${outdatedPackName}`,
+    title: 'Outdated Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${outdatedPackName}:asset-1`,
+        image: 'url',
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${outdatedPackName}`,
+        filename: 'asset-1.webp',
+        isAnimated: false,
+      },
+    ],
+  }),
+);
+const ctxCheck2 = createMockContext({
+  userId: allowedUserId,
+  args: [outdatedPackName],
+  telegram: mockCheckTelegram,
+});
+const handledCheck2 = await handleCheckCommand(ctxCheck2);
+assert.equal(handledCheck2, false);
+assert.ok(ctxCheck2.replies[0].includes('is out of date'));
+assert.ok(ctxCheck2.replies[0].includes('Local stickers: 1'));
+assert.ok(ctxCheck2.replies[0].includes('Telegram stickers: 2'));
+assert.ok(ctxCheck2.replies[0].includes('/refresh OutdatedPack'));
+
+// Case 2b: Same sticker count (1 vs 1), but changed content signature -> out of date
+const changedContentPackName = 'ChangedContentPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(changedContentPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${changedContentPackName}`,
+    title: 'Changed Content Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${changedContentPackName}:asset-original`,
+        image: 'url',
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${changedContentPackName}`,
+        filename: 'asset-1.webp',
+        isAnimated: false,
+      },
+    ],
+  }),
+);
+const ctxCheckChanged = createMockContext({
+  userId: allowedUserId,
+  args: [changedContentPackName],
+  telegram: mockCheckTelegram,
+});
+const handledCheckChanged = await handleCheckCommand(ctxCheckChanged);
+assert.equal(handledCheckChanged, false);
+assert.ok(ctxCheckChanged.replies[0].includes('is out of date'));
+assert.ok(ctxCheckChanged.replies[0].includes('/refresh ChangedContentPack'));
+
+// Case 3: Missing local sticker asset file
+const missingAssetPackName = 'MissingAssetPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(missingAssetPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${missingAssetPackName}`,
+    title: 'Missing Asset Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${missingAssetPackName}:missing-asset`,
+        image: 'url',
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${missingAssetPackName}`,
+        filename: 'does-not-exist.webp',
+        isAnimated: false,
+      },
+    ],
+  }),
+);
+const mockMissingAssetTg = {
+  getStickerSet: async () => ({
+    name: missingAssetPackName,
+    title: 'Missing Asset Pack',
+    stickers: [
+      {
+        file_id: 'f1',
+        file_unique_id: 'missing-asset',
+        emoji: '🐱',
+        is_animated: false,
+        is_video: false,
+      },
+    ],
+  }),
+} as unknown as Telegram;
+const ctxCheck3 = createMockContext({
+  userId: allowedUserId,
+  args: [missingAssetPackName],
+  telegram: mockMissingAssetTg,
+});
+const handledCheck3 = await handleCheckCommand(ctxCheck3);
+assert.equal(handledCheck3, false);
+assert.ok(ctxCheck3.replies[0].includes('incomplete local cache'));
+assert.ok(ctxCheck3.replies[0].includes('/refresh MissingAssetPack'));
+
+// Case 3b: Missing preview file
+const missingPreviewPackName = 'MissingPreviewPack';
+const missingPreviewDir = generateStickerPackDirPath(missingPreviewPackName);
+await fsp.mkdir(missingPreviewDir, {recursive: true});
+await fsp.writeFile(
+  path.join(missingPreviewDir, 'preview-asset-1.webp'),
+  Buffer.from('fake-asset'),
+);
+await fsp.writeFile(
+  generateStickerPackFilePath(missingPreviewPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${missingPreviewPackName}`,
+    title: 'Missing Preview Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${missingPreviewPackName}:preview-asset-1`,
+        image: 'url',
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${missingPreviewPackName}`,
+        filename: 'preview-asset-1.webp',
+        isAnimated: false,
+      },
+    ],
+  }),
+);
+const ctxCheckMissingPreview = createMockContext({
+  userId: allowedUserId,
+  args: [missingPreviewPackName],
+  telegram: mockCheckTelegram,
+});
+const handledCheckMissingPreview = await handleCheckCommand(
+  ctxCheckMissingPreview,
+);
+assert.equal(handledCheckMissingPreview, false);
+assert.ok(ctxCheckMissingPreview.replies[0].includes('incomplete local cache'));
+assert.ok(
+  ctxCheckMissingPreview.replies[0].includes('/refresh MissingPreviewPack'),
+);
+
+// Case 3c: Missing filename in manifest
+const missingFilenamePackName = 'MissingFilenamePack';
+await fsp.writeFile(
+  generateStickerPackFilePath(missingFilenamePackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${missingFilenamePackName}`,
+    title: 'Missing Filename Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${missingFilenamePackName}:no-fn-1`,
+        image: 'url',
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${missingFilenamePackName}`,
+        isAnimated: false,
+      },
+    ],
+  }),
+);
+const ctxCheckMissingFn = createMockContext({
+  userId: allowedUserId,
+  args: [missingFilenamePackName],
+  telegram: mockCheckTelegram,
+});
+const handledCheckMissingFn = await handleCheckCommand(ctxCheckMissingFn);
+assert.equal(handledCheckMissingFn, false);
+assert.ok(ctxCheckMissingFn.replies[0].includes('incomplete local cache'));
+
+// Case 4: Pack not downloaded locally
+const ctxCheck4 = createMockContext({
+  userId: allowedUserId,
+  args: ['NotDownloadedPack'],
+  telegram: mockCheckTelegram,
+});
+const handledCheck4 = await handleCheckCommand(ctxCheck4);
+assert.equal(handledCheck4, false);
+assert.ok(ctxCheck4.replies[0].includes('is not downloaded locally'));
+assert.ok(ctxCheck4.replies[0].includes('/pack NotDownloadedPack'));
+
+// Case 5: Malformed manifest
+const malformedCheckName = 'MalformedCheckPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(malformedCheckName),
+  'invalid json content',
+);
+const ctxCheck5 = createMockContext({
+  userId: allowedUserId,
+  args: [malformedCheckName],
+  telegram: mockCheckTelegram,
+});
+const handledCheck5 = await handleCheckCommand(ctxCheck5);
+assert.equal(handledCheck5, false);
+assert.ok(ctxCheck5.replies[0].includes('malformed local manifest'));
+
+console.log('Testing /info command...');
+const infoPackName = 'InfoTestPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(infoPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${infoPackName}`,
+    title: 'Info Sample Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${infoPackName}:s1`,
+        image: 'url1',
+        title: '🐱',
+        stickerPackId: `MoreStickers:Telegram:Pack:${infoPackName}`,
+        isAnimated: false,
+      },
+      {
+        id: `MoreStickers:Telegram:Sticker:${infoPackName}:s2`,
+        image: 'url2',
+        title: '🎉',
+        stickerPackId: `MoreStickers:Telegram:Pack:${infoPackName}`,
+        isAnimated: true,
+      },
+      {
+        id: `MoreStickers:Telegram:Sticker:${infoPackName}:s3`,
+        image: 'url3',
+        title: '🔥',
+        stickerPackId: `MoreStickers:Telegram:Pack:${infoPackName}`,
+        isAnimated: true,
+      },
+    ],
+    dynamic: {
+      version: 5,
+      refreshUrl: `https://stickers.example.com/stickerpack/telegram/${infoPackName}`,
+    },
+  }),
+);
+await updateStickerPackMetadata(infoPackName, {visibility: 'public'});
+
+// Case 1: Valid info command
+const ctxInfo1 = createMockContext({
+  userId: allowedUserId,
+  args: [infoPackName],
+});
+const handledInfo1 = await handleInfoCommand(ctxInfo1);
+assert.equal(handledInfo1, true);
+const infoResp = ctxInfo1.replies[0];
+assert.ok(infoResp.includes(`Pack: ${infoPackName}`));
+assert.ok(infoResp.includes('Title: Info Sample Pack'));
+assert.ok(infoResp.includes('Stickers: 3'));
+assert.ok(infoResp.includes('Static: 1'));
+assert.ok(infoResp.includes('Animated: 2'));
+assert.ok(infoResp.includes('Version: 5'));
+assert.ok(infoResp.includes('Visibility: public'));
+assert.ok(
+  infoResp.includes(
+    `https://stickers.example.com/stickerpack/telegram/${infoPackName}`,
+  ),
+);
+
+// Case 1b: Reply to sticker with /info
+const ctxInfoReply = createMockContext({
+  userId: allowedUserId,
+  replyTo: {sticker: {set_name: infoPackName}},
+});
+const handledInfoReply = await handleInfoCommand(ctxInfoReply);
+assert.equal(handledInfoReply, true);
+assert.ok(ctxInfoReply.replies[0].includes(`Pack: ${infoPackName}`));
+
+// Case 2: Legacy manifest without version -> reports Version: legacy
+const legacyInfoPackName = 'LegacyInfoPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(legacyInfoPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${legacyInfoPackName}`,
+    title: 'Legacy Info Pack',
+    stickers: [
+      {
+        id: 's1',
+        image: 'url',
+        title: '🐱',
+        stickerPackId: 'p',
+        isAnimated: false,
+      },
+    ],
+  }),
+);
+const ctxInfo2 = createMockContext({
+  userId: allowedUserId,
+  args: [legacyInfoPackName],
+});
+const handledInfo2 = await handleInfoCommand(ctxInfo2);
+assert.equal(handledInfo2, true);
+assert.ok(ctxInfo2.replies[0].includes('Version: legacy'));
+
+// Case 3: Nonexistent local pack
+const ctxInfo3 = createMockContext({
+  userId: allowedUserId,
+  args: ['NonExistentInfoPack'],
+});
+const handledInfo3 = await handleInfoCommand(ctxInfo3);
+assert.equal(handledInfo3, false);
+assert.ok(ctxInfo3.replies[0].includes('does not exist locally'));
+assert.ok(ctxInfo3.replies[0].includes('/pack NonExistentInfoPack'));
+
+// Case 4: Syntactically valid JSON with invalid sticker entries (e.g. [null]) -> does not throw
+const malformedStickerPackName = 'MalformedStickerInfoPack';
+await fsp.writeFile(
+  generateStickerPackFilePath(malformedStickerPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${malformedStickerPackName}`,
+    title: 'Broken Pack',
+    stickers: [null],
+  }),
+);
+const ctxInfoMalformed = createMockContext({
+  userId: allowedUserId,
+  args: [malformedStickerPackName],
+});
+const handledInfoMalformed = await handleInfoCommand(ctxInfoMalformed);
+assert.equal(handledInfoMalformed, false);
+assert.ok(ctxInfoMalformed.replies[0].includes('malformed'));
+
+console.log('Testing /stats command...');
+// Construct a controlled deterministic library in DATA_DIR to verify exact stats values:
+const statsFiles = await fsp.readdir(DATA_DIR);
+for (const f of statsFiles) {
+  if (f.endsWith('.telegram.stickerpack') || f.endsWith('.meta.json')) {
+    await fsp.rm(path.join(DATA_DIR, f), {force: true});
+  }
+}
+
+// Pack A: public, 2 stickers (1 static, 1 animated)
+const packAName = 'PackA';
+await fsp.writeFile(
+  generateStickerPackFilePath(packAName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${packAName}`,
+    title: 'Pack A',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${packAName}:1`,
+        title: '🐱',
+        isAnimated: false,
+      },
+      {
+        id: `MoreStickers:Telegram:Sticker:${packAName}:2`,
+        title: '🎉',
+        isAnimated: true,
+      },
+    ],
+  }),
+);
+await updateStickerPackMetadata(packAName, {visibility: 'public'});
+
+// Pack B: unlisted, 3 stickers (2 static, 1 animated)
+const packBName = 'PackB';
+await fsp.writeFile(
+  generateStickerPackFilePath(packBName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${packBName}`,
+    title: 'Pack B',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${packBName}:1`,
+        title: '🐱',
+        isAnimated: false,
+      },
+      {
+        id: `MoreStickers:Telegram:Sticker:${packBName}:2`,
+        title: '🐶',
+        isAnimated: false,
+      },
+      {
+        id: `MoreStickers:Telegram:Sticker:${packBName}:3`,
+        title: '🔥',
+        isAnimated: true,
+      },
+    ],
+  }),
+);
+await updateStickerPackMetadata(packBName, {visibility: 'unlisted'});
+
+// Pack C: malformed json
+const packCName = 'PackC';
+await fsp.writeFile(generateStickerPackFilePath(packCName), 'not valid json');
+
+// Pack D: valid json with invalid sticker item
+const packDName = 'PackD';
+await fsp.writeFile(
+  generateStickerPackFilePath(packDName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${packDName}`,
+    title: 'Pack D',
+    stickers: [null],
+  }),
+);
+
+const ctxStats1 = createMockContext({userId: allowedUserId});
+const handledStats1 = await handleStatsCommand(ctxStats1);
+assert.equal(handledStats1, true);
+const statsResp = ctxStats1.replies[0];
+assert.equal(
+  statsResp,
+  'Sticker library statistics\n\n' +
+    'Packs: 2\n' +
+    'Public: 1\n' +
+    'Unlisted: 1\n\n' +
+    'Stickers: 5\n' +
+    'Static: 3\n' +
+    'Animated: 2\n\n' +
+    'Invalid packs: 2',
+);
+
+// Unauthorized /stats
+const ctxStats2 = createMockContext({userId: 'unauthorized_id'});
+const handledStats2 = await handleStatsCommand(ctxStats2);
+assert.equal(handledStats2, false);
+assert.equal(ctxStats2.replies.length, 0);
+
+console.log('Testing /status command...');
+const ctxStatus1 = createMockContext({userId: allowedUserId});
+const handledStatus1 = await handleStatusCommand(ctxStatus1);
+assert.equal(handledStatus1, true);
+const statusResp = ctxStatus1.replies[0];
+assert.ok(statusResp.includes('MoreStickersConverter status'));
+assert.ok(statusResp.includes('Status: OK'));
+assert.ok(statusResp.includes('Uptime:'));
+assert.ok(statusResp.includes(`Node.js: ${process.version}`));
+assert.ok(statusResp.includes('Download concurrency: 2'));
+assert.ok(statusResp.includes('Data directory: OK'));
+assert.ok(statusResp.includes('External URL: configured'));
+assert.equal(
+  statusResp.includes(process.env.BOT_TOKEN!),
+  false,
+  'Status response must NOT contain BOT_TOKEN',
+);
+assert.equal(
+  statusResp.includes('123456789'),
+  false,
+  'Status response must NOT contain allowed Telegram user IDs',
+);
+
+// Unauthorized /status
+const ctxStatus2 = createMockContext({userId: 'unauthorized_id'});
+const handledStatus2 = await handleStatusCommand(ctxStatus2);
+assert.equal(handledStatus2, false);
+assert.equal(ctxStatus2.replies.length, 0);
+
+// Concurrent Test A: /refresh serialization
+console.log('Testing concurrent /refresh serialization...');
+const crPackName = 'ConcurrentRefreshPack';
+let getStickerSetCount = 0;
+let releaseFirstDownload!: () => void;
+const firstDownloadGate = new Promise<void>(resolve => {
+  releaseFirstDownload = resolve;
+});
+
+const crSticker1 = {
+  file_id: 'cr-file-1',
+  file_unique_id: 'cr_s1',
+  emoji: '🐱',
+  is_animated: false,
+  is_video: false,
+};
+const crSticker2 = {
+  file_id: 'cr-file-2',
+  file_unique_id: 'cr_s2',
+  emoji: '🐶',
+  is_animated: false,
+  is_video: false,
+};
+
+let firstDownloadStarted = false;
+let notifyFirstDownloadStarted!: () => void;
+const firstDownloadStartedPromise = new Promise<void>(resolve => {
+  notifyFirstDownloadStarted = resolve;
+});
+
+const mockConcurrentRefreshTg = {
+  getStickerSet: async (name: string) => {
+    getStickerSetCount++;
+    if (getStickerSetCount === 1) {
+      return {
+        name,
+        title: 'Concurrent Pack V1',
+        stickers: [crSticker1],
+      };
+    } else {
+      return {
+        name,
+        title: 'Concurrent Pack V2',
+        stickers: [crSticker1, crSticker2],
+      };
+    }
+  },
+  getFileLink: async () => new URL('https://example.com/cr.webp'),
+  getFile: async (fileId: string) => {
+    if (fileId === 'cr-file-1' && getStickerSetCount === 1) {
+      if (!firstDownloadStarted) {
+        firstDownloadStarted = true;
+        notifyFirstDownloadStarted();
+      }
+      await firstDownloadGate;
+    }
+    return {file_path: `documents/${fileId}.webp`};
+  },
+} as unknown as Telegram;
+
+const savedFetchForCr = globalThis.fetch;
+try {
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as typeof fetch;
+
+  const ctxCr1 = createMockContext({
+    userId: allowedUserId,
+    args: [crPackName],
+    telegram: mockConcurrentRefreshTg,
+  });
+  const ctxCr2 = createMockContext({
+    userId: allowedUserId,
+    args: [crPackName],
+    telegram: mockConcurrentRefreshTg,
+  });
+
+  // Start first refresh (will block at firstDownloadGate)
+  const refresh1Promise = handleRefreshCommand(ctxCr1);
+
+  // Wait until first refresh enters its download phase
+  await firstDownloadStartedPromise;
+
+  // Start second refresh for the SAME pack
+  const refresh2Promise = handleRefreshCommand(ctxCr2);
+
+  // Small delay to let any synchronous or eager work in refresh2 run
+  await new Promise(r => setTimeout(r, 50));
+
+  // Assert that getStickerSet was only called ONCE so far (refresh 2 is waiting in queue)
+  assert.equal(
+    getStickerSetCount,
+    1,
+    'getStickerSet must only be called once while first operation is in progress',
+  );
+
+  // Release first operation
+  releaseFirstDownload();
+
+  // Wait for both refreshes to complete
+  const [res1, res2] = await Promise.all([refresh1Promise, refresh2Promise]);
+  assert.equal(res1, true);
+  assert.equal(res2, true);
+
+  // Assert that getStickerSet was called twice in total
+  assert.equal(
+    getStickerSetCount,
+    2,
+    'getStickerSet must be called a second time after first operation completes',
+  );
+
+  // Read final manifest
+  const finalCrManifest = validateLocalStickerPackManifest(
+    JSON.parse(
+      await fsp.readFile(generateStickerPackFilePath(crPackName), 'utf8'),
+    ),
+  );
+  assert.ok(finalCrManifest);
+  assert.equal(
+    finalCrManifest.stickers.length,
+    2,
+    'Final manifest must contain 2 stickers from snapshot 2',
+  );
+  assert.equal(
+    finalCrManifest.stickers[0].id,
+    `MoreStickers:Telegram:Sticker:${crPackName}:cr_s1`,
+  );
+  assert.equal(
+    finalCrManifest.stickers[1].id,
+    `MoreStickers:Telegram:Sticker:${crPackName}:cr_s2`,
+  );
+  assert.ok(finalCrManifest.dynamic);
+  assert.equal(
+    finalCrManifest.dynamic.version,
+    2,
+    'Version must be incremented to 2',
+  );
+} finally {
+  globalThis.fetch = savedFetchForCr;
+}
+
+// Concurrent Test B: concurrent /pack failure must not delete success
+console.log('Testing concurrent /pack failure recovery...');
+const cpFailPackName = 'ConcurrentPackFailSuccessPack';
+let cpImportAttempt = 0;
+
+const mockConcurrentPackTg = {
+  getStickerSet: async (name: string) => ({
+    name,
+    title: 'Concurrent Pack Fail-Success',
+    stickers: [
+      {
+        file_id: 'cp-s1-file',
+        file_unique_id: 'cp_s1',
+        emoji: '⭐',
+        is_animated: false,
+        is_video: false,
+      },
+    ],
+  }),
+  getFileLink: async () => new URL('https://example.com/cp.webp'),
+  getFile: async () => {
+    cpImportAttempt++;
+    if (cpImportAttempt === 1) {
+      throw new Error('Network error on first attempt');
+    }
+    return {file_path: 'documents/cp.webp'};
+  },
+} as unknown as Telegram;
+
+const savedFetchForCp = globalThis.fetch;
+try {
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as typeof fetch;
+
+  const ctxCp1 = createMockContext({
+    userId: allowedUserId,
+    args: [cpFailPackName],
+    telegram: mockConcurrentPackTg,
+  });
+  const ctxCp2 = createMockContext({
+    userId: allowedUserId,
+    args: [cpFailPackName],
+    telegram: mockConcurrentPackTg,
+  });
+
+  const [res1, res2] = await Promise.all([
+    handlePackCommand(ctxCp1),
+    handlePackCommand(ctxCp2),
+  ]);
+
+  assert.equal(res1, false, 'First attempt must fail cleanly');
+  assert.equal(res2, true, 'Second attempt must succeed');
+
+  const cpManifestPath = generateStickerPackFilePath(cpFailPackName);
+  const cpDirPath = generateStickerPackDirPath(cpFailPackName);
+
+  await fsp.access(cpManifestPath, fs.constants.R_OK);
+  await fsp.access(cpDirPath, fs.constants.R_OK);
+
+  const finalCpManifest = validateLocalStickerPackManifest(
+    JSON.parse(await fsp.readFile(cpManifestPath, 'utf8')),
+  );
+  assert.ok(finalCpManifest);
+  assert.equal(finalCpManifest.stickers.length, 1);
+  assert.ok(
+    ctxCp2.replies.some(r =>
+      r.includes(`/stickerpack/telegram/${cpFailPackName}`),
+    ),
+    'Success URL must be returned by second attempt',
+  );
+} finally {
+  globalThis.fetch = savedFetchForCp;
+}
+
+// Concurrent Test C: different packs are not globally serialized
+console.log('Testing independent pack queue concurrency...');
+let packAStarted = false;
+let packBStarted = false;
+let releasePackA!: () => void;
+let releasePackB!: () => void;
+const gateA = new Promise<void>(r => {
+  releasePackA = r;
+});
+const gateB = new Promise<void>(r => {
+  releasePackB = r;
+});
+
+const opAPromise = enqueueStickerPackOperation('PackAlpha', async () => {
+  packAStarted = true;
+  await gateA;
+  return 'resultA';
+});
+
+const opBPromise = enqueueStickerPackOperation('PackBeta', async () => {
+  packBStarted = true;
+  await gateB;
+  return 'resultB';
+});
+
+// Give microtasks a turn to run
+await new Promise(r => setTimeout(r, 20));
+
+// Assert both operations have started concurrently before releasing either gate
+assert.equal(packAStarted, true, 'PackAlpha operation must have started');
+assert.equal(
+  packBStarted,
+  true,
+  'PackBeta operation must have started concurrently',
+);
+
+releasePackA();
+releasePackB();
+
+const [resA, resB] = await Promise.all([opAPromise, opBPromise]);
+assert.equal(resA, 'resultA');
+assert.equal(resB, 'resultB');
+
+// Concurrent Test D: Worker-drain on failure prevents premature lock release
+console.log('Testing worker-drain failure coordination and lock safety...');
+const drainPackName = 'WorkerDrainPack';
+const drainEvents: string[] = [];
+let releaseFailWorker!: () => void;
+const failWorkerGate = new Promise<void>(r => {
+  releaseFailWorker = r;
+});
+
+let releaseSlowWorker!: () => void;
+const slowWorkerGate = new Promise<void>(r => {
+  releaseSlowWorker = r;
+});
+
+let notifyFailWorkerStarted!: () => void;
+const failWorkerStarted = new Promise<void>(r => {
+  notifyFailWorkerStarted = r;
+});
+
+let notifySlowWorkerStarted!: () => void;
+const slowWorkerStarted = new Promise<void>(r => {
+  notifySlowWorkerStarted = r;
+});
+
+let drainGetStickerSetCount = 0;
+
+const mockDrainTg = {
+  getStickerSet: async (name: string) => {
+    drainGetStickerSetCount++;
+    if (drainGetStickerSetCount === 1) {
+      drainEvents.push('A-getStickerSet');
+      return {
+        name,
+        title: 'Worker Drain Pack Initial',
+        stickers: [
+          {
+            file_id: 'fail-file-1',
+            file_unique_id: 'fail_s1',
+            emoji: '💥',
+            is_animated: false,
+            is_video: false,
+          },
+          {
+            file_id: 'slow-file-2',
+            file_unique_id: 'slow_s2',
+            emoji: '⏳',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    } else {
+      drainEvents.push('B-getStickerSet');
+      return {
+        name,
+        title: 'Worker Drain Pack Final',
+        stickers: [
+          {
+            file_id: 'b-file-1',
+            file_unique_id: 'b_s1',
+            emoji: '✨',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    }
+  },
+  getFileLink: async () => new URL('https://example.com/drain.webp'),
+  getFile: async (fileId: string) => {
+    if (fileId === 'fail-file-1') {
+      notifyFailWorkerStarted();
+      await failWorkerGate;
+      throw new Error('Worker 1 intentional failure');
+    }
+    if (fileId === 'slow-file-2') {
+      notifySlowWorkerStarted();
+      await slowWorkerGate;
+      drainEvents.push('A-slow-finished');
+      return {file_path: 'documents/slow.webp'};
+    }
+    return {file_path: `documents/${fileId}.webp`};
+  },
+} as unknown as Telegram;
+
+const savedFetchForDrain = globalThis.fetch;
+try {
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as typeof fetch;
+
+  let refreshASettled = false;
+  const ctxDrainA = createMockContext({
+    userId: allowedUserId,
+    args: [drainPackName],
+    telegram: mockDrainTg,
+  });
+
+  const refreshAPromise = handleRefreshCommand(ctxDrainA).finally(() => {
+    refreshASettled = true;
+  });
+
+  // Wait until both workers in Refresh A have actually started
+  await Promise.all([failWorkerStarted, slowWorkerStarted]);
+
+  // Trigger failure of Worker 1
+  releaseFailWorker();
+
+  // Yield microtasks to allow Worker 1 rejection to be processed
+  await new Promise(r => setTimeout(r, 20));
+
+  // Critical assertion: Refresh A must NOT have completed yet because Worker 2 is still running
+  assert.equal(
+    refreshASettled,
+    false,
+    'Refresh A must not settle while Worker 2 is still in-flight',
+  );
+
+  // Start Refresh B for the SAME pack while Worker 2 of A is still blocked
+  let refreshBSettled = false;
+  const ctxDrainB = createMockContext({
+    userId: allowedUserId,
+    args: [drainPackName],
+    telegram: mockDrainTg,
+  });
+
+  const refreshBPromise = handleRefreshCommand(ctxDrainB).finally(() => {
+    refreshBSettled = true;
+  });
+
+  // Yield microtasks
+  await new Promise(r => setTimeout(r, 20));
+
+  // Assert Refresh B has not called getStickerSet yet because A still holds the lock
+  assert.equal(
+    drainGetStickerSetCount,
+    1,
+    'Refresh B must not call getStickerSet while Refresh A is still draining',
+  );
+  assert.equal(refreshBSettled, false);
+
+  // Now release slow worker 2
+  releaseSlowWorker();
+
+  // Wait for both operations
+  const [resA, resB] = await Promise.all([refreshAPromise, refreshBPromise]);
+
+  assert.equal(resA, false, 'Refresh A must fail');
+  assert.equal(resB, true, 'Refresh B must succeed');
+
+  assert.equal(
+    drainGetStickerSetCount,
+    2,
+    'Refresh B must have called getStickerSet after Refresh A drained',
+  );
+
+  const idxSlowFinished = drainEvents.indexOf('A-slow-finished');
+  const idxBGetStickerSet = drainEvents.indexOf('B-getStickerSet');
+  assert.ok(
+    idxSlowFinished !== -1 && idxBGetStickerSet !== -1,
+    'Both events must have been recorded',
+  );
+  assert.ok(
+    idxSlowFinished < idxBGetStickerSet,
+    'A-slow-finished must happen BEFORE B-getStickerSet',
+  );
+
+  // Verify final manifest corresponds to Refresh B
+  const finalDrainManifest = validateLocalStickerPackManifest(
+    JSON.parse(
+      await fsp.readFile(generateStickerPackFilePath(drainPackName), 'utf8'),
+    ),
+  );
+  assert.ok(finalDrainManifest);
+  assert.equal(finalDrainManifest.title, 'Worker Drain Pack Final');
+  assert.equal(finalDrainManifest.stickers.length, 1);
+  assert.equal(
+    finalDrainManifest.stickers[0].id,
+    `MoreStickers:Telegram:Sticker:${drainPackName}:b_s1`,
+  );
+
+  // Check no temp files left
+  const drainPackDir = generateStickerPackDirPath(drainPackName);
+  const remainingFiles = await fsp.readdir(drainPackDir);
+  const tempFiles = remainingFiles.filter(
+    f => f.includes('download-') || f.endsWith('.tmp'),
+  );
+  assert.equal(tempFiles.length, 0, 'No temporary download files must remain');
+} finally {
+  globalThis.fetch = savedFetchForDrain;
+}
+
+console.log('Verified: All new Telegram bot commands passed all tests');
+await fsp.rm(tempDir, {recursive: true, force: true});
 console.log('--- All Smoke Tests Passed Successfully! ---');

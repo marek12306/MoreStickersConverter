@@ -51,6 +51,23 @@ These commands can also be used by replying to a sticker from the target pack.
 
 Unlisted packs do not appear in the public catalog but remain accessible through their direct link.
 
+### Telegram bot commands
+
+Authorized users can manage and inspect sticker packs using the following bot commands:
+
+```text
+/pack      Import or get a sticker pack
+/refresh   Refresh a pack from Telegram
+/check     Check whether a local pack is up to date
+/info      Show information about a pack
+/public    Add a pack to the public catalog
+/unlisted  Remove a pack from the public catalog
+/stats     Show local library statistics
+/status    Show converter status
+```
+
+Pack-specific commands (`/pack`, `/refresh`, `/check`, `/info`, `/public`, `/unlisted`) can be used either with an explicit pack name (e.g. `/info MyPack`) or by replying to a sticker from that pack.
+
 ### Telegram access control
 
 Bot access can be limited with:

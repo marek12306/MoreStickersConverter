@@ -1,16 +1,16 @@
 import {Telegraf} from 'telegraf';
 import {message} from 'telegraf/filters';
 import {
-  downloadStickerPack,
-  isStickerPackDownloaded,
-  generateStickerPackDirPath,
-  generateStickerPackFilePath,
-} from './telegramStickers.js';
-import {
-  handleVisibilityCommand,
-  isAllowedTelegramUser,
-} from './stickerPackVisibilityCommands.js';
-import fsp from 'fs/promises';
+  handleCheckCommand,
+  handleInfoCommand,
+  handlePackCommand,
+  handleRefreshCommand,
+  handleStatsCommand,
+  handleStatusCommand,
+  importOrGetStickerPack,
+} from './stickerPackCommands.js';
+import {handleVisibilityCommand} from './stickerPackVisibilityCommands.js';
+import {isAllowedTelegramUser} from './telegramCommandUtils.js';
 
 const bot: Telegraf = new Telegraf(process.env.BOT_TOKEN!);
 
@@ -19,58 +19,37 @@ bot.on(message('sticker'), async ctx => {
     return;
   }
 
-  // Get the sticker pack name
-  const stickerPackName = ctx.message.sticker!.set_name;
+  const stickerPackName = ctx.message.sticker.set_name;
   if (!stickerPackName) {
     await ctx.reply('This sticker does not belong to any sticker pack.');
     return;
   }
 
-  // Download the whole sticker pack
-  const stickerSet = await ctx.telegram.getStickerSet(stickerPackName);
-  const mcStickerPackPath = generateStickerPackFilePath(stickerSet.name);
-  if (await isStickerPackDownloaded(stickerPackName)) {
-    try {
-      await fsp.access(mcStickerPackPath);
-    } catch {
-      await ctx.reply('Error: Sticker pack not found.');
-      return;
-    }
-    const stickerPackUrl = `${process.env.EXTERNAL_URL}/stickerpack/telegram/${encodeURIComponent(stickerSet.name)}`;
+  await importOrGetStickerPack(ctx.telegram, stickerPackName, ctx);
+});
 
-    await ctx.reply(stickerPackUrl);
-    return;
-  }
+bot.command('pack', async ctx => {
+  await handlePackCommand(ctx);
+});
 
-  await ctx.reply('Downloading the sticker pack...');
-  try {
-    await downloadStickerPack(ctx.telegram, stickerSet);
-  } catch (e) {
-    try {
-      await fsp.rm(generateStickerPackDirPath(stickerSet.name), {
-        recursive: true,
-        force: true,
-      });
-    } catch {
-      // ignore cleanup error
-    }
-    try {
-      await fsp.rm(mcStickerPackPath, {force: true});
-    } catch {
-      // ignore cleanup error
-    }
-    await ctx.reply('StickerPack download error.');
-    return;
-  }
-  try {
-    await fsp.access(mcStickerPackPath);
-  } catch {
-    await ctx.reply('Error: Sticker pack download error.');
-    return;
-  }
-  const stickerPackUrl = `${process.env.EXTERNAL_URL}/stickerpack/telegram/${encodeURIComponent(stickerSet.name)}`;
+bot.command('refresh', async ctx => {
+  await handleRefreshCommand(ctx);
+});
 
-  await ctx.reply(stickerPackUrl);
+bot.command('check', async ctx => {
+  await handleCheckCommand(ctx);
+});
+
+bot.command('info', async ctx => {
+  await handleInfoCommand(ctx);
+});
+
+bot.command('stats', async ctx => {
+  await handleStatsCommand(ctx);
+});
+
+bot.command('status', async ctx => {
+  await handleStatusCommand(ctx);
 });
 
 bot.command('public', async ctx => {

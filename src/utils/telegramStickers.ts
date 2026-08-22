@@ -66,6 +66,101 @@ export function getStickerContentSignature(stickers: McSticker[]): string {
   return JSON.stringify(stickers.map(sticker => [sticker.id, sticker.title]));
 }
 
+export function getTelegramStickerContentSignature(
+  stickerSetName: string,
+  telegramStickers: Sticker[],
+): string {
+  return JSON.stringify(
+    telegramStickers.map(sticker => [
+      toMcStickerId(sticker.file_unique_id, stickerSetName),
+      sticker.emoji || '',
+    ]),
+  );
+}
+
+export function validateLocalStickerPackManifest(
+  value: unknown,
+): StickerPack | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const pack = value as Partial<StickerPack>;
+  if (typeof pack.id !== 'string' || pack.id.trim().length === 0) {
+    return null;
+  }
+  if (!Array.isArray(pack.stickers)) {
+    return null;
+  }
+  for (const item of pack.stickers) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      return null;
+    }
+    const sticker = item as Partial<McSticker>;
+    if (typeof sticker.id !== 'string' || sticker.id.trim().length === 0) {
+      return null;
+    }
+    if (typeof sticker.title !== 'string') {
+      return null;
+    }
+    if (
+      sticker.isAnimated !== undefined &&
+      typeof sticker.isAnimated !== 'boolean'
+    ) {
+      return null;
+    }
+    if (
+      sticker.readyToUpload !== undefined &&
+      typeof sticker.readyToUpload !== 'boolean'
+    ) {
+      return null;
+    }
+    if (
+      sticker.filename !== undefined &&
+      typeof sticker.filename !== 'string'
+    ) {
+      return null;
+    }
+    if (sticker.image !== undefined && typeof sticker.image !== 'string') {
+      return null;
+    }
+    if (
+      sticker.previewImage !== undefined &&
+      typeof sticker.previewImage !== 'string'
+    ) {
+      return null;
+    }
+    if (
+      sticker.stickerPackId !== undefined &&
+      typeof sticker.stickerPackId !== 'string'
+    ) {
+      return null;
+    }
+  }
+  if (pack.dynamic !== undefined) {
+    if (
+      typeof pack.dynamic !== 'object' ||
+      pack.dynamic === null ||
+      Array.isArray(pack.dynamic)
+    ) {
+      return null;
+    }
+    const dynamic = pack.dynamic as Partial<StickerPackDynamic>;
+    if (
+      dynamic.version !== undefined &&
+      !isValidDynamicVersion(dynamic.version)
+    ) {
+      return null;
+    }
+    if (
+      dynamic.refreshUrl !== undefined &&
+      typeof dynamic.refreshUrl !== 'string'
+    ) {
+      return null;
+    }
+  }
+  return value as StickerPack;
+}
+
 function isValidDynamicVersion(version: unknown): version is number {
   return (
     typeof version === 'number' && Number.isSafeInteger(version) && version >= 1
@@ -382,26 +477,51 @@ async function downloadSingleSticker(
     stickerPackDirPath,
     `${sticker.file_unique_id}.${mediaInfo.outputFileType}`,
   );
-  await pipeline(
-    Readable.fromWeb(response.body!),
-    fs.createWriteStream(stickerFilePath),
+  const tempDownloadPath = path.join(
+    stickerPackDirPath,
+    `${sticker.file_unique_id}.download-${randomUUID()}.${mediaInfo.outputFileType}`,
   );
-  const previewPath = generateStickerPreviewFilePath(
-    stickerSet.name,
-    sticker.file_unique_id,
-  );
-  await generatePreview(stickerFilePath, previewPath);
+
+  try {
+    await pipeline(
+      Readable.fromWeb(response.body!),
+      fs.createWriteStream(tempDownloadPath),
+    );
+    await fsp.rename(tempDownloadPath, stickerFilePath);
+    const previewPath = generateStickerPreviewFilePath(
+      stickerSet.name,
+      sticker.file_unique_id,
+    );
+    await generatePreview(stickerFilePath, previewPath);
+  } finally {
+    await fsp.unlink(tempDownloadPath).catch(() => undefined);
+  }
+}
+
+interface DownloadState {
+  error?: unknown;
 }
 
 async function downloadWorker(
   queue: Sticker[],
   telegram: Telegram,
   stickerSet: StickerSet,
+  state: DownloadState,
 ): Promise<void> {
   while (queue.length > 0) {
+    if (state.error !== undefined) {
+      return;
+    }
     const sticker = queue.shift();
     if (!sticker) break;
-    await downloadSingleSticker(sticker, telegram, stickerSet);
+    try {
+      await downloadSingleSticker(sticker, telegram, stickerSet);
+    } catch (err) {
+      if (state.error === undefined) {
+        state.error = err;
+      }
+      return;
+    }
   }
 }
 
@@ -411,11 +531,16 @@ async function downloadStickerPack(telegram: Telegram, stickerSet: StickerSet) {
   const previewDir = generateStickerPreviewDirPath(stickerSet.name);
   await fsp.mkdir(previewDir, {recursive: true});
   const queue = stickerSet.stickers.slice();
+  const state: DownloadState = {};
 
   const downloadPromises = Array.from({length: CONCURRENCY}, () =>
-    downloadWorker(queue, telegram, stickerSet),
+    downloadWorker(queue, telegram, stickerSet, state),
   );
   await Promise.all(downloadPromises);
+
+  if (state.error !== undefined) {
+    throw state.error;
+  }
 
   await publishStickerPackManifest(telegram, stickerSet);
 }
@@ -440,6 +565,30 @@ export function enqueueManifestPublish(
       }
     });
   manifestWriteQueues.set(stickerSetName, trackedRun);
+  return run;
+}
+
+// Per-pack operation queue ensuring high-level mutating operations (/pack, /refresh)
+// on the same pack run serially without interleaving, while operations on different packs
+// execute concurrently.
+const stickerPackOperationQueues = new Map<string, Promise<unknown>>();
+
+export function enqueueStickerPackOperation<T>(
+  packName: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const normalizedKey = packName.toLowerCase();
+  const previousRun =
+    stickerPackOperationQueues.get(normalizedKey) ?? Promise.resolve();
+  const run = previousRun.then(operation);
+  const trackedRun = run
+    .catch(() => undefined)
+    .finally(() => {
+      if (stickerPackOperationQueues.get(normalizedKey) === trackedRun) {
+        stickerPackOperationQueues.delete(normalizedKey);
+      }
+    });
+  stickerPackOperationQueues.set(normalizedKey, trackedRun);
   return run;
 }
 
