@@ -5,7 +5,11 @@ import {Readable} from 'stream';
 import {pipeline} from 'stream/promises';
 import {randomUUID} from 'crypto';
 import {Telegram} from 'telegraf';
-import {StickerPack, Sticker as McSticker} from './mcStickerPack.js';
+import {
+  StickerPack,
+  Sticker as McSticker,
+  StickerPackDynamic,
+} from './mcStickerPack.js';
 import {Sticker, StickerSet} from 'telegraf/types';
 import {convertWebmToGif} from './webmToGif.js';
 import {convertTgsToGif} from './tgsToGif.js';
@@ -48,6 +52,109 @@ function generatePreviewExternalUrl(
   stickerId: string,
 ) {
   return `${EXTERNAL_URL}/preview/telegram/${stickerPackName}/${stickerId}.webp`;
+}
+
+export function generateStickerPackExternalUrl(
+  stickerPackName: string,
+): string {
+  return `${EXTERNAL_URL}/stickerpack/telegram/${encodeURIComponent(stickerPackName)}`;
+}
+
+export function getStickerContentSignature(stickers: McSticker[]): string {
+  // Canonical content signature: id embeds file_unique_id, title carries
+  // emoji. Order is preserved on purpose - reordering is a real change.
+  return JSON.stringify(stickers.map(sticker => [sticker.id, sticker.title]));
+}
+
+function isValidDynamicVersion(version: unknown): version is number {
+  return (
+    typeof version === 'number' && Number.isSafeInteger(version) && version >= 1
+  );
+}
+
+function isStickerSignatureEntry(
+  value: unknown,
+): value is Pick<McSticker, 'id' | 'title'> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as {id?: unknown}).id === 'string' &&
+    typeof (value as {title?: unknown}).title === 'string'
+  );
+}
+
+export function resolveStickerPackVersion(
+  previousPack: unknown,
+  nextStickers: McSticker[],
+): number {
+  if (previousPack === undefined) {
+    // Manifest does not exist on disk.
+    return 1;
+  }
+
+  if (
+    previousPack === null ||
+    typeof previousPack !== 'object' ||
+    Array.isArray(previousPack)
+  ) {
+    throw new Error(
+      'Existing manifest has invalid root structure; refusing to guess version',
+    );
+  }
+
+  const stickers = (previousPack as {stickers?: unknown}).stickers;
+  if (!Array.isArray(stickers) || stickers.length === 0) {
+    throw new Error(
+      'Versioned manifest lacks a readable stickers[] list; refusing to overwrite with a guessed version',
+    );
+  }
+  for (const sticker of stickers) {
+    if (!isStickerSignatureEntry(sticker)) {
+      throw new Error(
+        'Versioned manifest contains unreadable sticker entries; refusing to guess version',
+      );
+    }
+  }
+
+  const dynamic = (previousPack as {dynamic?: unknown}).dynamic;
+  if (
+    dynamic === undefined ||
+    (typeof dynamic === 'object' &&
+      dynamic !== null &&
+      !Array.isArray(dynamic) &&
+      (dynamic as {version?: unknown}).version === undefined)
+  ) {
+    // Legacy manifest without dynamic.version migrates to version 1.
+    return 1;
+  }
+  if (
+    typeof dynamic !== 'object' ||
+    dynamic === null ||
+    Array.isArray(dynamic)
+  ) {
+    throw new Error(
+      'Existing manifest has invalid dynamic field; refusing to guess version',
+    );
+  }
+
+  const {version} = dynamic as {version?: unknown};
+  if (!isValidDynamicVersion(version)) {
+    throw new Error(
+      `Existing manifest declares invalid dynamic.version (${String(version)}); refusing to reset it`,
+    );
+  }
+
+  const previousSignature = getStickerContentSignature(stickers as McSticker[]);
+  const nextSignature = getStickerContentSignature(nextStickers);
+  if (previousSignature === nextSignature) {
+    return version;
+  }
+
+  if (version === Number.MAX_SAFE_INTEGER) {
+    throw new Error('Sticker pack version overflow');
+  }
+  return version + 1;
 }
 
 export function generateStickerPreviewDirPath(stickerSetName: string) {
@@ -310,9 +417,30 @@ async function downloadStickerPack(telegram: Telegram, stickerSet: StickerSet) {
   );
   await Promise.all(downloadPromises);
 
-  const mcStickerPack = await toMcStickerPack(telegram, stickerSet);
-  const mcStickerPackPath = generateStickerPackFilePath(stickerSet.name);
-  await fsp.writeFile(mcStickerPackPath, JSON.stringify(mcStickerPack));
+  await publishStickerPackManifest(telegram, stickerSet);
+}
+
+// Per-pack FIFO ensuring the read-previous-manifest -> compute-version ->
+// atomic-write cycle never interleaves between concurrent generations of
+// the same pack. Different packs remain independent.
+const manifestWriteQueues = new Map<string, Promise<unknown>>();
+
+export function enqueueManifestPublish(
+  stickerSetName: string,
+  job: () => Promise<void>,
+): Promise<void> {
+  const previousRun =
+    manifestWriteQueues.get(stickerSetName) ?? Promise.resolve();
+  const run = previousRun.then(job);
+  const trackedRun = run
+    .catch(() => undefined)
+    .finally(() => {
+      if (manifestWriteQueues.get(stickerSetName) === trackedRun) {
+        manifestWriteQueues.delete(stickerSetName);
+      }
+    });
+  manifestWriteQueues.set(stickerSetName, trackedRun);
+  return run;
 }
 
 async function toMcStickerPack(
@@ -346,12 +474,89 @@ async function toMcStickerPack(
     } as McSticker;
   });
   const stickers = await Promise.all(stickerPs);
+  const previous = await readManifestOrUndefined(stickerSet.name);
   return {
     id: toMcStickerPackId(stickerSet.name),
     title: stickerSet.title,
     logo: stickers[0],
     stickers,
+    dynamic: buildStickerPackDynamic(stickerSet.name, previous, stickers),
   } as StickerPack;
+}
+
+function buildStickerPackDynamic(
+  stickerSetName: string,
+  previousPack: unknown,
+  stickers: McSticker[],
+): StickerPackDynamic {
+  return {
+    version: resolveStickerPackVersion(previousPack, stickers),
+    refreshUrl: generateStickerPackExternalUrl(stickerSetName),
+  };
+}
+
+function getErrorCode(err: unknown): string | undefined {
+  if (
+    typeof err === 'object' &&
+    err !== null &&
+    'code' in err &&
+    typeof (err as {code?: unknown}).code === 'string'
+  ) {
+    return (err as {code: string}).code;
+  }
+  return undefined;
+}
+
+export async function readManifestOrUndefined(
+  stickerSetName: string,
+): Promise<unknown> {
+  const manifestPath = generateStickerPackFilePath(stickerSetName);
+  let rawData: string;
+  try {
+    rawData = await fsp.readFile(manifestPath, 'utf8');
+  } catch (err: unknown) {
+    if (getErrorCode(err) === 'ENOENT') {
+      return undefined;
+    }
+    throw err;
+  }
+
+  try {
+    return JSON.parse(rawData);
+  } catch {
+    throw new Error(
+      `Existing manifest for "${stickerSetName}" contains malformed JSON; refusing to reset sticker pack version`,
+    );
+  }
+}
+
+async function publishStickerPackManifest(
+  telegram: Telegram,
+  stickerSet: StickerSet,
+): Promise<void> {
+  await enqueueManifestPublish(stickerSet.name, async () => {
+    // Rebuild inside the per-pack job: version resolution reads the latest
+    // on-disk manifest serialized against any other generation of this pack.
+    const pack = await toMcStickerPack(telegram, stickerSet);
+    await writeStickerPackManifestAtomically(
+      generateStickerPackFilePath(stickerSet.name),
+      pack,
+    );
+  });
+}
+
+export async function writeStickerPackManifestAtomically(
+  manifestPath: string,
+  pack: StickerPack,
+): Promise<void> {
+  const tempPath = `${manifestPath}.${randomUUID()}.tmp`;
+  await fsp.mkdir(path.dirname(manifestPath), {recursive: true});
+  try {
+    await fsp.writeFile(tempPath, JSON.stringify(pack), 'utf8');
+    await fsp.rename(tempPath, manifestPath);
+  } finally {
+    await fsp.unlink(tempPath).catch(() => undefined);
+  }
 }
 
 export {

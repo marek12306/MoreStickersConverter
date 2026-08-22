@@ -54,6 +54,12 @@ const {
   getStickerMediaInfo,
   fetchStickerWithRetry,
   parseDownloadConcurrency,
+  generateStickerPackExternalUrl,
+  getStickerContentSignature,
+  resolveStickerPackVersion,
+  writeStickerPackManifestAtomically,
+  enqueueManifestPublish,
+  readManifestOrUndefined,
   toMcStickerPack,
 } = await import('../src/utils/telegramStickers.js');
 const {
@@ -484,9 +490,394 @@ assert.ok(manifestWebp.filename?.endsWith('.webp'));
 assert.ok(manifestWebp.image.endsWith('.webp'));
 assert.equal(manifestWebp.isAnimated, false);
 assert.equal(Object.hasOwn(manifestWebp, 'readyToUpload'), false);
+
+// dynamic contract: numeric version + refreshUrl on every generated manifest
+assert.ok(manifest.dynamic, 'Generated manifest must contain dynamic block');
+assert.equal(
+  manifest.dynamic.version,
+  1,
+  `First generation must produce version 1, got ${manifest.dynamic.version}`,
+);
+assert.equal(
+  typeof manifest.dynamic.version,
+  'number',
+  'dynamic.version must be a JSON number, not a string',
+);
+assert.equal(
+  Number.isSafeInteger(manifest.dynamic.version),
+  true,
+  'dynamic.version must be a safe integer',
+);
+assert.equal(
+  manifest.dynamic.refreshUrl,
+  `https://stickers.example.com/stickerpack/telegram/${manifestPackName}`,
+  'refreshUrl must point at the public manifest endpoint of the same pack',
+);
+assert.equal(
+  typeof serializedManifest.dynamic.version,
+  'number',
+  'Serialized dynamic.version must remain a number after JSON round-trip',
+);
+assert.equal(
+  Object.hasOwn(serializedManifest, 'dynamic'),
+  true,
+  'Serialized manifest must contain the dynamic property',
+);
 console.log(
   'Verified: Telegram manifests expose final GIFs, static WebP, and WebP previews',
 );
+
+// Test 1.x: dynamic version lifecycle (resolveStickerPackVersion contract)
+console.log('Testing dynamic version lifecycle...');
+type TestMcSticker = {
+  id: string;
+  image: string;
+  previewImage?: string;
+  title: string;
+  stickerPackId: string;
+  filename?: string;
+  isAnimated?: boolean;
+  readyToUpload?: boolean;
+};
+const mkSticker = (uniqueId: string, emoji: string): TestMcSticker => ({
+  id: `MoreStickers:Telegram:Sticker:VersionPack:${uniqueId}`,
+  image: `https://stickers.example.com/sticker/telegram/VersionPack/${uniqueId}.gif`,
+  title: emoji,
+  stickerPackId: 'MoreStickers:Telegram:Pack:VersionPack',
+});
+const [stickerA, stickerB, stickerC, stickerD] = [
+  mkSticker('aaa', 'emoji-a'),
+  mkSticker('bbb', 'emoji-b'),
+  mkSticker('ccc', 'emoji-c'),
+  mkSticker('ddd', 'emoji-d'),
+] as const;
+
+const versionedPrevious = (
+  stickers: Parameters<typeof getStickerContentSignature>[0],
+  version: number,
+) => ({
+  id: 'MoreStickers:Telegram:Pack:VersionPack',
+  title: 'Some pack title',
+  logo: stickers[0],
+  stickers,
+  dynamic: {
+    version,
+    refreshUrl: 'https://old.example.com/stickerpack/telegram/VersionPack',
+  },
+});
+
+// Test 1 - first generation (no previous manifest)
+assert.equal(resolveStickerPackVersion(undefined, [stickerA]), 1);
+// Test 2 - identical regeneration keeps version
+assert.equal(
+  resolveStickerPackVersion(versionedPrevious([stickerA], 7), [stickerA]),
+  7,
+);
+// Test 3 - pack title change does not affect version (title lives on pack)
+assert.equal(
+  resolveStickerPackVersion(versionedPrevious([stickerA], 4), [stickerA]),
+  4,
+);
+// Test 4 - technical URL changes (image, preview, refreshUrl) do not affect version
+const technicalChangedPrevious = {
+  ...versionedPrevious([stickerA], 5),
+  dynamic: {
+    version: 5,
+    refreshUrl:
+      'https://newdomain.example.com/stickerpack/telegram/VersionPack',
+  },
+  stickers: [
+    {
+      ...stickerA,
+      image:
+        'https://newdomain.example.com/sticker/telegram/VersionPack/aaa.gif',
+      previewImage:
+        'https://newdomain.example.com/preview/telegram/VersionPack/aaa.webp',
+    },
+  ],
+};
+assert.equal(
+  resolveStickerPackVersion(technicalChangedPrevious, [stickerA]),
+  5,
+);
+// Test 5 - emoji/title change increments
+assert.equal(
+  resolveStickerPackVersion(versionedPrevious([stickerA], 3), [
+    {...stickerA, title: 'emoji-changed'},
+  ]),
+  4,
+);
+// Test 6 - file_unique_id replacement (different id) increments
+assert.equal(
+  resolveStickerPackVersion(versionedPrevious([stickerA], 2), [
+    mkSticker('xyz', 'emoji-a'),
+  ]),
+  3,
+);
+// Test 7 - add sticker increments
+assert.equal(
+  resolveStickerPackVersion(versionedPrevious([stickerA], 2), [
+    stickerA,
+    stickerB,
+  ]),
+  3,
+);
+// Test 8 - remove sticker increments
+assert.equal(
+  resolveStickerPackVersion(versionedPrevious([stickerA, stickerB], 2), [
+    stickerA,
+  ]),
+  3,
+);
+// Test 9 - reorder increments (signature preserves order)
+assert.equal(
+  resolveStickerPackVersion(
+    versionedPrevious([stickerA, stickerB, stickerC], 2),
+    [stickerB, stickerA, stickerC],
+  ),
+  3,
+);
+assert.notEqual(
+  getStickerContentSignature([
+    {id: 'a', title: '1'} as never,
+    {id: 'b', title: '2'} as never,
+  ]),
+  getStickerContentSignature([
+    {id: 'b', title: '2'} as never,
+    {id: 'a', title: '1'} as never,
+  ]),
+  'Signature must distinguish order',
+);
+// Test 10 - after a change, same content again keeps the new version
+const changed = [stickerA, stickerB, stickerD];
+const afterChange = resolveStickerPackVersion(
+  versionedPrevious([stickerA, stickerB, stickerC], 1),
+  changed,
+);
+assert.equal(afterChange, 2);
+assert.equal(
+  resolveStickerPackVersion(versionedPrevious(changed, afterChange), changed),
+  2,
+);
+// Test 11 - legacy manifest without dynamic migrates to version 1
+assert.equal(
+  resolveStickerPackVersion({id: 'x', stickers: [stickerA]}, [stickerA]),
+  1,
+);
+assert.equal(
+  resolveStickerPackVersion({id: 'x', dynamic: {}, stickers: [stickerA]}, [
+    stickerA,
+  ]),
+  1,
+  'Manifest with empty dynamic block (no version) migrates to version 1',
+);
+// Structural validation: null, primitive, array, corrupt root must throw
+for (const invalidRoot of [
+  null,
+  'invalid-string',
+  123,
+  true,
+  [],
+  ['not-an-object'],
+]) {
+  assert.throws(
+    () => resolveStickerPackVersion(invalidRoot, [stickerA]),
+    /invalid root structure|refusing/,
+    `Invalid root ${String(invalidRoot)} must be rejected`,
+  );
+}
+
+// Dynamic field validation: non-object or null or array must throw
+for (const invalidDynamic of [null, 'invalid', 123, true, []]) {
+  assert.throws(
+    () =>
+      resolveStickerPackVersion(
+        {dynamic: invalidDynamic, stickers: [stickerA]},
+        [stickerA],
+      ),
+    /invalid dynamic field|refusing/,
+    `Invalid dynamic field ${String(invalidDynamic)} must be rejected`,
+  );
+}
+
+// Unreadable stickers list or unreadable sticker entries must throw
+assert.throws(
+  () =>
+    resolveStickerPackVersion(
+      {dynamic: {version: 4, refreshUrl: 'u'}, stickers: []},
+      [stickerA],
+    ),
+  /lacks a readable stickers\[\] list|refusing/,
+);
+assert.throws(
+  () =>
+    resolveStickerPackVersion(
+      {dynamic: {version: 4, refreshUrl: 'u'}, stickers: [{}]},
+      [stickerA],
+    ),
+  /unreadable sticker entries|refusing/,
+);
+assert.throws(
+  () =>
+    resolveStickerPackVersion(
+      {
+        dynamic: {version: 4, refreshUrl: 'u'},
+        stickers: [{id: 123, title: 't'}],
+      },
+      [stickerA],
+    ),
+  /unreadable sticker entries|refusing/,
+);
+assert.throws(
+  () =>
+    resolveStickerPackVersion(
+      {
+        dynamic: {version: 4, refreshUrl: 'u'},
+        stickers: [{id: 'id', title: 123}],
+      },
+      [stickerA],
+    ),
+  /unreadable sticker entries|refusing/,
+);
+
+// Test 13 - invalid declared versions are rejected, never silently reset
+for (const bad of ['4', 0, -1, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+  assert.throws(
+    () =>
+      resolveStickerPackVersion(
+        {
+          dynamic: {
+            version: bad,
+            refreshUrl: 'u',
+          },
+          stickers: [stickerA],
+        },
+        [stickerA],
+      ),
+    /invalid dynamic\.version|refusing/,
+    `Invalid version ${String(bad)} must be rejected`,
+  );
+}
+// Version overflow guard
+assert.throws(
+  () =>
+    resolveStickerPackVersion(
+      versionedPrevious([stickerA], Number.MAX_SAFE_INTEGER),
+      [stickerB],
+    ),
+  /overflow/,
+);
+// refreshUrl helper uses encodeURIComponent and manifest endpoint
+assert.equal(
+  generateStickerPackExternalUrl('plain_pack'),
+  'https://stickers.example.com/stickerpack/telegram/plain_pack',
+);
+
+// Test 14 - atomic write + serialized per-pack publishing
+console.log('Testing atomic manifest write and per-pack serialization...');
+const atomicPackName = 'AtomicWriteTestPack';
+const atomicManifestPath = generateStickerPackFilePath(atomicPackName);
+await writeStickerPackManifestAtomically(atomicManifestPath, {
+  id: `MoreStickers:Telegram:Pack:${atomicPackName}`,
+  title: 'atomic',
+  logo: stickerA as never,
+  stickers: [stickerA as never],
+  dynamic: {
+    version: 3,
+    refreshUrl: generateStickerPackExternalUrl(atomicPackName),
+  },
+} as never);
+const storedAtomic = JSON.parse(await fsp.readFile(atomicManifestPath, 'utf8'));
+assert.equal(storedAtomic.dynamic.version, 3);
+assert.equal(
+  storedAtomic.dynamic.refreshUrl.includes('/stickerpack/telegram/'),
+  true,
+);
+const leftoverTempFiles = (
+  await fsp.readdir(path.dirname(atomicManifestPath))
+).filter(f => f.endsWith('.tmp'));
+assert.equal(leftoverTempFiles.length, 0, 'No .tmp leftovers may remain');
+
+// Test FIFO concurrency on enqueueManifestPublish
+const events: string[] = [];
+const first = enqueueManifestPublish('QueueTestPack', async () => {
+  events.push('first:start');
+  await new Promise<void>(resolve => setTimeout(resolve, 25));
+  events.push('first:end');
+});
+const second = enqueueManifestPublish('QueueTestPack', async () => {
+  events.push('second:start');
+  events.push('second:end');
+});
+await Promise.all([first, second]);
+assert.deepEqual(
+  events,
+  ['first:start', 'first:end', 'second:start', 'second:end'],
+  'Queue must execute concurrent requests strictly in FIFO order',
+);
+
+// Test Queue failure handling: first job rejects, next job runs without poisoning
+let nextExecuted = false;
+const failed = enqueueManifestPublish('QueueFailurePack', async () => {
+  throw new Error('expected queue test failure');
+});
+const next = enqueueManifestPublish('QueueFailurePack', async () => {
+  nextExecuted = true;
+});
+await assert.rejects(
+  failed,
+  /expected queue test failure/,
+  'Caller must receive the job rejection',
+);
+await next;
+assert.equal(
+  nextExecuted,
+  true,
+  'Next job after failure must execute successfully',
+);
+
+// Missing manifest returns undefined (ENOENT only)
+assert.equal(
+  await readManifestOrUndefined('NonExistentPackXYZ123'),
+  undefined,
+  'readManifestOrUndefined must return undefined for non-existent pack (ENOENT)',
+);
+
+// Malformed JSON manifest rejects and does not overwrite existing file
+const malformedPackName = 'MalformedJsonManifestPack';
+const malformedManifestPath = generateStickerPackFilePath(malformedPackName);
+await fsp.mkdir(path.dirname(malformedManifestPath), {recursive: true});
+await fsp.writeFile(
+  malformedManifestPath,
+  '{ definitely not valid JSON',
+  'utf8',
+);
+await assert.rejects(
+  async () => readManifestOrUndefined(malformedPackName),
+  /malformed JSON/,
+  'readManifestOrUndefined must reject on malformed JSON',
+);
+const malformedFileAfter = await fsp.readFile(malformedManifestPath, 'utf8');
+assert.equal(
+  malformedFileAfter,
+  '{ definitely not valid JSON',
+  'Malformed file must remain untouched',
+);
+
+// Non-ENOENT read error (manifest path is a directory) rejects
+const dirPackName = 'DirManifestPack';
+const dirManifestPath = generateStickerPackFilePath(dirPackName);
+await fsp.mkdir(dirManifestPath, {recursive: true});
+await assert.rejects(
+  async () => readManifestOrUndefined(dirPackName),
+  'Non-ENOENT filesystem error (EISDIR/EPERM) must reject and never return undefined',
+);
+await fsp.rmdir(dirManifestPath);
+
+console.log(
+  'Verified: dynamic version lifecycle, atomic writes, and queue serialization pass',
+);
+
 // Test 2: HTTP error retry and response body cancellation
 console.log('Testing fetchStickerWithRetry...');
 
@@ -1512,6 +1903,10 @@ await fsp.writeFile(
         readyToUpload: true,
       },
     ],
+    dynamic: {
+      version: 1,
+      refreshUrl: generateStickerPackExternalUrl(packName),
+    },
   }),
 );
 
@@ -1643,6 +2038,16 @@ assert.equal(
   parsedManifest.id,
   `MoreStickers:Telegram:Pack:${packName}`,
   'Manifest body must parse as valid JSON matching pack id',
+);
+assert.equal(
+  parsedManifest.dynamic?.version,
+  1,
+  'Manifest served via HTTP must contain dynamic.version',
+);
+assert.equal(
+  parsedManifest.dynamic?.refreshUrl,
+  generateStickerPackExternalUrl(packName),
+  'Manifest served via HTTP must contain dynamic.refreshUrl',
 );
 assert.equal(
   manifestResponse.headers['cache-control'],

@@ -9,6 +9,11 @@ export interface Sticker {
   readyToUpload?: boolean;
 }
 
+export interface StickerPackDynamic {
+  version: number;
+  refreshUrl: string;
+}
+
 export interface StickerPackMeta {
   id: string;
   title: string;
@@ -17,6 +22,8 @@ export interface StickerPackMeta {
     url?: string;
   };
   logo: Sticker;
+
+  dynamic?: StickerPackDynamic;
 }
 
 export interface StickerPack extends StickerPackMeta {
