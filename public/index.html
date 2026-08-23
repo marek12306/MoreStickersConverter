@@ -428,15 +428,62 @@ function showCopied(button) {
   }, 1600);
 }
 
+function enableHoverAnimation(element) {
+  const animatedSrc = element.dataset.animatedSrc;
+  const image = element.querySelector('img');
+  if (!animatedSrc || !image) return;
+  const staticSrc = image.src;
+  element.onmouseenter = () => {
+    image.src = animatedSrc;
+  };
+  element.onmouseleave = () => {
+    image.src = staticSrc;
+  };
+}
+
+function loadAnimatedPreview(element) {
+  const animatedSrc = element.dataset.animatedSrc;
+  const image = element.querySelector('img');
+  if (!animatedSrc || !image) return;
+  const animatedImage = new Image();
+  animatedImage.onload = () => {
+    if (image.isConnected) image.src = animatedImage.src;
+  };
+  animatedImage.src = animatedSrc;
+}
+
+const animatedPreviewObserver = new IntersectionObserver(
+  entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting || !entry.target.isConnected) continue;
+      animatedPreviewObserver.unobserve(entry.target);
+      loadAnimatedPreview(entry.target);
+    }
+  },
+  {
+    rootMargin: '200px',
+  },
+);
+
+function packMarkup(pack) {
+  const animatedSource =
+    pack.animatedPreview && pack.animatedPreview !== pack.preview
+      ? ` data-animated-src="${esc(pack.animatedPreview)}"`
+      : '';
+  return `<article class="card" tabindex="0" data-id="${esc(pack.id)}"${animatedSource}><div class="preview"><img src="${esc(pack.preview)}" alt="" loading="lazy" decoding="async"></div><div class="body"><div class="row"><div class="title"><b>${esc(pack.title)}</b></div><button class="copy-link" type="button" data-copy-url="${esc(pack.url || '')}" title="Copy pack URL" aria-label="Copy pack URL"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button></div><div class="tags">${(pack.tags || []).slice(0, 3).map(tag => `<span class="tag">#${esc(tag)}</span>`).join('')}</div></div></article>`;
+}
+
 function render() {
   $('#resultCount').textContent = `${filtered.length} ${filtered.length === 1 ? 'pack' : 'packs'}`;
+  animatedPreviewObserver.disconnect();
   if (!filtered.length) {
     $('#grid').innerHTML = '<div class="empty"><b>No matching packs</b>Try changing your search or filter.</div>';
     return;
   }
-  $('#grid').innerHTML = filtered.map(p => `<article class="card" tabindex="0" data-id="${esc(p.id)}"><div class="preview"><img src="${esc(p.preview)}" alt="" loading="lazy" decoding="async"></div><div class="body"><div class="row"><div class="title"><b>${esc(p.title)}</b></div><button class="copy-link" type="button" data-copy-url="${esc(p.url || '')}" title="Copy pack URL" aria-label="Copy pack URL"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button></div><div class="tags">${(p.tags || []).slice(0, 3).map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div></div></article>`).join('');
+  $('#grid').innerHTML = filtered.map(packMarkup).join('');
   document.querySelectorAll('.card').forEach(c => {
     const o = () => openPack(c.dataset.id);
+    if (c.dataset.animatedSrc) animatedPreviewObserver.observe(c);
     c.onclick = o;
     c.onkeydown = e => {
       if (e.key === 'Enter' || e.key === ' ') {
@@ -491,22 +538,21 @@ function stickerMarkup(sticker) {
 
 function drawPack(p, m) {
   const list = m.stickers || [];
-  const prev = p.preview || m.logo?.previewImage || m.logo?.image || '';
+  const prev =
+    p.animatedPreview ||
+    (m.logo?.isAnimated === true && m.logo.image) ||
+    p.preview ||
+    m.logo?.previewImage ||
+    m.logo?.image ||
+    '';
   $('#dcontent').innerHTML = `<section class="packhero"><div class="heroimg"><img src="${esc(prev)}" alt=""></div><div class="herocopy"><h2>${esc(p.title || m.title || p.name)}</h2><p>${Number(p.stickerCount || list.length || 0)} stickers</p></div><button class="hero-copy" id="copy" type="button" aria-live="polite">Copy pack URL</button></section><div class="stickers">${list.length ? list.map(stickerMarkup).join('') : '<div class="loading">No stickers available.</div>'}</div>`;
   const copyButton = $('#copy');
   copyButton.onclick = async () => {
     if (await copyPackUrl(p.url || '')) showCopied(copyButton);
   };
-  document.querySelectorAll('.st[data-animated-src]').forEach(sticker => {
-    const image = sticker.querySelector('img');
-    const staticSrc = image.src;
-    sticker.onmouseenter = () => {
-      image.src = sticker.dataset.animatedSrc;
-    };
-    sticker.onmouseleave = () => {
-      image.src = staticSrc;
-    };
-  });
+  document
+    .querySelectorAll('.st[data-animated-src]')
+    .forEach(enableHoverAnimation);
 }
 
 function close() {

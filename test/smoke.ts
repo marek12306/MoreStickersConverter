@@ -4436,6 +4436,7 @@ await fsp.writeFile(
       id: 'logo',
       image: `https://stickers.example.com/sticker/telegram/${publicPack1Name}/logo.gif`,
       previewImage: `https://stickers.example.com/preview/telegram/${publicPack1Name}/logo.webp`,
+      isAnimated: true,
     },
   }),
 );
@@ -4559,6 +4560,11 @@ assert.equal(
   `https://stickers.example.com/preview/telegram/${publicPack1Name}/logo.webp`,
   'Public pack with previewImage must use previewImage',
 );
+assert.equal(
+  pubSummary1.animatedPreview,
+  `https://stickers.example.com/sticker/telegram/${publicPack1Name}/logo.gif`,
+  'Animated public pack must expose its animated logo',
+);
 
 const pubSummary2 = catalogPacks.find(p => p.name === publicPack2Name)!;
 assert.equal(pubSummary2.stickerCount, 2);
@@ -4566,6 +4572,11 @@ assert.equal(
   pubSummary2.preview,
   `https://stickers.example.com/sticker/telegram/${publicPack2Name}/logo.gif`,
   'Public pack without previewImage must fallback to logo.image',
+);
+assert.equal(
+  pubSummary2.animatedPreview,
+  undefined,
+  'Static public pack must not expose an animated logo',
 );
 
 const apiResponse = await app.inject({

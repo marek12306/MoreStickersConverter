@@ -12,6 +12,7 @@ export interface PublicStickerPackSummary {
   stickerCount: number;
   url: string;
   preview: string;
+  animatedPreview?: string;
 }
 
 const STICKER_PACK_FILE_SUFFIX = '.telegram.stickerpack';
@@ -102,6 +103,10 @@ export async function getPublicStickerPacks(): Promise<
         typeof logo.previewImage === 'string' && logo.previewImage
           ? logo.previewImage
           : logo.image;
+      const animatedPreview =
+        logo.isAnimated === true && logo.image !== preview
+          ? logo.image
+          : undefined;
 
       const externalUrl = process.env.EXTERNAL_URL!;
       const url = `${externalUrl}/stickerpack/telegram/${encodeURIComponent(packName)}`;
@@ -113,6 +118,7 @@ export async function getPublicStickerPacks(): Promise<
         stickerCount: stickers.length,
         url,
         preview,
+        ...(animatedPreview ? {animatedPreview} : {}),
       });
     } catch (err: unknown) {
       const code = getErrorCode(err);
