@@ -25,9 +25,44 @@ import {
   readManifestOrUndefined,
   validateLocalStickerPackManifest,
 } from './telegramStickers.js';
+import {
+  resolveStickerAssetPath,
+  verifyStoredStickerAsset,
+} from './stickerAssetStorage.js';
 
 export interface ReplyContext {
   reply: (text: string) => Promise<unknown>;
+}
+
+async function isLocalStickerAssetAvailable(
+  stickerSetName: string,
+  version: number | undefined,
+  filename: string,
+  kind: 'stickers' | 'previews',
+  legacyPath: string,
+): Promise<boolean> {
+  if (version === undefined) {
+    try {
+      await fsp.access(legacyPath, fs.constants.R_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    const assetPath = await resolveStickerAssetPath(
+      stickerSetName,
+      version,
+      filename,
+      kind,
+    );
+    return (
+      assetPath !== undefined &&
+      (await verifyStoredStickerAsset(stickerSetName, path.basename(assetPath)))
+    );
+  } catch {
+    return false;
+  }
 }
 
 export async function importOrGetStickerPack(
@@ -270,10 +305,15 @@ export async function handleCheckCommand(
       return false;
     }
 
-    const assetPath = path.join(packDir, sticker.filename);
-    try {
-      await fsp.access(assetPath, fs.constants.R_OK);
-    } catch {
+    const version = localManifest.dynamic?.version;
+    const stickerAvailable = await isLocalStickerAssetAvailable(
+      packName,
+      version,
+      sticker.filename,
+      'stickers',
+      path.join(packDir, sticker.filename),
+    );
+    if (!stickerAvailable) {
       await ctx.reply(
         `Pack "${packName}" has an incomplete local cache.\n\nMissing sticker or preview files were detected.\n\nUse /refresh ${packName} to repair it.`,
       );
@@ -288,13 +328,15 @@ export async function handleCheckCommand(
       return false;
     }
 
-    const previewPath = generateStickerPreviewFilePath(
+    const previewFilename = `${stickerUniqueId}.webp`;
+    const previewAvailable = await isLocalStickerAssetAvailable(
       packName,
-      stickerUniqueId,
+      version,
+      previewFilename,
+      'previews',
+      generateStickerPreviewFilePath(packName, stickerUniqueId),
     );
-    try {
-      await fsp.access(previewPath, fs.constants.R_OK);
-    } catch {
+    if (!previewAvailable) {
       await ctx.reply(
         `Pack "${packName}" has an incomplete local cache.\n\nMissing sticker or preview files were detected.\n\nUse /refresh ${packName} to repair it.`,
       );

@@ -14,7 +14,22 @@ import {Sticker, StickerSet} from 'telegraf/types';
 import {convertWebmToGif} from './webmToGif.js';
 import {convertTgsToGif} from './tgsToGif.js';
 import {generatePreview} from './stickerPreview.js';
-const DATA_DIR = path.join(path.resolve(process.env.DATA_DIR!), 'telegram');
+import {
+  DATA_DIR,
+  garbageCollectStickerAssets,
+  generateStickerPackDirPath,
+  generateStickerPackFilePath,
+  generateStickerVersionIndexPath,
+  listStickerPackVersions,
+  pruneOldStickerVersions,
+  readStickerVersionIndex,
+  scheduleStickerAssetGarbageCollection,
+  type StickerVersionIndex,
+  storeStickerAsset,
+  withStickerStorageMutation,
+  verifyStoredStickerAsset,
+  writeStickerVersionIndexAtomically,
+} from './stickerAssetStorage.js';
 
 export function parseDownloadConcurrency(rawValue: string | undefined): number {
   if (rawValue === undefined || rawValue === '') {
@@ -40,18 +55,26 @@ function toMcStickerId(stickerId: string, stickerPackName: string) {
   return `${MC_STICKER_ID_PREFIX}:${stickerPackName}:${stickerId}`;
 }
 
+function assertSafeStorageSegment(value: string, label: string): void {
+  if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+    throw new Error(`Unsafe ${label} for sticker storage`);
+  }
+}
+
 function generateExternalUrl(
   stickerPackName: string,
+  version: number,
   stickerId: string,
   fileExtension: string,
 ) {
-  return `${EXTERNAL_URL}/sticker/telegram/${stickerPackName}/${stickerId}.${fileExtension}`;
+  return `${EXTERNAL_URL}/sticker/telegram/${stickerPackName}/${version}/${stickerId}.${fileExtension}`;
 }
 function generatePreviewExternalUrl(
   stickerPackName: string,
+  version: number,
   stickerId: string,
 ) {
-  return `${EXTERNAL_URL}/preview/telegram/${stickerPackName}/${stickerId}.webp`;
+  return `${EXTERNAL_URL}/preview/telegram/${stickerPackName}/${version}/${stickerId}.webp`;
 }
 
 export function generateStickerPackExternalUrl(
@@ -266,14 +289,6 @@ export function generateStickerPreviewFilePath(
   );
 }
 
-export function generateStickerPackDirPath(stickerSetName: string) {
-  return path.join(DATA_DIR, stickerSetName);
-}
-
-export function generateStickerPackFilePath(stickerSetName: string) {
-  return path.join(DATA_DIR, `${stickerSetName}.telegram.stickerpack`);
-}
-
 export interface StickerMediaInfo {
   isVideoSticker: boolean;
   isTgsSticker: boolean;
@@ -358,7 +373,6 @@ function isLegacySticker(sticker: McSticker): boolean {
 
   const hasLegacyAnimatedManifest =
     sticker.isAnimated === true && sticker.readyToUpload !== true;
-
   return Boolean(
     hasRawAnimatedSource ||
       hasNonGifAnimatedOutput ||
@@ -388,23 +402,7 @@ export async function isLegacyStickerPack(
 export async function invalidateLegacyStickerPackCache(
   stickerSetName: string,
 ): Promise<boolean> {
-  const isLegacy = await isLegacyStickerPack(stickerSetName);
-  if (isLegacy) {
-    const dirPath = generateStickerPackDirPath(stickerSetName);
-    const filePath = generateStickerPackFilePath(stickerSetName);
-    try {
-      await fsp.rm(dirPath, {recursive: true, force: true});
-    } catch {
-      // ignore cleanup error
-    }
-    try {
-      await fsp.rm(filePath, {force: true});
-    } catch {
-      // ignore cleanup error
-    }
-    return true;
-  }
-  return false;
+  return await isLegacyStickerPack(stickerSetName);
 }
 
 async function isStickerPackDownloaded(stickerSetName: string) {
@@ -418,7 +416,22 @@ async function isStickerPackDownloaded(stickerSetName: string) {
     if (wasLegacy) {
       return false;
     }
-
+    const manifest = validateLocalStickerPackManifest(
+      await readManifestOrUndefined(stickerSetName),
+    );
+    if (!manifest) {
+      return false;
+    }
+    if (manifest.dynamic?.version !== undefined) {
+      const index = await readStickerVersionIndex(
+        stickerSetName,
+        manifest.dynamic.version,
+      );
+      if (!index) {
+        return false;
+      }
+      await assertStoredVersionComplete(stickerSetName, manifest, index);
+    }
     return true;
   } catch {
     return false;
@@ -430,6 +443,8 @@ async function downloadSingleSticker(
   telegram: Telegram,
   stickerSet: StickerSet,
 ): Promise<void> {
+  assertSafeStorageSegment(stickerSet.name, 'sticker pack name');
+  assertSafeStorageSegment(sticker.file_unique_id, 'sticker unique id');
   const stickerFile = await telegram.getFile(sticker.file_id);
   const sourceFileType = stickerFile.file_path?.split('.').pop() || '';
   const mediaInfo = getStickerMediaInfo(sticker, sourceFileType);
@@ -526,6 +541,7 @@ async function downloadWorker(
 }
 
 async function downloadStickerPack(telegram: Telegram, stickerSet: StickerSet) {
+  assertSafeStorageSegment(stickerSet.name, 'sticker pack name');
   const stickerSetDir = generateStickerPackDirPath(stickerSet.name);
   await fsp.mkdir(stickerSetDir, {recursive: true});
   const previewDir = generateStickerPreviewDirPath(stickerSet.name);
@@ -595,26 +611,21 @@ export function enqueueStickerPackOperation<T>(
 async function toMcStickerPack(
   telegram: Telegram,
   stickerSet: StickerSet,
+  forcedVersion?: number,
 ): Promise<StickerPack> {
+  assertSafeStorageSegment(stickerSet.name, 'sticker pack name');
   const stickerPs = stickerSet.stickers.map(async sticker => {
+    assertSafeStorageSegment(sticker.file_unique_id, 'sticker unique id');
     const stickerFile = await telegram.getFile(sticker.file_id);
     const sourceFileType = stickerFile.file_path?.split('.').pop() || '';
     const {outputFileType, isAnimated} = getStickerMediaInfo(
       sticker,
       sourceFileType,
     );
-
     return {
       id: toMcStickerId(sticker.file_unique_id, stickerSet.name),
-      image: generateExternalUrl(
-        stickerSet.name,
-        sticker.file_unique_id,
-        outputFileType,
-      ),
-      previewImage: generatePreviewExternalUrl(
-        stickerSet.name,
-        sticker.file_unique_id,
-      ),
+      image: '',
+      previewImage: '',
       title: sticker.emoji ?? '',
       stickerPackId: toMcStickerPackId(stickerSet.name),
       filename: `${sticker.file_unique_id}.${outputFileType}`,
@@ -623,25 +634,157 @@ async function toMcStickerPack(
     } as McSticker;
   });
   const stickers = await Promise.all(stickerPs);
-  const previous = await readManifestOrUndefined(stickerSet.name);
-  return {
+  const previous =
+    forcedVersion === undefined
+      ? await readManifestOrUndefined(stickerSet.name)
+      : undefined;
+  const version =
+    forcedVersion ?? resolveStickerPackVersion(previous, stickers);
+  const pack = {
     id: toMcStickerPackId(stickerSet.name),
     title: stickerSet.title,
     logo: stickers[0],
     stickers,
-    dynamic: buildStickerPackDynamic(stickerSet.name, previous, stickers),
+    dynamic: buildStickerPackDynamic(stickerSet.name, version),
   } as StickerPack;
+  setStickerPackVersionUrls(stickerSet.name, pack, version);
+  return pack;
 }
-
 function buildStickerPackDynamic(
   stickerSetName: string,
-  previousPack: unknown,
-  stickers: McSticker[],
+  version: number,
 ): StickerPackDynamic {
   return {
-    version: resolveStickerPackVersion(previousPack, stickers),
+    version,
     refreshUrl: generateStickerPackExternalUrl(stickerSetName),
   };
+}
+function setStickerPackVersionUrls(
+  stickerSetName: string,
+  pack: StickerPack,
+  version: number,
+): void {
+  for (const sticker of pack.stickers) {
+    const filename = sticker.filename;
+    const stickerId = sticker.id.split(':').pop();
+    if (!filename || !stickerId) {
+      throw new Error('Cannot version sticker with missing filename or id');
+    }
+    const extension = path.extname(filename).slice(1);
+    sticker.image = generateExternalUrl(
+      stickerSetName,
+      version,
+      path.basename(filename, path.extname(filename)),
+      extension,
+    );
+    sticker.previewImage = generatePreviewExternalUrl(
+      stickerSetName,
+      version,
+      stickerId,
+    );
+  }
+  pack.logo = pack.stickers[0];
+  pack.dynamic = buildStickerPackDynamic(stickerSetName, version);
+}
+async function storePackVersionAssets(
+  stickerSetName: string,
+  pack: StickerPack,
+): Promise<Omit<StickerVersionIndex, 'version'>> {
+  const stickers: Record<string, string> = {};
+  const previews: Record<string, string> = {};
+  const signatureEntries: unknown[] = [];
+  for (const sticker of pack.stickers) {
+    const filename = sticker.filename;
+    const stickerId = sticker.id.split(':').pop();
+    if (!filename || !stickerId) {
+      throw new Error('Cannot store sticker with missing filename or id');
+    }
+    const stickerAsset = await storeStickerAsset(
+      stickerSetName,
+      path.join(generateStickerPackDirPath(stickerSetName), filename),
+    );
+    const previewFilename = `${stickerId}.webp`;
+    const previewAsset = await storeStickerAsset(
+      stickerSetName,
+      generateStickerPreviewFilePath(stickerSetName, stickerId),
+    );
+    stickers[filename] = stickerAsset;
+    previews[previewFilename] = previewAsset;
+    signatureEntries.push([
+      sticker.id,
+      sticker.title,
+      filename,
+      sticker.isAnimated === true,
+      sticker.readyToUpload === true,
+      stickerAsset,
+      previewAsset,
+    ]);
+  }
+  return {
+    signature: JSON.stringify(signatureEntries),
+    stickers,
+    previews,
+  };
+}
+function hasSameAssetMap(
+  left: Record<string, string>,
+  right: Record<string, string>,
+): boolean {
+  const leftEntries = Object.entries(left);
+  return (
+    leftEntries.length === Object.keys(right).length &&
+    leftEntries.every(([filename, asset]) => right[filename] === asset)
+  );
+}
+
+function hasSameStoredVersion(
+  index: StickerVersionIndex,
+  stored: Omit<StickerVersionIndex, 'version'>,
+): boolean {
+  return (
+    index.signature === stored.signature &&
+    hasSameAssetMap(index.stickers, stored.stickers) &&
+    hasSameAssetMap(index.previews, stored.previews)
+  );
+}
+async function removePublishedWorkingFiles(
+  stickerSetName: string,
+  pack: StickerPack,
+): Promise<void> {
+  await Promise.all(
+    pack.stickers.flatMap(sticker => {
+      const stickerId = sticker.id.split(':').pop();
+      return [
+        sticker.filename
+          ? fsp
+              .unlink(
+                path.join(
+                  generateStickerPackDirPath(stickerSetName),
+                  sticker.filename,
+                ),
+              )
+              .catch(() => undefined)
+          : Promise.resolve(),
+        stickerId
+          ? fsp
+              .unlink(generateStickerPreviewFilePath(stickerSetName, stickerId))
+              .catch(() => undefined)
+          : Promise.resolve(),
+        ...(stickerId
+          ? ['webm', 'tgs'].map(extension =>
+              fsp
+                .unlink(
+                  path.join(
+                    generateStickerPackDirPath(stickerSetName),
+                    `${stickerId}.${extension}`,
+                  ),
+                )
+                .catch(() => undefined),
+            )
+          : []),
+      ];
+    }),
+  );
 }
 
 function getErrorCode(err: unknown): string | undefined {
@@ -679,18 +822,104 @@ export async function readManifestOrUndefined(
   }
 }
 
+function getStoredManifestVersion(manifest: unknown): number {
+  if (manifest === undefined) {
+    return 0;
+  }
+  const pack = validateLocalStickerPackManifest(manifest);
+  if (!pack) {
+    throw new Error('Existing sticker pack manifest is invalid');
+  }
+  return pack.dynamic?.version ?? 0;
+}
+
+async function removeUnpublishedStickerVersionIndexes(
+  stickerSetName: string,
+  currentVersion: number,
+  versions: number[],
+  preservedPendingVersion?: number,
+): Promise<void> {
+  await Promise.all(
+    versions
+      .filter(
+        version =>
+          version > currentVersion && version !== preservedPendingVersion,
+      )
+      .map(version =>
+        fsp.rm(generateStickerVersionIndexPath(stickerSetName, version), {
+          force: true,
+        }),
+      ),
+  );
+}
+
 async function publishStickerPackManifest(
   telegram: Telegram,
   stickerSet: StickerSet,
 ): Promise<void> {
   await enqueueManifestPublish(stickerSet.name, async () => {
-    // Rebuild inside the per-pack job: version resolution reads the latest
-    // on-disk manifest serialized against any other generation of this pack.
-    const pack = await toMcStickerPack(telegram, stickerSet);
-    await writeStickerPackManifestAtomically(
-      generateStickerPackFilePath(stickerSet.name),
-      pack,
-    );
+    const pack = await toMcStickerPack(telegram, stickerSet, 1);
+    await withStickerStorageMutation(stickerSet.name, async () => {
+      const previous = await readManifestOrUndefined(stickerSet.name);
+      const currentVersion = getStoredManifestVersion(previous);
+      const stored = await storePackVersionAssets(stickerSet.name, pack);
+      const currentIndex =
+        currentVersion > 0
+          ? await readStickerVersionIndex(stickerSet.name, currentVersion)
+          : undefined;
+      const versions = await listStickerPackVersions(stickerSet.name);
+      const unchanged =
+        currentIndex !== undefined &&
+        hasSameStoredVersion(currentIndex, stored);
+      let version: number;
+      if (unchanged) {
+        version = currentVersion;
+        await removeUnpublishedStickerVersionIndexes(
+          stickerSet.name,
+          currentVersion,
+          versions,
+        );
+      } else {
+        const nextVersion = currentVersion + 1;
+        if (!Number.isSafeInteger(nextVersion)) {
+          throw new Error('Sticker pack version overflow');
+        }
+        let pendingIndex: StickerVersionIndex | undefined;
+        if (versions.includes(nextVersion)) {
+          try {
+            pendingIndex = await readStickerVersionIndex(
+              stickerSet.name,
+              nextVersion,
+            );
+          } catch {
+            pendingIndex = undefined;
+          }
+        }
+        const resumesInterruptedPublish =
+          pendingIndex !== undefined &&
+          hasSameStoredVersion(pendingIndex, stored);
+        await removeUnpublishedStickerVersionIndexes(
+          stickerSet.name,
+          currentVersion,
+          versions,
+          resumesInterruptedPublish ? nextVersion : undefined,
+        );
+        version = nextVersion;
+        if (!resumesInterruptedPublish) {
+          await writeStickerVersionIndexAtomically(stickerSet.name, {
+            version,
+            ...stored,
+          });
+        }
+      }
+      setStickerPackVersionUrls(stickerSet.name, pack, version);
+      await writeStickerPackManifestAtomically(
+        generateStickerPackFilePath(stickerSet.name),
+        pack,
+      );
+      await pruneOldStickerVersions(stickerSet.name);
+      await removePublishedWorkingFiles(stickerSet.name, pack);
+    });
   });
 }
 
@@ -708,9 +937,250 @@ export async function writeStickerPackManifestAtomically(
   }
 }
 
+export function getCanonicalStickerFilename(sticker: McSticker): string {
+  const stickerId = sticker.id.split(':').pop();
+  const filename = sticker.filename;
+  const extension = path.extname(filename ?? '').toLowerCase();
+  if (
+    !stickerId ||
+    !/^[a-zA-Z0-9_-]+$/.test(stickerId) ||
+    !filename ||
+    path.basename(filename) !== filename ||
+    filename.includes('..') ||
+    !/^[a-zA-Z0-9_-]+\.(?:gif|webp)$/i.test(filename) ||
+    (extension !== '.gif' && extension !== '.webp')
+  ) {
+    throw new Error('Legacy sticker has no safe final filename');
+  }
+  return `${stickerId}${extension}`;
+}
+
+async function removeIndexedWorkingFiles(
+  stickerSetName: string,
+  index: StickerVersionIndex,
+  legacyStickerFilenames: Iterable<string> = [],
+): Promise<void> {
+  await Promise.all([
+    ...[
+      ...new Set([...Object.keys(index.stickers), ...legacyStickerFilenames]),
+    ].map(filename =>
+      fsp
+        .unlink(path.join(generateStickerPackDirPath(stickerSetName), filename))
+        .catch(() => undefined),
+    ),
+    ...Object.keys(index.previews).map(filename =>
+      fsp
+        .unlink(
+          path.join(generateStickerPreviewDirPath(stickerSetName), filename),
+        )
+        .catch(() => undefined),
+    ),
+  ]);
+}
+
+async function assertStoredVersionComplete(
+  stickerSetName: string,
+  pack: StickerPack,
+  index: StickerVersionIndex,
+): Promise<void> {
+  for (const sticker of pack.stickers) {
+    const stickerId = sticker.id.split(':').pop();
+    const stickerAsset = sticker.filename
+      ? index.stickers[sticker.filename]
+      : undefined;
+    const previewAsset = stickerId
+      ? index.previews[`${stickerId}.webp`]
+      : undefined;
+    if (!stickerAsset || !previewAsset) {
+      throw new Error(
+        'Version index does not contain every sticker and preview',
+      );
+    }
+    const [stickerExists, previewExists] = await Promise.all([
+      verifyStoredStickerAsset(stickerSetName, stickerAsset),
+      verifyStoredStickerAsset(stickerSetName, previewAsset),
+    ]);
+    if (!stickerExists || !previewExists) {
+      throw new Error('Version index references a missing or corrupt asset');
+    }
+  }
+}
+
+function setVersionAssetMapping(
+  mapping: Record<string, string>,
+  filename: string,
+  assetFilename: string,
+): void {
+  const existing = mapping[filename];
+  if (existing && existing !== assetFilename) {
+    throw new Error(`Conflicting legacy asset mapping for "${filename}"`);
+  }
+  mapping[filename] = assetFilename;
+}
+
+async function migrateLegacyStickerPackUnlocked(
+  stickerSetName: string,
+  pack: StickerPack,
+): Promise<boolean> {
+  const version = pack.dynamic?.version ?? 1;
+  const existingIndex = await readStickerVersionIndex(stickerSetName, version);
+  const originalFilenames = new Map<string, string>();
+  for (const sticker of pack.stickers) {
+    if (!sticker.filename) {
+      throw new Error('Legacy sticker manifest is missing filename');
+    }
+    originalFilenames.set(sticker.id, sticker.filename);
+    sticker.filename = getCanonicalStickerFilename(sticker);
+  }
+
+  const expectedVersionPath = `/${stickerSetName}/${version}/`;
+  const alreadyMigrated =
+    existingIndex !== undefined &&
+    pack.stickers.every(sticker => sticker.image.includes(expectedVersionPath));
+  if (existingIndex) {
+    await assertStoredVersionComplete(stickerSetName, pack, existingIndex);
+  }
+  if (alreadyMigrated) {
+    await removeIndexedWorkingFiles(
+      stickerSetName,
+      existingIndex,
+      originalFilenames.values(),
+    );
+    return false;
+  }
+
+  let index = existingIndex;
+  if (!index) {
+    const stickers: Record<string, string> = {};
+    const previews: Record<string, string> = {};
+    const signatureEntries: unknown[] = [];
+    for (const sticker of pack.stickers) {
+      const originalFilename = originalFilenames.get(sticker.id);
+      const stickerId = sticker.id.split(':').pop();
+      if (!originalFilename || !sticker.filename || !stickerId) {
+        throw new Error('Legacy sticker manifest contains invalid identity');
+      }
+      const stickerAsset = await storeStickerAsset(
+        stickerSetName,
+        path.join(generateStickerPackDirPath(stickerSetName), originalFilename),
+      );
+      const previewFilename = `${stickerId}.webp`;
+      const previewAsset = await storeStickerAsset(
+        stickerSetName,
+        generateStickerPreviewFilePath(stickerSetName, stickerId),
+      );
+      setVersionAssetMapping(stickers, sticker.filename, stickerAsset);
+      setVersionAssetMapping(previews, previewFilename, previewAsset);
+      signatureEntries.push([
+        sticker.id,
+        sticker.title,
+        sticker.filename,
+        sticker.isAnimated === true,
+        sticker.readyToUpload === true,
+        stickerAsset,
+        previewAsset,
+      ]);
+    }
+    index = {
+      version,
+      signature: JSON.stringify(signatureEntries),
+      stickers,
+      previews,
+    };
+    await writeStickerVersionIndexAtomically(stickerSetName, index);
+  }
+  await assertStoredVersionComplete(stickerSetName, pack, index);
+  setStickerPackVersionUrls(stickerSetName, pack, version);
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(stickerSetName),
+    pack,
+  );
+  await removeIndexedWorkingFiles(
+    stickerSetName,
+    index,
+    originalFilenames.values(),
+  );
+  console.log(`Legacy sticker pack migrated: ${stickerSetName}`);
+  return true;
+}
+
+export async function migrateLegacyStickerPack(
+  stickerSetName: string,
+  pack: StickerPack,
+): Promise<boolean> {
+  return await withStickerStorageMutation(stickerSetName, async () =>
+    migrateLegacyStickerPackUnlocked(stickerSetName, pack),
+  );
+}
+
+export async function migrateLegacyStickerStorage(): Promise<number> {
+  console.log('Legacy sticker storage migration started');
+  await fsp.mkdir(DATA_DIR, {recursive: true});
+  const entries = await fsp.readdir(DATA_DIR, {withFileTypes: true});
+  let migrated = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    try {
+      const didMigrate = await withStickerStorageMutation(
+        entry.name,
+        async () => {
+          const rawManifest = await readManifestOrUndefined(entry.name);
+          if (rawManifest === undefined) {
+            return false;
+          }
+          const pack = validateLocalStickerPackManifest(rawManifest);
+          if (!pack) {
+            throw new Error('invalid manifest');
+          }
+          if (
+            pack.stickers.some(sticker => {
+              const filename = sticker.filename?.toLowerCase();
+              const image = sticker.image?.toLowerCase();
+              return (
+                (filename !== undefined &&
+                  (filename.endsWith('.webm') || filename.endsWith('.tgs'))) ||
+                (image !== undefined &&
+                  (image.endsWith('.webm') || image.endsWith('.tgs')))
+              );
+            })
+          ) {
+            throw new Error(
+              'raw animated assets require regeneration; existing files were preserved',
+            );
+          }
+          return await migrateLegacyStickerPackUnlocked(entry.name, pack);
+        },
+      );
+      if (didMigrate) {
+        migrated++;
+      }
+    } catch (err) {
+      console.warn(`Legacy migration skipped ${entry.name}:`, err);
+    }
+  }
+  return migrated;
+}
+
+export async function initializeTelegramStickerStorage(
+  migrate: () => Promise<unknown> = migrateLegacyStickerStorage,
+  collect: () => Promise<void> = garbageCollectStickerAssets,
+): Promise<NodeJS.Timeout> {
+  await migrate();
+  try {
+    await collect();
+  } catch (err) {
+    console.error('Sticker asset GC failed during startup:', err);
+  }
+  return scheduleStickerAssetGarbageCollection(collect);
+}
+
 export {
   isStickerPackDownloaded,
   downloadStickerPack,
   toMcStickerPack,
   DATA_DIR,
+  generateStickerPackDirPath,
+  generateStickerPackFilePath,
 };

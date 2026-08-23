@@ -64,8 +64,25 @@ const {
   enqueueManifestPublish,
   enqueueStickerPackOperation,
   readManifestOrUndefined,
+  initializeTelegramStickerStorage,
+  migrateLegacyStickerPack,
+  migrateLegacyStickerStorage,
   toMcStickerPack,
 } = await import('../src/utils/telegramStickers.js');
+const {
+  garbageCollectStickerAssets,
+  generateStickerAssetsDirPath,
+  listStickerPackVersions,
+  readStickerVersionIndex,
+  pruneOldStickerVersions,
+  resolveStickerAssetPath,
+  scheduleStickerAssetGarbageCollection,
+  STICKER_PACK_VERSION_RETENTION,
+  STICKER_STORAGE_GC_INTERVAL_MS,
+  storeStickerAsset,
+  withStickerStorageMutation,
+  writeStickerVersionIndexAtomically,
+} = await import('../src/utils/stickerAssetStorage.js');
 const {
   DEFAULT_STICKER_PACK_METADATA,
   getStickerPackMetadata,
@@ -102,7 +119,7 @@ console.log('--- Starting Smoke Tests in Nix Environment ---');
 assert.equal(GIF_DIMENSION_SCALE, 0.5, 'GIF dimension scale must be 0.5');
 assert.deepEqual(
   GIF_ENCODING_PROFILES.map(profile => profile.maxDimension),
-  [192, 160, 144, 128, 112, 96, 80, 64, 48, 40],
+  [160, 152, 144, 128, 112, 96, 80, 64, 48, 40],
   'GIF profiles must use half-size output dimensions',
 );
 assert.deepEqual(
@@ -165,15 +182,15 @@ for (const profile of TGS_GIF_ENCODING_PROFILES) {
 }
 
 const firstWebmProfile = GIF_ENCODING_PROFILES[0];
-assert.equal(firstWebmProfile.maxDimension, 192);
+assert.equal(firstWebmProfile.maxDimension, 160);
 const firstWebmFilter = buildFfmpegFilter(firstWebmProfile);
 assert.ok(
-  firstWebmFilter.includes('min(192,iw)'),
-  `Expected WebM filter to use scaled max dimension 192, got ${firstWebmFilter}`,
+  firstWebmFilter.includes('min(160,iw)'),
+  `Expected WebM filter to use scaled max dimension 160, got ${firstWebmFilter}`,
 );
 assert.ok(
-  firstWebmFilter.includes('min(192,ih)'),
-  `Expected WebM filter to use scaled max dimension 192, got ${firstWebmFilter}`,
+  firstWebmFilter.includes('min(160,ih)'),
+  `Expected WebM filter to use scaled max dimension 160, got ${firstWebmFilter}`,
 );
 
 // Test 0.9: Concurrency configuration parser
@@ -457,6 +474,8 @@ assert.equal(
 
 for (const sticker of [manifestWebm, manifestTgs]) {
   assert.ok(sticker.filename?.endsWith('.gif'));
+  assert.equal(sticker.filename?.includes('-160'), false);
+  assert.ok(sticker.image.includes(`/${manifest.dynamic?.version}/`));
   assert.ok(sticker.image.endsWith('.gif'));
   assert.equal(sticker.isAnimated, true);
   assert.equal(sticker.readyToUpload, true);
@@ -1068,6 +1087,10 @@ assert.ok(
   `WebM GIF height (${webmOutputHeight}) exceeds profile limit (${conversionResult.profile.maxDimension})`,
 );
 assert.ok(
+  conversionResult.profile.maxDimension <= 160,
+  `WebM GIF profile limit (${conversionResult.profile.maxDimension}) exceeds 160 px`,
+);
+assert.ok(
   Number(stream.nb_read_frames) > 1,
   `GIF must be animated with multiple frames, got: ${stream.nb_read_frames}`,
 );
@@ -1556,13 +1579,13 @@ assert.equal(
 
 assert.equal(
   fs.existsSync(legacyPackDir),
-  false,
-  'Legacy sticker pack dir should have been removed',
+  true,
+  'Legacy sticker pack dir must remain until replacement publication',
 );
 assert.equal(
   fs.existsSync(legacyPackFile),
-  false,
-  'Legacy sticker pack file should have been removed',
+  true,
+  'Legacy sticker pack manifest must remain until replacement publication',
 );
 console.log('Verified: legacy cache correctly detected and invalidated');
 
@@ -1650,13 +1673,27 @@ const additionalCacheCases = [
   },
   {
     name: 'LegacyGifPack',
-    sticker: {filename: 'sticker.gif', isAnimated: true},
-    expectedLegacy: true,
+    sticker: {
+      filename: 'sticker.gif',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: false,
   },
   {
     name: 'ReadyGifPack',
     sticker: {
       filename: 'sticker.gif',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: false,
+  },
+  {
+    name: 'SizedGifPack',
+    sticker: {
+      filename: 'sticker-160.gif',
+      image: 'https://example.test/sticker-160.gif',
       isAnimated: true,
       readyToUpload: true,
     },
@@ -1719,14 +1756,16 @@ const logoCacheCases = [
     pack: {
       logo: {
         filename: 'logo.gif',
-        image: 'https://example.test/logo.gif',
+        image:
+          'https://example.test/sticker/telegram/ModernLogoModernStickersPack/1/logo.gif',
         isAnimated: true,
         readyToUpload: true,
       },
       stickers: [
         {
           filename: 'sticker.gif',
-          image: 'https://example.test/sticker.gif',
+          image:
+            'https://example.test/sticker/telegram/ModernLogoModernStickersPack/1/sticker.gif',
           isAnimated: true,
           readyToUpload: true,
         },
@@ -1793,13 +1832,13 @@ assert.equal(
 );
 assert.equal(
   fs.existsSync(staleAnimatedTgsPackDir),
-  false,
-  'Legacy animated TGS pack directory must be removed',
+  true,
+  'Legacy animated TGS directory must remain until regeneration succeeds',
 );
 assert.equal(
   fs.existsSync(staleAnimatedTgsPackFile),
-  false,
-  'Legacy animated TGS manifest must be removed',
+  true,
+  'Legacy animated TGS manifest must remain until regeneration succeeds',
 );
 console.log('Verified: stale animated TGS cache is invalidated');
 
@@ -1821,13 +1860,13 @@ assert.equal(
 );
 assert.equal(
   fs.existsSync(staleGifPackDir),
-  false,
-  'Stale animated GIF pack directory must be removed',
+  true,
+  'Stale animated GIF directory must remain until regeneration succeeds',
 );
 assert.equal(
   fs.existsSync(staleGifPackFile),
-  false,
-  'Stale animated GIF manifest must be removed',
+  true,
+  'Stale animated GIF manifest must remain until regeneration succeeds',
 );
 console.log('Verified: stale animated GIF cache is invalidated');
 // Test 6: Modern Pack Cache (WebP / GIF)
@@ -1894,6 +1933,596 @@ assert.ok(
 );
 console.log('Verified: modern pack cache preserved');
 
+console.log('Testing content-addressed sticker storage lifecycle...');
+assert.equal(STICKER_PACK_VERSION_RETENTION, 5);
+assert.equal(STICKER_STORAGE_GC_INTERVAL_MS, 5 * 60 * 60 * 1000);
+const storagePackName = 'VersionedStoragePack';
+const storagePackDir = generateStickerPackDirPath(storagePackName);
+await fsp.mkdir(storagePackDir, {recursive: true});
+const storageSourceA = path.join(storagePackDir, 'source-a.gif');
+const storageSourceADuplicate = path.join(
+  storagePackDir,
+  'source-a-duplicate.gif',
+);
+const storageSourceBOld = path.join(storagePackDir, 'source-b-old.gif');
+const storageSourceBNew = path.join(storagePackDir, 'source-b-new.gif');
+const orphanSource = path.join(storagePackDir, 'orphan.gif');
+await fsp.writeFile(storageSourceA, 'asset-a');
+await fsp.writeFile(storageSourceADuplicate, 'asset-a');
+await fsp.writeFile(storageSourceBOld, 'asset-b-old');
+await fsp.writeFile(storageSourceBNew, 'asset-b-new');
+await fsp.writeFile(orphanSource, 'orphan');
+const assetA = await storeStickerAsset(storagePackName, storageSourceA);
+const duplicateAssetA = await storeStickerAsset(
+  storagePackName,
+  storageSourceADuplicate,
+);
+const assetBOld = await storeStickerAsset(storagePackName, storageSourceBOld);
+const assetBNew = await storeStickerAsset(storagePackName, storageSourceBNew);
+const orphanAsset = await storeStickerAsset(storagePackName, orphanSource);
+assert.equal(assetA, duplicateAssetA, 'Identical bytes must reuse one hash');
+await fsp.writeFile(
+  path.join(generateStickerAssetsDirPath(storagePackName), assetA),
+  'corrupted',
+);
+assert.equal(
+  await storeStickerAsset(storagePackName, storageSourceA),
+  assetA,
+  'Re-storing known bytes must repair a corrupted hash-named asset',
+);
+assert.equal(
+  await fsp.readFile(
+    path.join(generateStickerAssetsDirPath(storagePackName), assetA),
+    'utf8',
+  ),
+  'asset-a',
+);
+for (let version = 1; version <= 6; version++) {
+  const bAsset = version === 6 ? assetBNew : assetBOld;
+  await writeStickerVersionIndexAtomically(storagePackName, {
+    version,
+    signature: `signature-${version}`,
+    stickers: {'A.gif': assetA, 'B.gif': bAsset},
+    previews: {},
+  });
+}
+await fsp.writeFile(
+  generateStickerPackFilePath(storagePackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${storagePackName}`,
+    stickers: [],
+    dynamic: {version: 6},
+  }),
+);
+await assert.rejects(
+  writeStickerVersionIndexAtomically(storagePackName, {
+    version: 6,
+    signature: 'replacement',
+    stickers: {'A.gif': assetBNew},
+    previews: {},
+  }),
+  /Refusing to replace immutable sticker version/,
+);
+await garbageCollectStickerAssets();
+assert.deepEqual(
+  await listStickerPackVersions(storagePackName),
+  [2, 3, 4, 5, 6],
+  'Only five newest pack versions must remain',
+);
+assert.equal(
+  path.basename(
+    (await resolveStickerAssetPath(storagePackName, 2, 'A.gif', 'stickers'))!,
+  ),
+  assetA,
+);
+assert.equal(
+  path.basename(
+    (await resolveStickerAssetPath(storagePackName, 6, 'B.gif', 'stickers'))!,
+  ),
+  assetBNew,
+  'Changed sticker bytes must resolve to a new content hash',
+);
+assert.equal(
+  fs.existsSync(
+    path.join(generateStickerAssetsDirPath(storagePackName), assetA),
+  ),
+  true,
+  'Asset shared by retained versions must survive GC',
+);
+assert.equal(
+  fs.existsSync(
+    path.join(generateStickerAssetsDirPath(storagePackName), assetBOld),
+  ),
+  true,
+  'Old asset must survive while any retained version references it',
+);
+assert.equal(
+  fs.existsSync(
+    path.join(generateStickerAssetsDirPath(storagePackName), orphanAsset),
+  ),
+  false,
+  'Unreferenced content-addressed asset must be collected',
+);
+assert.equal(
+  (await fsp.readdir(generateStickerAssetsDirPath(storagePackName))).length,
+  3,
+  'Two versions with one changed sticker must store three unique assets',
+);
+
+console.log('Testing pending versions do not evict published history...');
+const pendingRetentionPackName = 'PendingRetentionPack';
+const pendingRetentionPackDir = generateStickerPackDirPath(
+  pendingRetentionPackName,
+);
+await fsp.mkdir(pendingRetentionPackDir, {recursive: true});
+const publishedRetentionSource = path.join(
+  pendingRetentionPackDir,
+  'published.gif',
+);
+const pendingRetentionSource = path.join(
+  pendingRetentionPackDir,
+  'pending.gif',
+);
+const ghostRetentionSource = path.join(pendingRetentionPackDir, 'ghost.gif');
+await fsp.writeFile(publishedRetentionSource, 'published-history-asset');
+await fsp.writeFile(pendingRetentionSource, 'pending-recovery-asset');
+await fsp.writeFile(ghostRetentionSource, 'ghost-version-asset');
+const publishedRetentionAsset = await storeStickerAsset(
+  pendingRetentionPackName,
+  publishedRetentionSource,
+);
+const pendingRetentionAsset = await storeStickerAsset(
+  pendingRetentionPackName,
+  pendingRetentionSource,
+);
+const ghostRetentionAsset = await storeStickerAsset(
+  pendingRetentionPackName,
+  ghostRetentionSource,
+);
+for (let version = 6; version <= 13; version++) {
+  const asset =
+    version <= 10
+      ? publishedRetentionAsset
+      : version === 11
+        ? pendingRetentionAsset
+        : ghostRetentionAsset;
+  await writeStickerVersionIndexAtomically(pendingRetentionPackName, {
+    version,
+    signature: `pending-retention-${version}`,
+    stickers: {'A.gif': asset},
+    previews: {},
+  });
+}
+await fsp.writeFile(
+  generateStickerPackFilePath(pendingRetentionPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${pendingRetentionPackName}`,
+    stickers: [],
+    dynamic: {version: 10},
+  }),
+);
+assert.equal(
+  await pruneOldStickerVersions(pendingRetentionPackName),
+  2,
+  'Immediate retention must remove only ghost indexes',
+);
+assert.deepEqual(
+  await listStickerPackVersions(pendingRetentionPackName),
+  [6, 7, 8, 9, 10, 11],
+  'Pending recovery must not evict five published versions',
+);
+await garbageCollectStickerAssets();
+assert.deepEqual(
+  await listStickerPackVersions(pendingRetentionPackName),
+  [6, 7, 8, 9, 10, 11],
+);
+assert.equal(
+  fs.existsSync(
+    path.join(
+      generateStickerAssetsDirPath(pendingRetentionPackName),
+      pendingRetentionAsset,
+    ),
+  ),
+  true,
+  'GC must mark assets referenced by the pending recovery index',
+);
+assert.equal(
+  fs.existsSync(
+    path.join(
+      generateStickerAssetsDirPath(pendingRetentionPackName),
+      ghostRetentionAsset,
+    ),
+  ),
+  false,
+  'Assets referenced only by removed ghost indexes must become collectible',
+);
+await fsp.writeFile(
+  path.join(
+    generateStickerAssetsDirPath(pendingRetentionPackName),
+    pendingRetentionAsset,
+  ),
+  'corrupted-pending-recovery-asset',
+);
+await garbageCollectStickerAssets();
+assert.deepEqual(
+  await listStickerPackVersions(pendingRetentionPackName),
+  [6, 7, 8, 9, 10],
+  'A corrupt pending index must not be preserved as recovery state',
+);
+assert.equal(
+  fs.existsSync(
+    path.join(
+      generateStickerAssetsDirPath(pendingRetentionPackName),
+      publishedRetentionAsset,
+    ),
+  ),
+  true,
+  'Discarding corrupt pending state must preserve published history assets',
+);
+
+console.log('Testing corruption-safe retention and garbage collection...');
+const corruptRetentionPackName = 'CorruptRetentionPack';
+const corruptRetentionPackDir = generateStickerPackDirPath(
+  corruptRetentionPackName,
+);
+await fsp.mkdir(corruptRetentionPackDir, {recursive: true});
+const corruptRetentionAssets: string[] = [];
+for (let version = 1; version <= 6; version++) {
+  const sourcePath = path.join(
+    corruptRetentionPackDir,
+    `retention-${version}.gif`,
+  );
+  await fsp.writeFile(sourcePath, `retention-asset-${version}`);
+  const asset = await storeStickerAsset(corruptRetentionPackName, sourcePath);
+  corruptRetentionAssets.push(asset);
+  await writeStickerVersionIndexAtomically(corruptRetentionPackName, {
+    version,
+    signature: `retention-${version}`,
+    stickers: {'A.gif': asset},
+    previews: {},
+  });
+}
+await fsp.writeFile(
+  generateStickerPackFilePath(corruptRetentionPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${corruptRetentionPackName}`,
+    stickers: [],
+    dynamic: {version: 6},
+  }),
+);
+await fsp.writeFile(
+  path.join(
+    generateStickerAssetsDirPath(corruptRetentionPackName),
+    corruptRetentionAssets[5],
+  ),
+  'corrupted-retained-asset',
+);
+const corruptVersionsDir = path.join(corruptRetentionPackDir, 'versions');
+const corruptAssetsDir = generateStickerAssetsDirPath(corruptRetentionPackName);
+const corruptVersionsBefore = (await fsp.readdir(corruptVersionsDir)).sort();
+const corruptAssetsBefore = (await fsp.readdir(corruptAssetsDir)).sort();
+const corruptVersionBytesBefore = await Promise.all(
+  corruptVersionsBefore.map(filename =>
+    fsp.readFile(path.join(corruptVersionsDir, filename)),
+  ),
+);
+const corruptAssetBytesBefore = await Promise.all(
+  corruptAssetsBefore.map(filename =>
+    fsp.readFile(path.join(corruptAssetsDir, filename)),
+  ),
+);
+assert.equal(
+  await pruneOldStickerVersions(corruptRetentionPackName),
+  0,
+  'Immediate retention must skip a pack with corrupt retained storage',
+);
+await garbageCollectStickerAssets();
+assert.deepEqual(
+  (await fsp.readdir(corruptVersionsDir)).sort(),
+  corruptVersionsBefore,
+  'GC must not remove any version when a retained asset is corrupt',
+);
+assert.deepEqual(
+  (await fsp.readdir(corruptAssetsDir)).sort(),
+  corruptAssetsBefore,
+  'GC must not remove any asset when a retained asset is corrupt',
+);
+assert.deepEqual(
+  await Promise.all(
+    corruptVersionsBefore.map(filename =>
+      fsp.readFile(path.join(corruptVersionsDir, filename)),
+    ),
+  ),
+  corruptVersionBytesBefore,
+  'GC must preserve version indexes byte-for-byte on validation failure',
+);
+assert.deepEqual(
+  await Promise.all(
+    corruptAssetsBefore.map(filename =>
+      fsp.readFile(path.join(corruptAssetsDir, filename)),
+    ),
+  ),
+  corruptAssetBytesBefore,
+  'GC must preserve assets byte-for-byte on validation failure',
+);
+
+console.log('Testing per-pack storage mutation serialization...');
+const storageMutationEvents: string[] = [];
+let markFirstStorageMutationStarted!: () => void;
+let releaseFirstStorageMutation!: () => void;
+const firstStorageMutationStarted = new Promise<void>(resolve => {
+  markFirstStorageMutationStarted = resolve;
+});
+const firstStorageMutationGate = new Promise<void>(resolve => {
+  releaseFirstStorageMutation = resolve;
+});
+const firstPackMutation = withStickerStorageMutation(
+  'StorageQueuePackA',
+  async () => {
+    storageMutationEvents.push('A:first:start');
+    markFirstStorageMutationStarted();
+    await firstStorageMutationGate;
+    storageMutationEvents.push('A:first:end');
+  },
+);
+await firstStorageMutationStarted;
+const secondPackMutation = withStickerStorageMutation(
+  'StorageQueuePackA',
+  async () => {
+    storageMutationEvents.push('A:second');
+  },
+);
+const independentPackMutation = withStickerStorageMutation(
+  'StorageQueuePackB',
+  async () => {
+    storageMutationEvents.push('B');
+  },
+);
+await new Promise<void>(resolve => setImmediate(resolve));
+assert.deepEqual(
+  storageMutationEvents,
+  ['A:first:start', 'B'],
+  'Different packs may mutate while the first pack is blocked',
+);
+releaseFirstStorageMutation();
+await Promise.all([
+  firstPackMutation,
+  secondPackMutation,
+  independentPackMutation,
+]);
+assert.deepEqual(
+  storageMutationEvents,
+  ['A:first:start', 'B', 'A:first:end', 'A:second'],
+  'Mutations for the same pack must remain FIFO',
+);
+
+console.log('Testing idempotent legacy storage migration...');
+const migrationPackName = 'LegacyStorageMigrationPack';
+const migrationPackDir = generateStickerPackDirPath(migrationPackName);
+const migrationPreviewDir = generateStickerPreviewDirPath(migrationPackName);
+const migrationManifestPath = generateStickerPackFilePath(migrationPackName);
+await fsp.mkdir(migrationPreviewDir, {recursive: true});
+const migrationSourcePath = path.join(migrationPackDir, 'legacy-160.gif');
+await fsp.writeFile(migrationSourcePath, 'legacy-gif-bytes');
+await fsp.writeFile(
+  path.join(migrationPreviewDir, 'legacy.webp'),
+  'legacy-preview-bytes',
+);
+const migrationPack = {
+  id: `MoreStickers:Telegram:Pack:${migrationPackName}`,
+  title: 'Legacy Storage Migration Pack',
+  logo: {
+    id: `MoreStickers:Telegram:Sticker:${migrationPackName}:legacy`,
+    image: `https://stickers.example.com/sticker/telegram/${migrationPackName}/legacy-160.gif`,
+    previewImage: `https://stickers.example.com/preview/telegram/${migrationPackName}/legacy.webp`,
+    title: '✨',
+    stickerPackId: `MoreStickers:Telegram:Pack:${migrationPackName}`,
+    filename: 'legacy-160.gif',
+    isAnimated: true,
+    readyToUpload: true,
+  },
+  stickers: [
+    {
+      id: `MoreStickers:Telegram:Sticker:${migrationPackName}:legacy`,
+      image: `https://stickers.example.com/sticker/telegram/${migrationPackName}/legacy-160.gif`,
+      previewImage: `https://stickers.example.com/preview/telegram/${migrationPackName}/legacy.webp`,
+      title: '✨',
+      stickerPackId: `MoreStickers:Telegram:Pack:${migrationPackName}`,
+      filename: 'legacy-160.gif',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+  ],
+  dynamic: {
+    version: 7,
+    refreshUrl: generateStickerPackExternalUrl(migrationPackName),
+  },
+} as Parameters<typeof migrateLegacyStickerPack>[1];
+await fsp.writeFile(migrationManifestPath, JSON.stringify(migrationPack));
+const partiallyStoredAsset = await storeStickerAsset(
+  migrationPackName,
+  migrationSourcePath,
+);
+assert.equal(
+  await migrateLegacyStickerPack(migrationPackName, migrationPack),
+  true,
+);
+const migratedIndex = await readStickerVersionIndex(migrationPackName, 7);
+assert.equal(migratedIndex?.stickers['legacy.gif'], partiallyStoredAsset);
+assert.equal(
+  migratedIndex?.stickers['legacy-160.gif'],
+  undefined,
+  'Version indexes must not contain legacy -160 aliases',
+);
+assert.ok(migratedIndex?.previews['legacy.webp']);
+const migratedManifest = validateLocalStickerPackManifest(
+  JSON.parse(await fsp.readFile(migrationManifestPath, 'utf8')),
+);
+assert.ok(migratedManifest);
+assert.equal(migratedManifest.stickers[0].filename, 'legacy.gif');
+assert.ok(migratedManifest.stickers[0].image.includes('/7/legacy.gif'));
+assert.ok(
+  migratedManifest.stickers[0].previewImage?.includes('/7/legacy.webp'),
+);
+assert.equal(fs.existsSync(migrationSourcePath), false);
+assert.equal(
+  await migrateLegacyStickerPack(migrationPackName, migratedManifest),
+  false,
+  'Second migration run must be a no-op',
+);
+assert.equal(
+  await resolveStickerAssetPath(
+    migrationPackName,
+    7,
+    'legacy-160.gif',
+    'stickers',
+  ),
+  undefined,
+  'Versioned lookup must not resolve legacy -160 aliases',
+);
+await fsp.writeFile(
+  path.join(migrationPackDir, 'legacy.gif'),
+  'leftover-working-copy',
+);
+await fsp.mkdir(migrationPreviewDir, {recursive: true});
+await fsp.writeFile(
+  path.join(migrationPreviewDir, 'legacy.webp'),
+  'leftover-preview-copy',
+);
+assert.equal(
+  await migrateLegacyStickerPack(migrationPackName, migratedManifest),
+  false,
+  'Interrupted post-manifest cleanup must resume idempotently',
+);
+assert.equal(fs.existsSync(path.join(migrationPackDir, 'legacy.gif')), false);
+assert.equal(
+  fs.existsSync(path.join(migrationPreviewDir, 'legacy.webp')),
+  false,
+);
+
+console.log('Testing isolated legacy storage migration failures...');
+async function writeLegacyGifMigrationFixture(
+  fixturePackName: string,
+): Promise<void> {
+  const fixturePackDir = generateStickerPackDirPath(fixturePackName);
+  const fixturePreviewDir = generateStickerPreviewDirPath(fixturePackName);
+  await fsp.mkdir(fixturePreviewDir, {recursive: true});
+  await fsp.writeFile(
+    path.join(fixturePackDir, 'sticker-160.gif'),
+    `gif-${fixturePackName}`,
+  );
+  await fsp.writeFile(
+    path.join(fixturePreviewDir, 'sticker.webp'),
+    `preview-${fixturePackName}`,
+  );
+  const fixtureSticker = {
+    id: `MoreStickers:Telegram:Sticker:${fixturePackName}:sticker`,
+    image: `https://stickers.example.com/sticker/telegram/${fixturePackName}/sticker-160.gif`,
+    previewImage: `https://stickers.example.com/preview/telegram/${fixturePackName}/sticker.webp`,
+    title: 'fixture',
+    stickerPackId: `MoreStickers:Telegram:Pack:${fixturePackName}`,
+    filename: 'sticker-160.gif',
+    isAnimated: true,
+    readyToUpload: true,
+  };
+  await fsp.writeFile(
+    generateStickerPackFilePath(fixturePackName),
+    JSON.stringify({
+      id: `MoreStickers:Telegram:Pack:${fixturePackName}`,
+      title: fixturePackName,
+      logo: fixtureSticker,
+      stickers: [fixtureSticker],
+    }),
+  );
+}
+
+const migrationGoodBefore = 'MigrationIsolationGoodBefore';
+const migrationRawTgs = 'MigrationIsolationRawTgs';
+const migrationGoodAfter = 'MigrationIsolationGoodAfter';
+const migrationInvalid = 'MigrationIsolationInvalid';
+await writeLegacyGifMigrationFixture(migrationGoodBefore);
+const migrationRawDir = generateStickerPackDirPath(migrationRawTgs);
+await fsp.mkdir(migrationRawDir, {recursive: true});
+const migrationRawPath = path.join(migrationRawDir, 'raw.tgs');
+const migrationRawBytes = Buffer.from('legacy-raw-tgs');
+await fsp.writeFile(migrationRawPath, migrationRawBytes);
+const migrationRawManifestPath = generateStickerPackFilePath(migrationRawTgs);
+const migrationRawManifest = JSON.stringify({
+  id: `MoreStickers:Telegram:Pack:${migrationRawTgs}`,
+  title: migrationRawTgs,
+  stickers: [
+    {
+      id: `MoreStickers:Telegram:Sticker:${migrationRawTgs}:raw`,
+      image: `https://stickers.example.com/sticker/telegram/${migrationRawTgs}/raw.tgs`,
+      title: 'raw',
+      stickerPackId: `MoreStickers:Telegram:Pack:${migrationRawTgs}`,
+      filename: 'raw.tgs',
+      isAnimated: true,
+    },
+  ],
+});
+await fsp.writeFile(migrationRawManifestPath, migrationRawManifest);
+await writeLegacyGifMigrationFixture(migrationGoodAfter);
+const migrationInvalidDir = generateStickerPackDirPath(migrationInvalid);
+await fsp.mkdir(migrationInvalidDir, {recursive: true});
+const migrationInvalidSentinel = path.join(
+  migrationInvalidDir,
+  'preserve-me.bin',
+);
+await fsp.writeFile(migrationInvalidSentinel, 'preserve-invalid-pack');
+const migrationInvalidManifestPath =
+  generateStickerPackFilePath(migrationInvalid);
+const migrationInvalidManifest = '{invalid-json';
+await fsp.writeFile(migrationInvalidManifestPath, migrationInvalidManifest);
+
+await migrateLegacyStickerStorage();
+assert.ok(
+  await readStickerVersionIndex(migrationGoodBefore, 1),
+  'A valid pack before a failing pack must migrate',
+);
+assert.ok(
+  await readStickerVersionIndex(migrationGoodAfter, 1),
+  'A valid pack after a failing pack must still migrate',
+);
+assert.deepEqual(
+  await fsp.readFile(migrationRawPath),
+  migrationRawBytes,
+  'Raw TGS bytes must remain untouched for later regeneration',
+);
+assert.equal(
+  await fsp.readFile(migrationRawManifestPath, 'utf8'),
+  migrationRawManifest,
+  'Raw TGS manifest must remain untouched',
+);
+assert.equal(
+  await fsp.readFile(migrationInvalidManifestPath, 'utf8'),
+  migrationInvalidManifest,
+  'Invalid manifest must remain untouched',
+);
+assert.equal(
+  await fsp.readFile(migrationInvalidSentinel, 'utf8'),
+  'preserve-invalid-pack',
+  'Invalid pack files must remain untouched',
+);
+
+const startupEvents: string[] = [];
+const startupGcTimer = await initializeTelegramStickerStorage(
+  async () => {
+    startupEvents.push('migration');
+  },
+  async () => {
+    startupEvents.push('gc');
+  },
+);
+clearInterval(startupGcTimer);
+assert.deepEqual(startupEvents, ['migration', 'gc']);
+assert.equal(startupGcTimer.hasRef(), false);
+assert.equal(typeof migrateLegacyStickerStorage, 'function');
+assert.equal(typeof scheduleStickerAssetGarbageCollection, 'function');
+console.log(
+  'Verified: deduplication, immutable indexes, retention, GC, migration, and startup ordering',
+);
+
 // Test 7: Fastify endpoint with GIF, manifests, and CORS
 console.log('Testing Fastify endpoints and CORS...');
 const packName = 'TestPackHttp';
@@ -1925,6 +2554,13 @@ await fsp.writeFile(
     },
   }),
 );
+const sampleGifAsset = await storeStickerAsset(packName, sampleGifDest);
+await writeStickerVersionIndexAtomically(packName, {
+  version: 1,
+  signature: 'http-fixture',
+  stickers: {'test_sticker.gif': sampleGifAsset},
+  previews: {},
+});
 
 const gifResponse = await app.inject({
   method: 'GET',
@@ -1951,7 +2587,7 @@ assert.equal(
 );
 assert.equal(
   gifResponse.headers['cache-control'],
-  'public, max-age=31536000',
+  'public, max-age=300',
   `Expected cache-control header, got ${gifResponse.headers['cache-control']}`,
 );
 
@@ -1980,7 +2616,7 @@ assert.equal(
 );
 assert.equal(
   gifHeadResponse.headers['cache-control'],
-  'public, max-age=31536000',
+  'public, max-age=300',
   `Expected cache-control header for HEAD, got ${gifHeadResponse.headers['cache-control']}`,
 );
 assert.equal(
@@ -2153,6 +2789,245 @@ assert.ok(
   'Manifest Access-Control-Allow-Methods must include OPTIONS',
 );
 
+console.log('Testing immutable versioned and mutable legacy asset routes...');
+const versionedHttpPackName = 'VersionedHttpPack';
+const versionedHttpPackDir = generateStickerPackDirPath(versionedHttpPackName);
+await fsp.mkdir(versionedHttpPackDir, {recursive: true});
+const version10StickerSource = path.join(versionedHttpPackDir, 'v10.gif');
+const version11StickerSource = path.join(versionedHttpPackDir, 'v11.gif');
+const version10PreviewSource = path.join(versionedHttpPackDir, 'v10.webp');
+const version11PreviewSource = path.join(versionedHttpPackDir, 'v11.webp');
+await fsp.writeFile(version10StickerSource, 'version-10-sticker');
+await fsp.writeFile(version11StickerSource, 'version-11-sticker');
+await fsp.writeFile(version10PreviewSource, 'version-10-preview');
+await fsp.writeFile(version11PreviewSource, 'version-11-preview');
+const version10StickerAsset = await storeStickerAsset(
+  versionedHttpPackName,
+  version10StickerSource,
+);
+const version11StickerAsset = await storeStickerAsset(
+  versionedHttpPackName,
+  version11StickerSource,
+);
+const version10PreviewAsset = await storeStickerAsset(
+  versionedHttpPackName,
+  version10PreviewSource,
+);
+const version11PreviewAsset = await storeStickerAsset(
+  versionedHttpPackName,
+  version11PreviewSource,
+);
+await writeStickerVersionIndexAtomically(versionedHttpPackName, {
+  version: 10,
+  signature: 'version-10',
+  stickers: {'A.gif': version10StickerAsset},
+  previews: {'A.webp': version10PreviewAsset},
+});
+await writeStickerVersionIndexAtomically(versionedHttpPackName, {
+  version: 11,
+  signature: 'version-11',
+  stickers: {'A.gif': version11StickerAsset},
+  previews: {'A.webp': version11PreviewAsset},
+});
+assert.equal(
+  (
+    await app.inject({
+      method: 'GET',
+      url: `/sticker/telegram/${versionedHttpPackName}/10/A.gif`,
+    })
+  ).statusCode,
+  404,
+  'Versioned sticker routes must remain private without a public manifest',
+);
+assert.equal(
+  (
+    await app.inject({
+      method: 'GET',
+      url: `/preview/telegram/${versionedHttpPackName}/10/A.webp`,
+    })
+  ).statusCode,
+  404,
+  'Versioned preview routes must remain private without a public manifest',
+);
+await fsp.writeFile(
+  generateStickerPackFilePath(versionedHttpPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${versionedHttpPackName}`,
+    title: 'Versioned HTTP Pack',
+    logo: {
+      id: `MoreStickers:Telegram:Sticker:${versionedHttpPackName}:A`,
+      image: `https://stickers.example.com/sticker/telegram/${versionedHttpPackName}/10/A.gif`,
+      previewImage: `https://stickers.example.com/preview/telegram/${versionedHttpPackName}/10/A.webp`,
+      title: 'A',
+      stickerPackId: `MoreStickers:Telegram:Pack:${versionedHttpPackName}`,
+      filename: 'A.gif',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${versionedHttpPackName}:A`,
+        image: `https://stickers.example.com/sticker/telegram/${versionedHttpPackName}/10/A.gif`,
+        previewImage: `https://stickers.example.com/preview/telegram/${versionedHttpPackName}/10/A.webp`,
+        title: 'A',
+        stickerPackId: `MoreStickers:Telegram:Pack:${versionedHttpPackName}`,
+        filename: 'A.gif',
+        isAnimated: true,
+        readyToUpload: true,
+      },
+    ],
+    dynamic: {
+      version: 10,
+      refreshUrl: generateStickerPackExternalUrl(versionedHttpPackName),
+    },
+  }),
+);
+const version10Response = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/10/A.gif`,
+});
+assert.equal(version10Response.statusCode, 200);
+assert.equal(version10Response.body, 'version-10-sticker');
+assert.ok(version10Response.headers['cache-control']?.includes('immutable'));
+assert.ok(
+  version10Response.headers['cache-control']?.includes('max-age=31536000'),
+);
+const pendingVersion11Response = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/11/A.gif`,
+});
+assert.equal(
+  pendingVersion11Response.statusCode,
+  404,
+  'Pending sticker versions must not be public',
+);
+const pendingVersion11PreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${versionedHttpPackName}/11/A.webp`,
+});
+assert.equal(
+  pendingVersion11PreviewResponse.statusCode,
+  404,
+  'Pending preview versions must not be public',
+);
+const committedVersion11Manifest = JSON.parse(
+  await fsp.readFile(
+    generateStickerPackFilePath(versionedHttpPackName),
+    'utf8',
+  ),
+) as {dynamic: {version: number}};
+committedVersion11Manifest.dynamic.version = 11;
+await fsp.writeFile(
+  generateStickerPackFilePath(versionedHttpPackName),
+  JSON.stringify(committedVersion11Manifest),
+);
+const version11Response = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/11/A.gif`,
+});
+assert.equal(version11Response.statusCode, 200);
+assert.equal(version11Response.body, 'version-11-sticker');
+assert.ok(version11Response.headers['cache-control']?.includes('immutable'));
+const legacyLatestResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/A.gif`,
+});
+assert.equal(legacyLatestResponse.statusCode, 200);
+assert.equal(legacyLatestResponse.body, 'version-11-sticker');
+assert.equal(
+  legacyLatestResponse.headers['cache-control']?.includes('immutable'),
+  false,
+);
+const versionedLegacyAliasResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/10/A-160.gif`,
+});
+assert.equal(
+  versionedLegacyAliasResponse.statusCode,
+  404,
+  'Versioned routes must require an exact index key',
+);
+const versionedCanonicalizationResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/10/A.GIF`,
+});
+assert.equal(
+  versionedCanonicalizationResponse.statusCode,
+  404,
+  'Versioned routes must not canonicalize request filenames',
+);
+const legacyAliasResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/A-160.gif`,
+});
+assert.equal(legacyAliasResponse.statusCode, 200);
+assert.equal(legacyAliasResponse.body, 'version-11-sticker');
+assert.equal(
+  legacyAliasResponse.headers['cache-control']?.includes('immutable'),
+  false,
+);
+const versionedPreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${versionedHttpPackName}/10/A.webp`,
+});
+assert.equal(versionedPreviewResponse.statusCode, 200);
+assert.equal(versionedPreviewResponse.body, 'version-10-preview');
+assert.ok(
+  versionedPreviewResponse.headers['cache-control']?.includes('immutable'),
+);
+const committedVersion11PreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${versionedHttpPackName}/11/A.webp`,
+});
+assert.equal(committedVersion11PreviewResponse.statusCode, 200);
+assert.equal(committedVersion11PreviewResponse.body, 'version-11-preview');
+assert.ok(
+  committedVersion11PreviewResponse.headers['cache-control']?.includes(
+    'immutable',
+  ),
+);
+const legacyPreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${versionedHttpPackName}/A.webp`,
+});
+assert.equal(legacyPreviewResponse.statusCode, 200);
+assert.equal(legacyPreviewResponse.body, 'version-11-preview');
+assert.equal(
+  legacyPreviewResponse.headers['cache-control']?.includes('immutable'),
+  false,
+);
+assert.equal(
+  (
+    await app.inject({
+      method: 'GET',
+      url: `/sticker/telegram/${versionedHttpPackName}/9/A.gif`,
+    })
+  ).statusCode,
+  404,
+);
+assert.equal(
+  (
+    await app.inject({
+      method: 'GET',
+      url: `/sticker/telegram/${versionedHttpPackName}/10/missing.gif`,
+    })
+  ).statusCode,
+  404,
+);
+assert.ok(
+  [400, 404].includes(
+    (
+      await app.inject({
+        method: 'GET',
+        url: `/sticker/telegram/${versionedHttpPackName}/10/%2e%2e%2fA.gif`,
+      })
+    ).statusCode,
+  ),
+);
+console.log(
+  'Verified: versioned history is immutable and legacy routes use latest',
+);
+
 console.log('Verified: Fastify correctly serves .gif and manifest with CORS');
 
 // Manifest Path Traversal and Invalid Pack Name tests
@@ -2213,11 +3088,14 @@ console.log(
 
 // Test 8: Fastify static WebP and forbidden raw formats (.webm / .tgs / .exe)
 console.log('Testing Fastify endpoint for static .webp...');
-const webpFilePath = path.join(packDir, 'test_static.webp');
+const legacyStaticPackName = 'LegacyStaticHttpPack';
+const legacyStaticPackDir = generateStickerPackDirPath(legacyStaticPackName);
+await fsp.mkdir(legacyStaticPackDir, {recursive: true});
+const webpFilePath = path.join(legacyStaticPackDir, 'test_static.webp');
 await fsp.writeFile(webpFilePath, 'dummy-webp');
 const webpResponse = await app.inject({
   method: 'GET',
-  url: `/sticker/telegram/${packName}/test_static.webp`,
+  url: `/sticker/telegram/${legacyStaticPackName}/test_static.webp`,
   headers: {
     origin: 'https://discord.com',
   },
@@ -2234,7 +3112,7 @@ assert.equal(
 );
 assert.equal(
   webpResponse.headers['cache-control'],
-  'public, max-age=31536000',
+  'public, max-age=300',
   `Expected cache-control header for .webp, got ${webpResponse.headers['cache-control']}`,
 );
 assert.equal(
@@ -2348,11 +3226,11 @@ assert.equal(
   `Expected 400 for invalid extension, got ${invalidResponse.statusCode}`,
 );
 console.log('Testing Fastify endpoint for uppercase extension .GIF...');
-const upperGifPath = path.join(packDir, 'upper.GIF');
+const upperGifPath = path.join(legacyStaticPackDir, 'upper.GIF');
 await fsp.copyFile(testGifPath, upperGifPath);
 const upperGifResponse = await app.inject({
   method: 'GET',
-  url: `/sticker/telegram/${packName}/upper.GIF`,
+  url: `/sticker/telegram/${legacyStaticPackName}/upper.GIF`,
 });
 assert.equal(
   upperGifResponse.statusCode,
@@ -2688,10 +3566,11 @@ console.log(
 console.log(
   'Testing Fastify preview endpoint /preview/telegram/:pack/:filename...',
 );
-const previewPackDir = generateStickerPreviewDirPath(packName);
+const legacyPreviewPackName = 'LegacyPreviewHttpPack';
+const previewPackDir = generateStickerPreviewDirPath(legacyPreviewPackName);
 await fsp.mkdir(previewPackDir, {recursive: true});
 const previewFilePathInPack = generateStickerPreviewFilePath(
-  packName,
+  legacyPreviewPackName,
   'test_sticker',
 );
 await fsp.copyFile(gifPreviewOutput, previewFilePathInPack);
@@ -2699,7 +3578,7 @@ await fsp.copyFile(gifPreviewOutput, previewFilePathInPack);
 // GET preview
 const previewGetResponse = await app.inject({
   method: 'GET',
-  url: `/preview/telegram/${packName}/test_sticker.webp`,
+  url: `/preview/telegram/${legacyPreviewPackName}/test_sticker.webp`,
   headers: {
     origin: 'https://discord.com',
   },
@@ -2716,8 +3595,8 @@ assert.equal(
 );
 assert.equal(
   previewGetResponse.headers['cache-control'],
-  'public, max-age=31536000',
-  'Expected 1-year cache-control for preview',
+  'public, max-age=300',
+  'Expected short mutable cache-control for legacy preview',
 );
 assert.equal(
   previewGetResponse.headers['access-control-allow-origin'],
@@ -2728,7 +3607,7 @@ assert.equal(
 // HEAD preview
 const previewHeadResponse = await app.inject({
   method: 'HEAD',
-  url: `/preview/telegram/${packName}/test_sticker.webp`,
+  url: `/preview/telegram/${legacyPreviewPackName}/test_sticker.webp`,
   headers: {
     origin: 'https://discord.com',
   },
@@ -2747,7 +3626,7 @@ assert.equal(
 // OPTIONS preview
 const previewOptionsResponse = await app.inject({
   method: 'OPTIONS',
-  url: `/preview/telegram/${packName}/test_sticker.webp`,
+  url: `/preview/telegram/${legacyPreviewPackName}/test_sticker.webp`,
   headers: {
     origin: 'https://discord.com',
     'access-control-request-method': 'GET',
@@ -2762,7 +3641,7 @@ assert.equal(
 // Missing preview -> 404
 const missingPreviewResponse = await app.inject({
   method: 'GET',
-  url: `/preview/telegram/${packName}/non_existent_sticker.webp`,
+  url: `/preview/telegram/${legacyPreviewPackName}/non_existent_sticker.webp`,
 });
 assert.equal(
   missingPreviewResponse.statusCode,
@@ -2774,7 +3653,7 @@ assert.equal(missingPreviewResponse.body, 'Preview not found');
 // Invalid extension -> 400
 const invalidExtPreviewResponse = await app.inject({
   method: 'GET',
-  url: `/preview/telegram/${packName}/test_sticker.gif`,
+  url: `/preview/telegram/${legacyPreviewPackName}/test_sticker.gif`,
 });
 assert.equal(
   invalidExtPreviewResponse.statusCode,
@@ -2785,7 +3664,7 @@ assert.equal(
 // Double extension -> 400
 const doubleExtPreviewResponse = await app.inject({
   method: 'GET',
-  url: `/preview/telegram/${packName}/test_sticker.webp.exe`,
+  url: `/preview/telegram/${legacyPreviewPackName}/test_sticker.webp.exe`,
 });
 assert.equal(
   doubleExtPreviewResponse.statusCode,
@@ -2796,7 +3675,7 @@ assert.equal(
 // Path component -> 400
 const pathCompPreviewResponse = await app.inject({
   method: 'GET',
-  url: `/preview/telegram/${packName}/nested%2Ftest_sticker.webp`,
+  url: `/preview/telegram/${legacyPreviewPackName}/nested%2Ftest_sticker.webp`,
 });
 assert.equal(
   pathCompPreviewResponse.statusCode,
@@ -4306,6 +5185,11 @@ await fsp.writeFile(
     },
   }),
 );
+const packTestManifest = validateLocalStickerPackManifest(
+  JSON.parse(await fsp.readFile(packManifestPath, 'utf8')),
+);
+assert.ok(packTestManifest);
+await migrateLegacyStickerPack(packTestName, packTestManifest);
 let getStickerSetCalled = false;
 const mockTelegram = {
   getStickerSet: async (name: string) => {
@@ -4387,6 +5271,19 @@ const sampleWebpBuffer = spawnSync('ffmpeg', [
   'lavfi',
   '-i',
   'color=c=blue:size=64x64:duration=1',
+  '-vframes',
+  '1',
+  '-c:v',
+  'libwebp',
+  '-f',
+  'webp',
+  'pipe:1',
+]).stdout;
+const changedSampleWebpBuffer = spawnSync('ffmpeg', [
+  '-f',
+  'lavfi',
+  '-i',
+  'color=c=green:size=64x64:duration=1',
   '-vframes',
   '1',
   '-c:v',
@@ -4557,7 +5454,12 @@ await fsp.writeFile(
     },
   }),
 );
+const legacyRawTgsPath = path.join(refreshDir, 'unique-1.tgs');
+const legacyRawWebmPath = path.join(refreshDir, 'unique-1.webm');
+await fsp.writeFile(legacyRawTgsPath, 'legacy-tgs-working-file');
+await fsp.writeFile(legacyRawWebmPath, 'legacy-webm-working-file');
 await updateStickerPackMetadata(refreshPackName, {visibility: 'public'});
+let refreshGetFileCalls = 0;
 const mockRefreshTelegram = {
   getStickerSet: async (name: string) => {
     if (name === 'FailTgPack') {
@@ -4578,7 +5480,26 @@ const mockRefreshTelegram = {
     };
   },
   getFileLink: async () => new URL('https://example.com/file.webp'),
-  getFile: async () => ({file_path: 'documents/file.webp'}),
+  getFile: async () => {
+    refreshGetFileCalls++;
+    if (refreshGetFileCalls === 2) {
+      let storageProbeRan = false;
+      const storageProbe = withStickerStorageMutation(
+        refreshPackName,
+        async () => {
+          storageProbeRan = true;
+        },
+      );
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (!storageProbeRan) {
+        throw new Error(
+          'Telegram metadata lookup ran while holding the pack storage lock',
+        );
+      }
+      await storageProbe;
+    }
+    return {file_path: 'documents/file.webp'};
+  },
 } as unknown as Telegram;
 
 const savedFetch = globalThis.fetch;
@@ -4589,7 +5510,7 @@ globalThis.fetch = (async () => {
   });
 }) as unknown as typeof fetch;
 try {
-  // Case 1: Refresh existing pack with same content -> retains version 3 and retains public visibility
+  // Case 1: First content-addressed publication advances legacy version 3 to 4
   const ctxRef1 = createMockContext({
     userId: allowedUserId,
     args: [refreshPackName],
@@ -4598,14 +5519,111 @@ try {
   const handledRef1 = await handleRefreshCommand(ctxRef1);
   assert.equal(handledRef1, true);
   assert.ok(ctxRef1.replies.some(r => r.includes('refreshed successfully')));
-  assert.ok(ctxRef1.replies.some(r => r.includes('Version: 3')));
+  assert.ok(ctxRef1.replies.some(r => r.includes('Version: 4')));
   assert.equal(
     (await getStickerPackMetadata(refreshPackName)).visibility,
     'public',
     'Visibility must be preserved after refresh',
   );
+  assert.equal(
+    fs.existsSync(legacyRawTgsPath),
+    false,
+    'Successful regeneration must clean the unambiguous legacy TGS working file',
+  );
+  assert.equal(
+    fs.existsSync(legacyRawWebmPath),
+    false,
+    'Successful regeneration must clean the unambiguous legacy WebM working file',
+  );
 
-  // Case 1b: Refresh pack with changed content -> increments version to 4
+  const ctxRef1NoChange = createMockContext({
+    userId: allowedUserId,
+    args: [refreshPackName],
+    telegram: mockRefreshTelegram,
+  });
+  const handledRef1NoChange = await handleRefreshCommand(ctxRef1NoChange);
+  assert.equal(handledRef1NoChange, true);
+  assert.ok(
+    ctxRef1NoChange.replies.some(r => r.includes('Version: 4')),
+    'Identical final asset and preview hashes must not bump version',
+  );
+  const committedRefreshVersion4Manifest = await fsp.readFile(
+    refreshManifestPath,
+    'utf8',
+  );
+
+  globalThis.fetch = (async () => {
+    return new Response(changedSampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+  const ctxRefAssetChange = createMockContext({
+    userId: allowedUserId,
+    args: [refreshPackName],
+    telegram: mockRefreshTelegram,
+  });
+  const handledRefAssetChange = await handleRefreshCommand(ctxRefAssetChange);
+  assert.equal(handledRefAssetChange, true);
+  assert.ok(ctxRefAssetChange.replies.some(r => r.includes('Version: 5')));
+  const refreshVersion4 = await readStickerVersionIndex(refreshPackName, 4);
+  const refreshVersion5 = await readStickerVersionIndex(refreshPackName, 5);
+  assert.notEqual(
+    refreshVersion4?.stickers['unique-1.webp'],
+    refreshVersion5?.stickers['unique-1.webp'],
+    'Changed final bytes must bump version for the same sticker id and title',
+  );
+  assert.ok(refreshVersion5);
+  const refreshVersion5Signature = refreshVersion5.signature;
+  for (const ghostVersion of [6, 7, 8]) {
+    await writeStickerVersionIndexAtomically(refreshPackName, {
+      version: ghostVersion,
+      signature: `ghost-${ghostVersion}`,
+      stickers: {...refreshVersion5.stickers},
+      previews: {...refreshVersion5.previews},
+    });
+  }
+  await fsp.writeFile(refreshManifestPath, committedRefreshVersion4Manifest);
+  const ctxResumePending = createMockContext({
+    userId: allowedUserId,
+    args: [refreshPackName],
+    telegram: mockRefreshTelegram,
+  });
+  assert.equal(await handleRefreshCommand(ctxResumePending), true);
+  assert.ok(ctxResumePending.replies.some(r => r.includes('Version: 5')));
+  assert.equal(
+    validateLocalStickerPackManifest(
+      JSON.parse(await fsp.readFile(refreshManifestPath, 'utf8')),
+    )?.dynamic?.version,
+    5,
+    'Matching canonical pending index must complete publication',
+  );
+  assert.equal(
+    (await readStickerVersionIndex(refreshPackName, 5))?.signature,
+    refreshVersion5Signature,
+    'Matching pending index must be reused without replacement',
+  );
+  assert.deepEqual(
+    await listStickerPackVersions(refreshPackName),
+    [4, 5],
+    'Resume must remove ghost indexes above the canonical pending slot',
+  );
+
+  for (const ghostVersion of [6, 7, 8]) {
+    await writeStickerVersionIndexAtomically(refreshPackName, {
+      version: ghostVersion,
+      signature: `divergent-${ghostVersion}`,
+      stickers: {...refreshVersion5.stickers},
+      previews: {...refreshVersion5.previews},
+    });
+  }
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+  // Case 1b: Divergent pending 6 is replaced; ghosts 7 and 8 are removed
   const mockChangedRefreshTelegram = {
     getStickerSet: async (name: string) => ({
       name,
@@ -4639,7 +5657,56 @@ try {
   const handledRef1b = await handleRefreshCommand(ctxRef1b);
   assert.equal(handledRef1b, true);
   assert.ok(ctxRef1b.replies.some(r => r.includes('refreshed successfully')));
-  assert.ok(ctxRef1b.replies.some(r => r.includes('Version: 4')));
+  assert.ok(ctxRef1b.replies.some(r => r.includes('Version: 6')));
+  const refreshVersion6 = await readStickerVersionIndex(refreshPackName, 6);
+  assert.ok(refreshVersion6);
+  assert.notEqual(
+    refreshVersion6.signature,
+    'divergent-6',
+    'Divergent unpublished content must be replaced in canonical next slot',
+  );
+  assert.deepEqual(
+    await listStickerPackVersions(refreshPackName),
+    [4, 5, 6],
+    'Divergent publish must not create a version gap or retain ghost indexes',
+  );
+
+  const firstCrashPackName = 'FirstPublicationCrashPack';
+  const firstCrashPackDir = generateStickerPackDirPath(firstCrashPackName);
+  await fsp.mkdir(firstCrashPackDir, {recursive: true});
+  const firstCrashOldSource = path.join(firstCrashPackDir, 'old.webp');
+  await fsp.writeFile(firstCrashOldSource, 'old-pending-bytes');
+  const firstCrashOldAsset = await storeStickerAsset(
+    firstCrashPackName,
+    firstCrashOldSource,
+  );
+  await writeStickerVersionIndexAtomically(firstCrashPackName, {
+    version: 1,
+    signature: 'old-first-pending',
+    stickers: {'old.webp': firstCrashOldAsset},
+    previews: {},
+  });
+  const firstCrashContext = createMockContext({
+    userId: allowedUserId,
+    args: [firstCrashPackName],
+    telegram: mockRefreshTelegram,
+  });
+  assert.equal(await handleRefreshCommand(firstCrashContext), true);
+  assert.ok(firstCrashContext.replies.some(r => r.includes('Version: 1')));
+  const firstCrashManifest = validateLocalStickerPackManifest(
+    JSON.parse(
+      await fsp.readFile(
+        generateStickerPackFilePath(firstCrashPackName),
+        'utf8',
+      ),
+    ),
+  );
+  assert.equal(firstCrashManifest?.dynamic?.version, 1);
+  assert.notEqual(
+    (await readStickerVersionIndex(firstCrashPackName, 1))?.signature,
+    'old-first-pending',
+  );
+  assert.deepEqual(await listStickerPackVersions(firstCrashPackName), [1]);
 
   // Case 1c: Refresh download failure preserves previous valid manifest and metadata
   const failRefreshPackName = 'RefreshDownloadFailPack';
@@ -4864,6 +5931,20 @@ await fsp.writeFile(
   path.join(checkDir, 'previews', 'asset-1.webp'),
   Buffer.from('fake-preview'),
 );
+const checkStickerAsset = await storeStickerAsset(
+  checkPackName,
+  path.join(checkDir, 'asset-1.webp'),
+);
+const checkPreviewAsset = await storeStickerAsset(
+  checkPackName,
+  path.join(checkDir, 'previews', 'asset-1.webp'),
+);
+await writeStickerVersionIndexAtomically(checkPackName, {
+  version: 2,
+  signature: 'check-pack',
+  stickers: {'asset-1.webp': checkStickerAsset},
+  previews: {'asset-1.webp': checkPreviewAsset},
+});
 await fsp.writeFile(
   checkManifestPath,
   JSON.stringify({
@@ -5156,6 +6237,152 @@ assert.ok(
   ctxCheckMissingPreview.replies[0].includes('/refresh MissingPreviewPack'),
 );
 
+// Case 3c: Versioned sticker mapping cannot fall back to a legacy direct file
+const missingVersionedStickerPackName = 'MissingVersionedStickerPack';
+const missingVersionedStickerDir = generateStickerPackDirPath(
+  missingVersionedStickerPackName,
+);
+await fsp.mkdir(path.join(missingVersionedStickerDir, 'previews'), {
+  recursive: true,
+});
+await fsp.writeFile(
+  path.join(missingVersionedStickerDir, 'A.webp'),
+  'legacy-sticker-leftover',
+);
+const missingVersionedStickerPreviewPath = path.join(
+  missingVersionedStickerDir,
+  'previews',
+  'A.webp',
+);
+await fsp.writeFile(missingVersionedStickerPreviewPath, 'versioned-preview');
+const missingVersionedStickerPreviewAsset = await storeStickerAsset(
+  missingVersionedStickerPackName,
+  missingVersionedStickerPreviewPath,
+);
+await writeStickerVersionIndexAtomically(missingVersionedStickerPackName, {
+  version: 10,
+  signature: 'missing-sticker-mapping',
+  stickers: {},
+  previews: {'A.webp': missingVersionedStickerPreviewAsset},
+});
+await fsp.writeFile(
+  generateStickerPackFilePath(missingVersionedStickerPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${missingVersionedStickerPackName}`,
+    title: 'Missing Versioned Sticker Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${missingVersionedStickerPackName}:A`,
+        image: 'url',
+        title: 'A',
+        stickerPackId: `MoreStickers:Telegram:Pack:${missingVersionedStickerPackName}`,
+        filename: 'A.webp',
+        isAnimated: false,
+      },
+    ],
+    dynamic: {version: 10, refreshUrl: 'url'},
+  }),
+);
+const missingVersionedStickerContext = createMockContext({
+  userId: allowedUserId,
+  args: [missingVersionedStickerPackName],
+  telegram: {
+    getStickerSet: async () => ({
+      name: missingVersionedStickerPackName,
+      title: 'Missing Versioned Sticker Pack',
+      stickers: [
+        {
+          file_id: 'A',
+          file_unique_id: 'A',
+          emoji: 'A',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+  } as unknown as Telegram,
+});
+assert.equal(
+  await handleCheckCommand(missingVersionedStickerContext),
+  false,
+  '/check must not use a direct working file for a missing versioned sticker mapping',
+);
+assert.ok(
+  missingVersionedStickerContext.replies[0].includes('incomplete local cache'),
+);
+
+// Case 3d: Versioned preview mapping cannot fall back to a legacy direct file
+const missingVersionedPreviewPackName = 'MissingVersionedPreviewPack';
+const missingVersionedPreviewDir = generateStickerPackDirPath(
+  missingVersionedPreviewPackName,
+);
+await fsp.mkdir(path.join(missingVersionedPreviewDir, 'previews'), {
+  recursive: true,
+});
+const missingVersionedPreviewStickerPath = path.join(
+  missingVersionedPreviewDir,
+  'B.webp',
+);
+await fsp.writeFile(missingVersionedPreviewStickerPath, 'versioned-sticker');
+await fsp.writeFile(
+  path.join(missingVersionedPreviewDir, 'previews', 'B.webp'),
+  'legacy-preview-leftover',
+);
+const missingVersionedPreviewStickerAsset = await storeStickerAsset(
+  missingVersionedPreviewPackName,
+  missingVersionedPreviewStickerPath,
+);
+await writeStickerVersionIndexAtomically(missingVersionedPreviewPackName, {
+  version: 10,
+  signature: 'missing-preview-mapping',
+  stickers: {'B.webp': missingVersionedPreviewStickerAsset},
+  previews: {},
+});
+await fsp.writeFile(
+  generateStickerPackFilePath(missingVersionedPreviewPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${missingVersionedPreviewPackName}`,
+    title: 'Missing Versioned Preview Pack',
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${missingVersionedPreviewPackName}:B`,
+        image: 'url',
+        title: 'B',
+        stickerPackId: `MoreStickers:Telegram:Pack:${missingVersionedPreviewPackName}`,
+        filename: 'B.webp',
+        isAnimated: false,
+      },
+    ],
+    dynamic: {version: 10, refreshUrl: 'url'},
+  }),
+);
+const missingVersionedPreviewContext = createMockContext({
+  userId: allowedUserId,
+  args: [missingVersionedPreviewPackName],
+  telegram: {
+    getStickerSet: async () => ({
+      name: missingVersionedPreviewPackName,
+      title: 'Missing Versioned Preview Pack',
+      stickers: [
+        {
+          file_id: 'B',
+          file_unique_id: 'B',
+          emoji: 'B',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+  } as unknown as Telegram,
+});
+assert.equal(
+  await handleCheckCommand(missingVersionedPreviewContext),
+  false,
+  '/check must not use a direct working file for a missing versioned preview mapping',
+);
+assert.ok(
+  missingVersionedPreviewContext.replies[0].includes('incomplete local cache'),
+);
 // Case 3c: Missing filename in manifest
 const missingFilenamePackName = 'MissingFilenamePack';
 await fsp.writeFile(

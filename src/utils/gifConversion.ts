@@ -14,8 +14,8 @@ export const GIF_SAFE_HARD_LIMIT_BYTES = 9_500_000;
 export const GIF_DIMENSION_SCALE = 0.5;
 
 const BASE_GIF_ENCODING_PROFILES: GifEncodingProfile[] = [
-  {maxDimension: 384, fps: 24, maxColors: 192, bayerScale: 3},
-  {maxDimension: 320, fps: 20, maxColors: 160, bayerScale: 3},
+  {maxDimension: 320, fps: 24, maxColors: 192, bayerScale: 3},
+  {maxDimension: 304, fps: 20, maxColors: 160, bayerScale: 3},
   {maxDimension: 288, fps: 18, maxColors: 128, bayerScale: 3},
   {maxDimension: 256, fps: 15, maxColors: 128, bayerScale: 4},
   {maxDimension: 224, fps: 15, maxColors: 96, bayerScale: 4},

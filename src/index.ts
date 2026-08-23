@@ -1,11 +1,20 @@
 import {app} from './utils/fastify.js';
 import {bot} from './utils/telegram.js';
+import {initializeTelegramStickerStorage} from './utils/telegramStickers.js';
 
 const port = parseInt(process.env.PORT!);
 const host = process.env.HOST ?? '::';
 
-process.on('SIGINT', () => bot.stop('SIGINT'));
-process.on('SIGTERM', () => bot.stop('SIGTERM'));
+const stickerStorageGcTimer = await initializeTelegramStickerStorage();
+
+process.on('SIGINT', () => {
+  clearInterval(stickerStorageGcTimer);
+  bot.stop('SIGINT');
+});
+process.on('SIGTERM', () => {
+  clearInterval(stickerStorageGcTimer);
+  bot.stop('SIGTERM');
+});
 
 await Promise.all([
   app
