@@ -121,7 +121,7 @@ async function serveStickerAsset(
   if (rawVersion === undefined && version === undefined && !assetPath) {
     assetPath =
       kind === 'stickers'
-        ? path.join(DATA_DIR, stickerPackName, canonicalFilename)
+        ? path.join(DATA_DIR, stickerPackName, filename)
         : generateStickerPreviewFilePath(stickerPackName, stickerId);
   }
   if (!assetPath) {
