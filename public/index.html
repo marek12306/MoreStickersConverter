@@ -413,9 +413,19 @@ async function copyPackUrl(url) {
   const u = new URL(url || '', location.href).href;
   try {
     await navigator.clipboard.writeText(u);
+    return true;
   } catch {
     prompt('Copy URL:', u);
+    return false;
   }
+}
+
+function showCopied(button) {
+  clearTimeout(button.copyFeedbackTimer);
+  button.textContent = 'Copied!';
+  button.copyFeedbackTimer = setTimeout(() => {
+    if (button.isConnected) button.textContent = 'Copy pack URL';
+  }, 1600);
 }
 
 function render() {
@@ -424,7 +434,7 @@ function render() {
     $('#grid').innerHTML = '<div class="empty"><b>No matching packs</b>Try changing your search or filter.</div>';
     return;
   }
-  $('#grid').innerHTML = filtered.map(p => `<article class="card" tabindex="0" data-id="${esc(p.id)}"><div class="preview"><img src="${esc(p.preview)}" alt="" loading="lazy" decoding="async"></div><div class="body"><div class="row"><div class="title"><b>${esc(p.title)}</b></div><button class="copy-link" type="button" data-copy-url="${esc(p.url || '')}" title="Copy pack URL" aria-label="Copy pack URL"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button></div><div class="tags">${(p.tags || []).slice(0, 3).map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div></div></article>`).join('');
+  $('#grid').innerHTML = filtered.map(p => `<article class="card" tabindex="0" data-id="${esc(p.id)}"><div class="preview"><img src="${esc(p.preview)}" alt="" loading="lazy" decoding="async"></div><div class="body"><div class="row"><div class="title"><b>${esc(p.title)}</b></div><button class="copy-link" type="button" data-copy-url="${esc(p.url || '')}" title="Copy pack URL" aria-label="Copy pack URL"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg></button></div><div class="tags">${(p.tags || []).slice(0, 3).map(t => `<span class="tag">#${esc(t)}</span>`).join('')}</div></div></article>`).join('');
   document.querySelectorAll('.card').forEach(c => {
     const o = () => openPack(c.dataset.id);
     c.onclick = o;
@@ -467,11 +477,36 @@ async function openPack(id) {
   }
 }
 
+function stickerMarkup(sticker) {
+  const staticSrc = sticker.previewImage || sticker.image || '';
+  const animatedSrc =
+    sticker.isAnimated === true && sticker.image !== staticSrc
+      ? sticker.image
+      : '';
+  const hoverSource = animatedSrc
+    ? ` data-animated-src="${esc(animatedSrc)}"`
+    : '';
+  return `<div class="st" title="${esc(sticker.title || '')}"${hoverSource}><img src="${esc(staticSrc)}" alt="${esc(sticker.title || '')}" loading="lazy" decoding="async"></div>`;
+}
+
 function drawPack(p, m) {
   const list = m.stickers || [];
   const prev = p.preview || m.logo?.previewImage || m.logo?.image || '';
-  $('#dcontent').innerHTML = `<section class="packhero"><div class="heroimg"><img src="${esc(prev)}" alt=""></div><div class="herocopy"><h2>${esc(p.title || m.title || p.name)}</h2><p>${Number(p.stickerCount || list.length || 0)} stickers</p></div><button class="hero-copy" id="copy" type="button">Copy pack URL</button></section><div class="stickers">${list.length ? list.map(x => `<div class="st" title="${esc(x.title || '')}"><img src="${esc(x.previewImage || x.image || '')}" alt="${esc(x.title || '')}" loading="lazy" decoding="async"></div>`).join('') : '<div class="loading">No stickers available.</div>'}</div>`;
-  $('#copy').onclick = () => copyPackUrl(p.url || '');
+  $('#dcontent').innerHTML = `<section class="packhero"><div class="heroimg"><img src="${esc(prev)}" alt=""></div><div class="herocopy"><h2>${esc(p.title || m.title || p.name)}</h2><p>${Number(p.stickerCount || list.length || 0)} stickers</p></div><button class="hero-copy" id="copy" type="button" aria-live="polite">Copy pack URL</button></section><div class="stickers">${list.length ? list.map(stickerMarkup).join('') : '<div class="loading">No stickers available.</div>'}</div>`;
+  const copyButton = $('#copy');
+  copyButton.onclick = async () => {
+    if (await copyPackUrl(p.url || '')) showCopied(copyButton);
+  };
+  document.querySelectorAll('.st[data-animated-src]').forEach(sticker => {
+    const image = sticker.querySelector('img');
+    const staticSrc = image.src;
+    sticker.onmouseenter = () => {
+      image.src = sticker.dataset.animatedSrc;
+    };
+    sticker.onmouseleave = () => {
+      image.src = staticSrc;
+    };
+  });
 }
 
 function close() {
