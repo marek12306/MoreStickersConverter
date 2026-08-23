@@ -13,9 +13,9 @@
 The fork supports all common Telegram sticker formats:
 
 * Static **WebP** stickers are preserved as-is.
-* Video stickers in **WebM** format are converted to animated **GIFs**.
-* Animated **TGS** stickers are also converted to animated **GIFs**.
-* GIFs are automatically compressed to stay within practical upload limits.
+* Video stickers in **WebM** format are converted to animated **AVIF**.
+* Animated **TGS** stickers are rendered losslessly to frames and encoded as animated **AVIF**.
+* Animated AVIF uses quality-first AV1 encoding with a hard 5 MiB limit; existing GIF assets remain supported.
 * Previews are generated automatically for both static and animated stickers.
 
 ### Hosted and refreshable sticker packs
@@ -108,7 +108,7 @@ Failed Telegram downloads are retried automatically, and download handling has b
 
 Previously generated packs are reused when possible.
 
-Older cached packs using outdated WebM/TGS handling are detected automatically and regenerated using the current GIF-based format, while compatible WebP/GIF caches remain valid.
+Older raw WebM/TGS caches are regenerated as animated AVIF when refreshed, while compatible historical WebP/GIF data and immutable GIF versions remain valid.
 
 ### Safer and more robust server
 
@@ -160,7 +160,7 @@ This project includes both the Telegram bot logic and the HTTP server used to ho
 
 * Receive Telegram stickers from users (static WebP, animated TGS, and video WebM)
 * Automatically download sticker assets
-* Server-side conversion of Telegram WebM video stickers and Telegram TGS stickers to final animated GIFs, with adaptive compression targeting ~5 MB and a hard limit below 10 MB
+* Server-side conversion of Telegram WebM video stickers and Telegram TGS stickers to final animated AVIF (AV1, 10-bit color, preserved alpha), with a quality ladder and a hard 5 MiB limit
 * Keep static Telegram WebP stickers as WebP
 * Convert stickers into `.stickerpack` format
 * Host sticker images through the built-in HTTP server
@@ -205,6 +205,6 @@ You can build the image locally or use the prebuilt image from `ghcr.io/lekoowo/
 
 ## Notes
 
-* **Animated stickers & runtime tools**: Telegram WebM stickers are converted server-side to animated GIF with FFmpeg; Telegram TGS stickers are converted to animated GIF with `lottieconverter`. Both FFmpeg and `lottieconverter` are required runtime dependencies and included in the Docker image.
+* **Animated stickers & runtime tools**: Telegram WebM stickers are converted server-side to animated AVIF with FFmpeg/libaom-av1. Telegram TGS stickers are rendered by `lottieconverter` to lossless PNG frames before FFmpeg encodes AVIF. Both tools are required runtime dependencies and included in the Docker image; historical GIF assets remain served for compatibility.
 * Since stickerpacks rely on externally hosted images, make sure your server's external URL is reachable.
 * If using a reverse proxy, ensure that HTTPS is properly configured to avoid client-side loading errors.

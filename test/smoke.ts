@@ -16,37 +16,41 @@ process.env.EXTERNAL_URL = 'https://stickers.example.com';
 process.env.BOT_TOKEN = '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11';
 process.env.ALLOWED_TELEGRAM_USER_IDS = '123456789,987654321';
 process.env.PORT = '3000';
-import type {GifEncoder} from '../src/utils/webmToGif.js';
+import type {AvifEncoder} from '../src/utils/webmToAvif.js';
 import type {Telegram} from 'telegraf';
 const {
-  buildFfmpegFilter,
-  convertWebmToGif,
-  convertWebmToGifWithEncoder,
-  GIF_DIMENSION_SCALE,
-  GIF_ENCODING_PROFILES,
-  GIF_TARGET_BYTES,
-  GIF_SAFE_HARD_LIMIT_BYTES,
-} = await import('../src/utils/webmToGif.js');
-const {TGS_GIF_ENCODING_PROFILES} = await import(
-  '../src/utils/gifConversion.js'
-);
+  buildAlphaFfmpegArgs,
+  buildAvifFilter,
+  buildAvifMuxArgs,
+  buildColorFfmpegArgs,
+  buildWebmFfmpegInputArgs,
+  convertWebmToAvif,
+  convertWebmToAvifWithEncoder,
+  validateAnimatedAvif,
+  AVIF_ENCODING_PROFILES,
+  AVIF_HARD_LIMIT_BYTES,
+} = await import('../src/utils/webmToAvif.js');
 const {
-  convertTgsToGif,
-  convertTgsToGifWithEncoder,
+  buildTgsFfmpegInputArgs,
+  convertTgsToAvif,
+  convertTgsToAvifWithEncoder,
   normalizeLottieJsonForConverter,
   prepareTgsForLottieConverter,
-} = await import('../src/utils/tgsToGif.js');
+} = await import('../src/utils/tgsToAvif.js');
 const {
   buildPreviewFilter,
+  buildPreviewFfmpegArgs,
   generatePreview,
   generatePreviewWithEncoder,
   PREVIEW_TARGET_BYTES,
   PREVIEW_MAX_BYTES,
   PREVIEW_PROFILES,
 } = await import('../src/utils/stickerPreview.js');
+const {runMediaProcess} = await import('../src/utils/mediaProcess.js');
 const {
   DATA_DIR,
   isLegacyStickerPack,
+  downloadStickerPack,
   isStickerPackDownloaded,
   generateStickerPackDirPath,
   generateStickerPackFilePath,
@@ -116,21 +120,17 @@ const {app} = await import('../src/utils/fastify.js');
 
 console.log('--- Starting Smoke Tests in Nix Environment ---');
 
-assert.equal(GIF_DIMENSION_SCALE, 0.5, 'GIF dimension scale must be 0.5');
 assert.deepEqual(
-  GIF_ENCODING_PROFILES.map(profile => profile.maxDimension),
-  [160, 152, 144, 128, 112, 96, 80, 64, 48, 40],
-  'GIF profiles must use half-size output dimensions',
-);
-assert.deepEqual(
-  TGS_GIF_ENCODING_PROFILES.map(profile => profile.maxDimension),
-  GIF_ENCODING_PROFILES.map(profile => profile.maxDimension),
-  'TGS and WebM GIF profiles must use the same scaled dimensions',
-);
-assert.equal(
-  TGS_GIF_ENCODING_PROFILES.length,
-  GIF_ENCODING_PROFILES.length,
-  'TGS and WebM GIF profile lists must have matching lengths',
+  AVIF_ENCODING_PROFILES,
+  [
+    {maxDimension: 160, fps: 24, crf: 24, cpuUsed: 3},
+    {maxDimension: 160, fps: 24, crf: 28, cpuUsed: 3},
+    {maxDimension: 160, fps: 24, crf: 32, cpuUsed: 3},
+    {maxDimension: 160, fps: 24, crf: 36, cpuUsed: 3},
+    {maxDimension: 160, fps: 20, crf: 36, cpuUsed: 3},
+    {maxDimension: 160, fps: 16, crf: 36, cpuUsed: 3},
+  ],
+  'AVIF profiles must exhaust 24 fps quality before FPS fallbacks',
 );
 assert.equal(
   PREVIEW_TARGET_BYTES,
@@ -158,41 +158,56 @@ assert.ok(
   firstPreviewFilter.includes('min(96,ih)'),
   `Expected preview filter to use max dimension 96, got ${firstPreviewFilter}`,
 );
-assert.deepEqual(
-  GIF_ENCODING_PROFILES.map(profile => profile.fps),
-  [24, 20, 18, 15, 15, 12, 10, 8, 6, 5],
-  'WebM GIF profiles must retain their baseline FPS values',
+const previewAvifArgs = buildPreviewFfmpegArgs(
+  'input.avif',
+  'preview.webp',
+  PREVIEW_PROFILES[0],
+  {colorStreamIndex: 2, alphaStreamIndex: 3},
 );
+assert.ok(previewAvifArgs.some(arg => arg.includes('[0:2][0:3]alphamerge')));
+assert.ok(previewAvifArgs.some(arg => arg.includes('premultiply=inplace=1')));
+assert.ok(previewAvifArgs.some(arg => arg.includes('unpremultiply=inplace=1')));
 assert.deepEqual(
-  TGS_GIF_ENCODING_PROFILES.map(profile => profile.fps),
-  [20, 20, 20, 10, 10, 10, 10, 5, 5, 5],
-  'TGS GIF profiles must use timing-safe FPS values',
+  previewAvifArgs.slice(
+    previewAvifArgs.indexOf('-filter_complex_threads'),
+    previewAvifArgs.indexOf('-filter_complex_threads') + 2,
+  ),
+  ['-filter_complex_threads', '1'],
 );
-for (const profile of TGS_GIF_ENCODING_PROFILES) {
-  assert.equal(
-    100 % profile.fps,
-    0,
-    `TGS FPS ${profile.fps} must divide GIF's 100 Hz delay base`,
-  );
-  assert.equal(
-    60 % profile.fps,
-    0,
-    `TGS FPS ${profile.fps} must divide Telegram's 60 FPS source`,
-  );
-}
-
-const firstWebmProfile = GIF_ENCODING_PROFILES[0];
+assert.equal(
+  previewAvifArgs.filter(
+    (value, index) =>
+      value === '-threads' && previewAvifArgs[index + 1] === '1',
+  ).length,
+  2,
+  'Preview decoder and encoder must each receive threads=1',
+);
+await assert.rejects(
+  runMediaProcess(
+    process.execPath,
+    ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+    'hung child timeout test',
+    {timeoutMs: 50, killGraceMs: 50},
+  ),
+  /timed out/,
+);
+const firstWebmProfile = AVIF_ENCODING_PROFILES[0];
 assert.equal(firstWebmProfile.maxDimension, 160);
-const firstWebmFilter = buildFfmpegFilter(firstWebmProfile);
+const firstWebmFilter = buildAvifFilter(firstWebmProfile, 'color');
 assert.ok(
   firstWebmFilter.includes('min(160,iw)'),
-  `Expected WebM filter to use scaled max dimension 160, got ${firstWebmFilter}`,
+  `Expected WebM filter to use max dimension 160, got ${firstWebmFilter}`,
 );
 assert.ok(
   firstWebmFilter.includes('min(160,ih)'),
-  `Expected WebM filter to use scaled max dimension 160, got ${firstWebmFilter}`,
+  `Expected WebM filter to use max dimension 160, got ${firstWebmFilter}`,
 );
-
+assert.ok(
+  firstWebmFilter.includes('yuv420p10le'),
+  `Expected ten-bit 4:2:0 color, got ${firstWebmFilter}`,
+);
+assert.ok(firstWebmFilter.includes('premultiply=inplace=1'));
+assert.ok(firstWebmFilter.includes('unpremultiply=inplace=1'));
 // Test 0.9: Concurrency configuration parser
 console.log('Testing parseDownloadConcurrency...');
 assert.equal(parseDownloadConcurrency(undefined), 5);
@@ -247,7 +262,11 @@ const infoA = getStickerMediaInfo(
   'webm',
 );
 assert.equal(infoA.isVideoSticker, true, 'Case A: isVideoSticker must be true');
-assert.equal(infoA.outputFileType, 'gif', 'Case A: outputFileType must be gif');
+assert.equal(
+  infoA.outputFileType,
+  'avif',
+  'Case A: outputFileType must be avif',
+);
 assert.equal(infoA.isAnimated, true, 'Case A: isAnimated must be true');
 
 // Case B: fallback when is_video = false but source extension is webm
@@ -271,8 +290,8 @@ assert.equal(
 );
 assert.equal(
   infoB.outputFileType,
-  'gif',
-  'Case B: outputFileType must be gif for .webm fallback',
+  'avif',
+  'Case B: outputFileType must be avif for .webm fallback',
 );
 assert.equal(
   infoB.isAnimated,
@@ -330,7 +349,11 @@ assert.equal(
   'Case D: isVideoSticker must be false for tgs',
 );
 assert.equal(infoD.isTgsSticker, true, 'Case D: isTgsSticker must be true');
-assert.equal(infoD.outputFileType, 'gif', 'Case D: outputFileType must be gif');
+assert.equal(
+  infoD.outputFileType,
+  'avif',
+  'Case D: outputFileType must be avif',
+);
 assert.equal(infoD.isAnimated, true, 'Case D: isAnimated must be true for tgs');
 
 // Case E: fallback when is_animated = false but source extension is tgs
@@ -354,8 +377,8 @@ assert.equal(
 );
 assert.equal(
   infoE.outputFileType,
-  'gif',
-  'Case E: outputFileType must be gif for .tgs fallback',
+  'avif',
+  'Case E: outputFileType must be avif for .tgs fallback',
 );
 assert.equal(
   infoE.isAnimated,
@@ -473,10 +496,10 @@ assert.equal(
 );
 
 for (const sticker of [manifestWebm, manifestTgs]) {
-  assert.ok(sticker.filename?.endsWith('.gif'));
+  assert.ok(sticker.filename?.endsWith('.avif'));
   assert.equal(sticker.filename?.includes('-160'), false);
   assert.ok(sticker.image.includes(`/${manifest.dynamic?.version}/`));
-  assert.ok(sticker.image.endsWith('.gif'));
+  assert.ok(sticker.image.endsWith('.avif'));
   assert.equal(sticker.isAnimated, true);
   assert.equal(sticker.readyToUpload, true);
 }
@@ -559,7 +582,7 @@ assert.equal(
   'Serialized manifest must contain the dynamic property',
 );
 console.log(
-  'Verified: Telegram manifests expose final GIFs, static WebP, and WebP previews',
+  'Verified: Telegram manifests expose final AVIFs, static WebP, and WebP previews',
 );
 
 // Test 1.x: dynamic version lifecycle (resolveStickerPackVersion contract)
@@ -1013,18 +1036,38 @@ await assert.rejects(
 );
 console.log('Verified: pipeline propagates stream errors correctly');
 
-// Test 4: Generate WebM with VP9 + Alpha + Opaque Box and verify conversion
+// Test 4: Generate WebM with VP9 alpha and verify animated AVIF conversion.
 console.log('Generating test VP9 WebM with alpha transparency...');
 const testWebmPath = path.join(tempDir, 'sample_alpha_sticker.webm');
-const testGifPath = path.join(tempDir, 'sample_alpha_sticker.gif');
+const testAvifPath = path.join(tempDir, 'sample_alpha_sticker.avif');
+
+const libaomHelp = spawnSync(
+  'ffmpeg',
+  ['-hide_banner', '-h', 'encoder=libaom-av1'],
+  {encoding: 'utf8'},
+);
+assert.equal(libaomHelp.status, 0, 'libaom-av1 encoder probe failed');
+assert.match(libaomHelp.stdout, /yuv420p10le/);
+assert.match(libaomHelp.stdout, /gray10le/);
+assert.match(libaomHelp.stdout, /-row-mt/);
+const avifMuxerHelp = spawnSync(
+  'ffmpeg',
+  ['-hide_banner', '-h', 'muxer=avif'],
+  {encoding: 'utf8'},
+);
+assert.equal(avifMuxerHelp.status, 0, 'AVIF muxer probe failed');
+assert.match(avifMuxerHelp.stdout, /Mime type: image\/avif/);
+assert.match(avifMuxerHelp.stdout, /-loop/);
 
 const genResult = spawnSync('ffmpeg', [
   '-f',
   'lavfi',
   '-i',
-  'color=c=black@0.0:size=512x512:duration=2:rate=30,format=rgba,drawbox=x=100:y=100:w=200:h=200:color=red:t=fill:replace=1,format=yuva420p',
+  'color=c=black@0.0:size=512x512:duration=2:rate=30,format=rgba,drawbox=x=100:y=100:w=200:h=200:color=red@1.0:t=fill:replace=1,drawbox=x=350:y=200:w=100:h=100:color=blue@0.5:t=fill:replace=1,format=yuva420p',
   '-c:v',
   'libvpx-vp9',
+  '-lossless',
+  '1',
   '-auto-alt-ref',
   '0',
   '-pix_fmt',
@@ -1039,121 +1082,201 @@ assert.equal(
 );
 assert.ok(fs.existsSync(testWebmPath), 'Test WebM file does not exist');
 
-console.log('Testing convertWebmToGif with libvpx-vp9 input decoding...');
-const conversionResult = await convertWebmToGif(testWebmPath, testGifPath);
+for (const args of [
+  buildColorFfmpegArgs(['-i', 'input.webm'], 'color.ivf', firstWebmProfile),
+  buildAlphaFfmpegArgs(['-i', 'input.webm'], 'alpha.ivf', firstWebmProfile),
+]) {
+  assert.deepEqual(
+    args.slice(args.indexOf('-threads'), args.indexOf('-threads') + 2),
+    ['-threads', '1'],
+  );
+  assert.deepEqual(
+    args.slice(args.indexOf('-row-mt'), args.indexOf('-row-mt') + 2),
+    ['-row-mt', '0'],
+  );
+  assert.deepEqual(
+    args.slice(args.indexOf('-tiles'), args.indexOf('-tiles') + 2),
+    ['-tiles', '1x1'],
+  );
+  assert.equal(args.includes('row-mt=1'), false);
+}
+const alphaArgs = buildAlphaFfmpegArgs(
+  ['-i', 'input.webm'],
+  'alpha.ivf',
+  firstWebmProfile,
+);
+assert.deepEqual(
+  alphaArgs.slice(alphaArgs.indexOf('-crf'), alphaArgs.indexOf('-crf') + 2),
+  ['-crf', '0'],
+);
+assert.deepEqual(
+  alphaArgs.slice(
+    alphaArgs.indexOf('-aom-params'),
+    alphaArgs.indexOf('-aom-params') + 2,
+  ),
+  ['-aom-params', 'lossless=1'],
+);
+const muxArgs = buildAvifMuxArgs('color.ivf', 'alpha.ivf', 'output.avif');
+assert.deepEqual(
+  muxArgs.slice(muxArgs.indexOf('-loop'), muxArgs.indexOf('-loop') + 2),
+  ['-loop', '0'],
+);
+for (const inputArgs of [
+  buildWebmFfmpegInputArgs('input.webm'),
+  buildTgsFfmpegInputArgs('frame-%02d.png'),
+]) {
+  const inputIndex = inputArgs.indexOf('-i');
+  assert.ok(inputIndex > 1);
+  assert.deepEqual(inputArgs.slice(inputIndex - 2, inputIndex), [
+    '-threads',
+    '1',
+  ]);
+}
 
+console.log('Testing convertWebmToAvif with libvpx-vp9 alpha decoding...');
+const conversionResult = await convertWebmToAvif(testWebmPath, testAvifPath);
+assert.ok(fs.existsSync(testAvifPath), 'Output AVIF file was not created');
+assert.ok(
+  conversionResult.sizeBytes <= AVIF_HARD_LIMIT_BYTES,
+  `Output AVIF size (${conversionResult.sizeBytes}) exceeds ${AVIF_HARD_LIMIT_BYTES}`,
+);
+assert.equal(conversionResult.profileIndex, 0);
+assert.deepEqual(conversionResult.profile, firstWebmProfile);
+
+const avifProbe = await validateAnimatedAvif(
+  testAvifPath,
+  conversionResult.profile,
+);
+assert.ok(
+  avifProbe.colorStreamIndex > 0,
+  'Validation must select the animated sequence, not primary image stream 0',
+);
+assert.ok(
+  avifProbe.alphaStreamIndex > avifProbe.colorStreamIndex,
+  'Animated AVIF must expose a separate alpha sequence',
+);
+assert.ok(avifProbe.frameCount > 1, 'AVIF must contain multiple frames');
+assert.equal(avifProbe.colorPixelFormat, 'yuv420p10le');
+assert.equal(avifProbe.alphaPixelFormat, 'gray10le');
+assert.ok(avifProbe.width <= 160 && avifProbe.height <= 160);
+assert.ok(avifProbe.durationSeconds <= 3);
+assert.equal(avifProbe.fps, 24);
+const fakeAvifContainerPath = path.join(tempDir, 'fake-container.avif');
+const fakeAvifContainerResult = spawnSync('ffmpeg', [
+  '-v',
+  'error',
+  '-i',
+  testAvifPath,
+  '-map',
+  `0:${avifProbe.colorStreamIndex}`,
+  '-map',
+  `0:${avifProbe.alphaStreamIndex}`,
+  '-c',
+  'copy',
+  '-f',
+  'matroska',
+  '-y',
+  fakeAvifContainerPath,
+]);
+assert.equal(fakeAvifContainerResult.status, 0);
+await assert.rejects(
+  validateAnimatedAvif(fakeAvifContainerPath, conversionResult.profile),
+  /invalid container/,
+);
+
+const readAvifAlphaPixel = (x: number, y: number): number => {
+  const result = spawnSync('ffmpeg', [
+    '-v',
+    'error',
+    '-i',
+    testAvifPath,
+    '-map',
+    `0:${avifProbe.alphaStreamIndex}`,
+    '-vf',
+    `select=eq(n\\,0),crop=1:1:${x}:${y},format=gray10le`,
+    '-frames:v',
+    '1',
+    '-f',
+    'rawvideo',
+    'pipe:1',
+  ]);
+  assert.equal(
+    result.status,
+    0,
+    `FFmpeg alpha extraction failed at (${x},${y})`,
+  );
+  assert.equal(result.stdout.length, 2, 'Expected one 16-bit alpha sample');
+  return result.stdout.readUInt16LE(0);
+};
+assert.equal(readAvifAlphaPixel(0, 0), 0, 'Transparent alpha must remain zero');
+assert.equal(
+  readAvifAlphaPixel(
+    Math.floor(avifProbe.width / 2),
+    Math.floor(avifProbe.height / 2),
+  ),
+  1023,
+  'Opaque alpha must remain fully opaque',
+);
+const semiAlpha = readAvifAlphaPixel(
+  Math.floor(avifProbe.width * 0.78),
+  Math.floor(avifProbe.height * 0.49),
+);
+assert.ok(
+  semiAlpha >= 500 && semiAlpha <= 520,
+  `Half-transparent alpha must remain near 50%, got ${semiAlpha}`,
+);
 console.log('Conversion result:', {
-  outputPath: conversionResult.outputPath,
-  sizeBytes: conversionResult.sizeBytes,
-  profile: conversionResult.profile,
-  profileIndex: conversionResult.profileIndex,
+  ...conversionResult,
+  probe: avifProbe,
+  semiAlpha,
 });
-
-assert.ok(fs.existsSync(testGifPath), 'Output GIF file was not created');
-assert.ok(
-  conversionResult.sizeBytes <= GIF_TARGET_BYTES,
-  `Output GIF size (${conversionResult.sizeBytes}) exceeds target (${GIF_TARGET_BYTES})`,
-);
-assert.ok(
-  conversionResult.sizeBytes <= GIF_SAFE_HARD_LIMIT_BYTES,
-  `Output GIF size (${conversionResult.sizeBytes}) exceeds safe limit (${GIF_SAFE_HARD_LIMIT_BYTES})`,
-);
-
-// Verify GIF properties with ffprobe
-const probeResult = spawnSync('ffprobe', [
-  '-v',
-  'error',
-  '-select_streams',
-  'v:0',
-  '-show_entries',
-  'stream=codec_name,width,height,nb_read_frames',
-  '-count_frames',
-  '-of',
-  'json',
-  testGifPath,
-]);
-assert.equal(probeResult.status, 0, 'ffprobe failed on generated GIF');
-const probeData = JSON.parse(probeResult.stdout.toString('utf8'));
-const stream = probeData.streams[0];
-assert.equal(stream.codec_name, 'gif', 'Output file is not GIF codec');
-const webmOutputWidth = Number(stream.width);
-const webmOutputHeight = Number(stream.height);
-assert.ok(
-  webmOutputWidth <= conversionResult.profile.maxDimension,
-  `WebM GIF width (${webmOutputWidth}) exceeds profile limit (${conversionResult.profile.maxDimension})`,
-);
-assert.ok(
-  webmOutputHeight <= conversionResult.profile.maxDimension,
-  `WebM GIF height (${webmOutputHeight}) exceeds profile limit (${conversionResult.profile.maxDimension})`,
-);
-assert.ok(
-  conversionResult.profile.maxDimension <= 160,
-  `WebM GIF profile limit (${conversionResult.profile.maxDimension}) exceeds 160 px`,
-);
-assert.ok(
-  Number(stream.nb_read_frames) > 1,
-  `GIF must be animated with multiple frames, got: ${stream.nb_read_frames}`,
-);
-// Verify Pixel (0,0) is Transparent (alpha = 0)
-const transparentPixelResult = spawnSync('ffmpeg', [
-  '-v',
-  'error',
-  '-i',
-  testGifPath,
-  '-vf',
-  'select=eq(n\\,0),format=rgba,crop=1:1:0:0',
-  '-frames:v',
-  '1',
+const smallLongWebmPath = path.join(tempDir, 'small_long.webm');
+const smallLongAvifPath = path.join(tempDir, 'small_long.avif');
+const smallLongGeneration = spawnSync('ffmpeg', [
   '-f',
-  'rawvideo',
-  '-pix_fmt',
-  'rgba',
-  'pipe:1',
-]);
-assert.equal(
-  transparentPixelResult.status,
-  0,
-  'FFmpeg pixel extraction failed at (0,0)',
-);
-assert.equal(transparentPixelResult.stdout.length, 4, 'Expected 4 bytes RGBA');
-assert.equal(
-  transparentPixelResult.stdout[3],
-  0,
-  `Expected alpha = 0 at transparent corner (0,0), got ${transparentPixelResult.stdout[3]}`,
-);
-
-const centerX = Math.floor(webmOutputWidth / 2);
-const centerY = Math.floor(webmOutputHeight / 2);
-// Verify Pixel (centerX,centerY) is Opaque Red (alpha = 255)
-const opaquePixelResult = spawnSync('ffmpeg', [
-  '-v',
-  'error',
+  'lavfi',
   '-i',
-  testGifPath,
-  '-vf',
-  `select=eq(n\\,0),format=rgba,crop=1:1:${centerX}:${centerY}`,
-  '-frames:v',
-  '1',
-  '-f',
-  'rawvideo',
-  '-pix_fmt',
-  'rgba',
-  'pipe:1',
+  'testsrc2=size=64x48:rate=30',
+  '-t',
+  '4',
+  '-c:v',
+  'libvpx-vp9',
+  '-crf',
+  '24',
+  '-b:v',
+  '0',
+  '-y',
+  smallLongWebmPath,
 ]);
-assert.equal(
-  opaquePixelResult.status,
-  0,
-  `FFmpeg pixel extraction failed at (${centerX},${centerY})`,
+assert.equal(smallLongGeneration.status, 0);
+const smallLongResult = await convertWebmToAvif(
+  smallLongWebmPath,
+  smallLongAvifPath,
 );
-assert.equal(opaquePixelResult.stdout.length, 4, 'Expected 4 bytes RGBA');
-assert.equal(
-  opaquePixelResult.stdout[3],
-  255,
-  `Expected alpha = 255 at opaque center (${centerX},${centerY}), got ${opaquePixelResult.stdout[3]}`,
+const smallLongProbe = await validateAnimatedAvif(
+  smallLongAvifPath,
+  smallLongResult.profile,
 );
-console.log(
-  `Verified GIF: codec=${stream.codec_name}, dimensions=${stream.width}x${stream.height}, frames=${stream.nb_read_frames}, transparent pixel alpha=0, opaque pixel alpha=255`,
+assert.ok(
+  smallLongProbe.width <= 64 && smallLongProbe.height <= 48,
+  `Small sticker must not be upscaled, got ${smallLongProbe.width}x${smallLongProbe.height}`,
 );
+assert.ok(smallLongProbe.durationSeconds <= 3);
+assert.ok(smallLongProbe.frameCount <= 3 * smallLongProbe.fps);
+const testGifPath = path.join(tempDir, 'legacy_alpha_sticker.gif');
+const legacyGifResult = spawnSync('ffmpeg', [
+  '-c:v',
+  'libvpx-vp9',
+  '-i',
+  testWebmPath,
+  '-filter_complex',
+  'fps=20,scale=160:160:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=192:reserve_transparent=1:transparency_color=000000[p];[s1][p]paletteuse=alpha_threshold=128',
+  '-loop',
+  '0',
+  '-y',
+  testGifPath,
+]);
+assert.equal(legacyGifResult.status, 0, 'Failed to create legacy GIF fixture');
 
 // Verify no leftover candidate files exist
 const tempFiles = await fsp.readdir(tempDir);
@@ -1189,10 +1312,10 @@ if (lottieConverterUnavailable) {
     undefined,
     'lottieconverter probe must not fail before the integration test',
   );
-  console.log('Testing real TGS to GIF conversion with lottieconverter...');
+  console.log('Testing real TGS to animated AVIF conversion...');
   const tgsIntegrationDir = await fsp.mkdtemp(path.join(tempDir, 'tgs-real-'));
   const inputTgsPath = path.join(tgsIntegrationDir, 'fixture.tgs');
-  const outputTgsGifPath = path.join(tgsIntegrationDir, 'fixture.gif');
+  const outputTgsAvifPath = path.join(tgsIntegrationDir, 'fixture.avif');
   const lottieJson = JSON.stringify({
     v: '5.7.4',
     fr: 60,
@@ -1291,245 +1414,91 @@ if (lottieConverterUnavailable) {
     `Telegram TGS fixture must be <= 64 KB, got ${tgsData.length}`,
   );
   await fsp.writeFile(inputTgsPath, tgsData);
-  console.log(
-    'Testing normalized lottieconverter execution at 20, 10, 5 FPS using production helper...',
-  );
-  const normalizedInputPath = await prepareTgsForLottieConverter(inputTgsPath);
 
-  const expectedNormalized = new Map([
-    [20, {frames: 20, duration: 1}],
-    [10, {frames: 10, duration: 1}],
-    [5, {frames: 5, duration: 1}],
-  ]);
+  const tgsResult = await convertTgsToAvif(inputTgsPath, outputTgsAvifPath);
+  assert.ok(fs.existsSync(outputTgsAvifPath), 'TGS output AVIF must exist');
+  assert.ok(tgsResult.sizeBytes <= AVIF_HARD_LIMIT_BYTES);
+  assert.equal(tgsResult.profileIndex, 0);
+  assert.equal(tgsResult.profile.fps, 24);
+  const tgsProbe = await validateAnimatedAvif(
+    outputTgsAvifPath,
+    tgsResult.profile,
+  );
+  assert.equal(tgsProbe.frameCount, 24);
+  assert.ok(Math.abs(tgsProbe.durationSeconds - 1) <= 0.02);
+  assert.ok(tgsProbe.width <= 160 && tgsProbe.height <= 160);
+  console.log('TGS conversion result:', {
+    sizeBytes: tgsResult.sizeBytes,
+    profile: tgsResult.profile,
+    profileIndex: tgsResult.profileIndex,
+    probe: tgsProbe,
+  });
 
-  try {
-    for (const fps of [20, 10, 5]) {
-      const expected = expectedNormalized.get(fps);
-      assert.ok(expected);
-      const normOutPath = path.join(
-        tgsIntegrationDir,
-        `fixture-norm-${fps}.gif`,
-      );
-      const normConv = spawnSync(
-        'lottieconverter',
-        [
-          normalizedInputPath,
-          normOutPath,
-          'gif',
-          `${GIF_ENCODING_PROFILES[0].maxDimension}x${GIF_ENCODING_PROFILES[0].maxDimension}`,
-          String(fps),
-        ],
-        {encoding: 'utf8'},
-      );
-      assert.equal(
-        normConv.status,
-        0,
-        `lottieconverter failed for normalized ${fps} FPS`,
-      );
-      const probe = spawnSync(
-        'ffprobe',
-        [
-          '-v',
-          'error',
-          '-select_streams',
-          'v:0',
-          '-count_frames',
-          '-show_entries',
-          'stream=codec_name,width,height,nb_read_frames:format=duration',
-          '-of',
-          'json',
-          normOutPath,
-        ],
-        {encoding: 'utf8'},
-      );
-      assert.equal(
-        probe.status,
-        0,
-        `ffprobe failed for normalized ${fps} FPS GIF`,
-      );
-      const info = JSON.parse(probe.stdout);
-      assert.equal(
-        info.streams[0].codec_name,
-        'gif',
-        `Normalized ${fps} FPS output must use GIF codec`,
-      );
-      const normFrameCount = Number(info.streams[0].nb_read_frames);
-      const normDuration = Number(info.format.duration);
-      assert.equal(
-        normFrameCount,
-        expected.frames,
-        `Normalized ${fps} FPS GIF must have ${expected.frames} frames, got ${normFrameCount}`,
-      );
-      assert.ok(
-        Number.isFinite(normDuration),
-        `Normalized ${fps} FPS duration must be finite`,
-      );
-      assert.ok(
-        Math.abs(normDuration - expected.duration) <= 0.02,
-        `Normalized ${fps} FPS GIF must preserve 1s duration, got ${normDuration}s`,
-      );
-    }
-  } finally {
-    await fsp.unlink(normalizedInputPath).catch(err => {
-      if (err.code !== 'ENOENT') throw err;
-    });
-  }
-
-  const tgsResult = await convertTgsToGif(inputTgsPath, outputTgsGifPath);
-  assert.ok(fs.existsSync(outputTgsGifPath), 'TGS output GIF must exist');
-  assert.ok(
-    tgsResult.sizeBytes <= GIF_SAFE_HARD_LIMIT_BYTES,
-    'TGS output GIF must be within the safe size limit',
-  );
-
-  const tgsProbeResult = spawnSync(
-    'ffprobe',
-    [
-      '-v',
-      'error',
-      '-select_streams',
-      'v:0',
-      '-count_frames',
-      '-show_entries',
-      'stream=codec_name,width,height,nb_read_frames:format=duration',
-      '-of',
-      'json',
-      outputTgsGifPath,
-    ],
-    {encoding: 'utf8'},
-  );
-  assert.equal(tgsProbeResult.status, 0, 'ffprobe failed on TGS GIF');
-  const tgsProbe = JSON.parse(tgsProbeResult.stdout);
-  const tgsStream = tgsProbe.streams[0];
-  const outputDuration = Number(tgsProbe.format.duration);
-  assert.ok(
-    Number.isFinite(outputDuration),
-    `TGS GIF duration must be finite, got ${tgsProbe.format.duration}`,
-  );
-  assert.ok(
-    Math.abs(outputDuration - 1) <= 0.02,
-    `TGS GIF must preserve 1 second source duration, got ${outputDuration}s`,
-  );
-  assert.equal(tgsStream.codec_name, 'gif', 'TGS output must use GIF codec');
-  const outputWidth = Number(tgsStream.width);
-  const outputHeight = Number(tgsStream.height);
-  assert.ok(outputWidth > 0, 'TGS GIF width must be positive');
-  assert.ok(outputHeight > 0, 'TGS GIF height must be positive');
-  assert.ok(
-    outputWidth <= tgsResult.profile.maxDimension,
-    `TGS GIF width (${outputWidth}) must be <= profile maxDimension (${tgsResult.profile.maxDimension})`,
-  );
-  assert.ok(
-    outputHeight <= tgsResult.profile.maxDimension,
-    `TGS GIF height (${outputHeight}) must be <= profile maxDimension (${tgsResult.profile.maxDimension})`,
-  );
-  assert.ok(
-    Number(tgsStream.nb_read_frames) > 1,
-    `TGS GIF must contain multiple frames, got ${tgsStream.nb_read_frames}`,
-  );
-  const frameCount = Number(tgsStream.nb_read_frames);
-  assert.equal(
-    frameCount,
-    20,
-    `Production adaptive TGS GIF must contain exactly 20 frames for 1s 20 FPS profile, got ${frameCount}`,
-  );
-  assert.equal(tgsResult.profileIndex, 0, 'Fixture must select profile 0');
-  assert.equal(tgsResult.profile.fps, 20, 'Fixture must select 20 FPS profile');
-  const firstFrameIndex = 0;
-  const middleFrameIndex = Math.floor(frameCount / 2);
-  const lastFrameIndex = frameCount - 1;
-  const transparentX = outputWidth - 1;
-  const transparentY = outputHeight - 1;
-  const animationProbeX = Math.floor(outputWidth * 0.25);
-  const animationProbeY = Math.floor(outputHeight * 0.5);
-  const readGifPixelAlpha = (
-    gifPath: string,
-    frameIndex: number,
-    x: number,
-    y: number,
-  ): number => {
+  const readTgsAlpha = (frameIndex: number, x: number, y: number): number => {
     const result = spawnSync('ffmpeg', [
       '-v',
       'error',
       '-i',
-      gifPath,
+      outputTgsAvifPath,
+      '-map',
+      `0:${tgsProbe.alphaStreamIndex}`,
       '-vf',
-      `select=eq(n\\,${frameIndex}),format=rgba,crop=1:1:${x}:${y}`,
+      `select=eq(n\\,${frameIndex}),crop=1:1:${x}:${y},format=gray10le`,
       '-frames:v',
       '1',
       '-f',
       'rawvideo',
-      '-pix_fmt',
-      'rgba',
       'pipe:1',
     ]);
     assert.equal(
       result.status,
       0,
-      `FFmpeg pixel extraction failed for GIF frame ${frameIndex}`,
+      `FFmpeg alpha extraction failed for TGS frame ${frameIndex}`,
     );
-    assert.equal(
-      result.stdout.length,
-      4,
-      `Expected one RGBA pixel from GIF frame ${frameIndex}`,
-    );
-    return result.stdout[3];
+    assert.equal(result.stdout.length, 2);
+    return result.stdout.readUInt16LE(0);
   };
+  const animationProbeX = Math.floor(tgsProbe.width * 0.25);
+  const animationProbeY = Math.floor(tgsProbe.height * 0.5);
+  const transparentX = tgsProbe.width - 1;
+  const transparentY = tgsProbe.height - 1;
   assert.equal(
-    readGifPixelAlpha(
-      outputTgsGifPath,
-      firstFrameIndex,
-      transparentX,
-      transparentY,
-    ),
+    readTgsAlpha(0, transparentX, transparentY),
     0,
-    'TGS GIF background pixel must remain transparent',
+    'TGS transparent background must remain transparent',
   );
   assert.equal(
-    readGifPixelAlpha(
-      outputTgsGifPath,
-      firstFrameIndex,
-      animationProbeX,
-      animationProbeY,
-    ),
-    255,
-    'TGS GIF rectangle must be opaque at the start of the animation',
+    readTgsAlpha(0, animationProbeX, animationProbeY),
+    1023,
+    'TGS shape must remain opaque',
   );
   assert.equal(
-    readGifPixelAlpha(
-      outputTgsGifPath,
-      middleFrameIndex,
+    readTgsAlpha(
+      Math.floor(tgsProbe.frameCount / 2),
       animationProbeX,
       animationProbeY,
     ),
     0,
-    'TGS GIF rectangle must move away from the probe point',
+    'TGS moving shape must leave transparent pixels behind',
   );
   assert.equal(
-    readGifPixelAlpha(
-      outputTgsGifPath,
-      lastFrameIndex,
-      animationProbeX,
-      animationProbeY,
-    ),
-    255,
-    'TGS GIF must return to the initial visual state for looping',
+    readTgsAlpha(tgsProbe.frameCount - 1, animationProbeX, animationProbeY),
+    1023,
+    'TGS final frame must return to its looping visual state',
   );
+  const tgsTemporaryFiles = await fsp.readdir(tgsIntegrationDir);
   assert.deepEqual(
-    (await fsp.readdir(tgsIntegrationDir)).filter(file =>
-      file.includes('.candidate-'),
+    tgsTemporaryFiles.filter(file =>
+      /candidate-|lottieconverter-|lottie-frames-|avif-(?:color|alpha)-/.test(
+        file,
+      ),
     ),
     [],
-    'TGS candidate files must be cleaned up',
+    'TGS conversion must clean candidates, normalized input, frames, and IVF files',
   );
-  assert.deepEqual(
-    (await fsp.readdir(tgsIntegrationDir)).filter(file =>
-      file.includes('.lottieconverter-'),
-    ),
-    [],
-    'Normalized temporary TGS files must be cleaned up',
+  console.log(
+    'Verified: lottieconverter PNG frames produced a valid animated AVIF',
   );
-  console.log('Verified: lottieconverter produced a valid GIF from TGS');
 }
 
 // Test 5: Legacy Cache Invalidation
@@ -1684,6 +1653,16 @@ const additionalCacheCases = [
     name: 'ReadyGifPack',
     sticker: {
       filename: 'sticker.gif',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    expectedLegacy: false,
+  },
+  {
+    name: 'ReadyAvifPack',
+    sticker: {
+      filename: 'sticker.avif',
+      image: 'https://example.test/sticker.avif',
       isAnimated: true,
       readyToUpload: true,
     },
@@ -1947,11 +1926,15 @@ const storageSourceADuplicate = path.join(
 const storageSourceBOld = path.join(storagePackDir, 'source-b-old.gif');
 const storageSourceBNew = path.join(storagePackDir, 'source-b-new.gif');
 const orphanSource = path.join(storagePackDir, 'orphan.gif');
+const referencedAvifSource = path.join(storagePackDir, 'animated.avif');
+const orphanAvifSource = path.join(storagePackDir, 'orphan.avif');
 await fsp.writeFile(storageSourceA, 'asset-a');
 await fsp.writeFile(storageSourceADuplicate, 'asset-a');
 await fsp.writeFile(storageSourceBOld, 'asset-b-old');
 await fsp.writeFile(storageSourceBNew, 'asset-b-new');
 await fsp.writeFile(orphanSource, 'orphan');
+await fsp.writeFile(referencedAvifSource, 'referenced-avif');
+await fsp.writeFile(orphanAvifSource, 'orphan-avif');
 const assetA = await storeStickerAsset(storagePackName, storageSourceA);
 const duplicateAssetA = await storeStickerAsset(
   storagePackName,
@@ -1960,6 +1943,15 @@ const duplicateAssetA = await storeStickerAsset(
 const assetBOld = await storeStickerAsset(storagePackName, storageSourceBOld);
 const assetBNew = await storeStickerAsset(storagePackName, storageSourceBNew);
 const orphanAsset = await storeStickerAsset(storagePackName, orphanSource);
+const referencedAvifAsset = await storeStickerAsset(
+  storagePackName,
+  referencedAvifSource,
+);
+const orphanAvifAsset = await storeStickerAsset(
+  storagePackName,
+  orphanAvifSource,
+);
+assert.match(referencedAvifAsset, /^[a-f0-9]{64}\.avif$/);
 assert.equal(assetA, duplicateAssetA, 'Identical bytes must reuse one hash');
 await fsp.writeFile(
   path.join(generateStickerAssetsDirPath(storagePackName), assetA),
@@ -1982,7 +1974,7 @@ for (let version = 1; version <= 6; version++) {
   await writeStickerVersionIndexAtomically(storagePackName, {
     version,
     signature: `signature-${version}`,
-    stickers: {'A.gif': assetA, 'B.gif': bAsset},
+    stickers: {'A.gif': assetA, 'B.gif': bAsset, 'C.avif': referencedAvifAsset},
     previews: {},
   });
 }
@@ -2044,9 +2036,26 @@ assert.equal(
   'Unreferenced content-addressed asset must be collected',
 );
 assert.equal(
+  fs.existsSync(
+    path.join(
+      generateStickerAssetsDirPath(storagePackName),
+      referencedAvifAsset,
+    ),
+  ),
+  true,
+  'Referenced AVIF asset must survive GC mark and sweep',
+);
+assert.equal(
+  fs.existsSync(
+    path.join(generateStickerAssetsDirPath(storagePackName), orphanAvifAsset),
+  ),
+  false,
+  'Unreferenced AVIF asset must be swept',
+);
+assert.equal(
   (await fsp.readdir(generateStickerAssetsDirPath(storagePackName))).length,
-  3,
-  'Two versions with one changed sticker must store three unique assets',
+  4,
+  'Retained GIF and AVIF versions must store four unique assets',
 );
 
 console.log('Testing pending versions do not evict published history...');
@@ -2794,7 +2803,7 @@ const versionedHttpPackName = 'VersionedHttpPack';
 const versionedHttpPackDir = generateStickerPackDirPath(versionedHttpPackName);
 await fsp.mkdir(versionedHttpPackDir, {recursive: true});
 const version10StickerSource = path.join(versionedHttpPackDir, 'v10.gif');
-const version11StickerSource = path.join(versionedHttpPackDir, 'v11.gif');
+const version11StickerSource = path.join(versionedHttpPackDir, 'v11.avif');
 const version10PreviewSource = path.join(versionedHttpPackDir, 'v10.webp');
 const version11PreviewSource = path.join(versionedHttpPackDir, 'v11.webp');
 await fsp.writeFile(version10StickerSource, 'version-10-sticker');
@@ -2826,7 +2835,7 @@ await writeStickerVersionIndexAtomically(versionedHttpPackName, {
 await writeStickerVersionIndexAtomically(versionedHttpPackName, {
   version: 11,
   signature: 'version-11',
-  stickers: {'A.gif': version11StickerAsset},
+  stickers: {'A.avif': version11StickerAsset},
   previews: {'A.webp': version11PreviewAsset},
 });
 assert.equal(
@@ -2894,7 +2903,7 @@ assert.ok(
 );
 const pendingVersion11Response = await app.inject({
   method: 'GET',
-  url: `/sticker/telegram/${versionedHttpPackName}/11/A.gif`,
+  url: `/sticker/telegram/${versionedHttpPackName}/11/A.avif`,
 });
 assert.equal(
   pendingVersion11Response.statusCode,
@@ -2915,22 +2924,47 @@ const committedVersion11Manifest = JSON.parse(
     generateStickerPackFilePath(versionedHttpPackName),
     'utf8',
   ),
-) as {dynamic: {version: number}};
+);
 committedVersion11Manifest.dynamic.version = 11;
+for (const sticker of committedVersion11Manifest.stickers) {
+  sticker.filename = 'A.avif';
+  sticker.image = `https://stickers.example.com/sticker/telegram/${versionedHttpPackName}/11/A.avif`;
+}
+committedVersion11Manifest.logo = committedVersion11Manifest.stickers[0];
 await fsp.writeFile(
   generateStickerPackFilePath(versionedHttpPackName),
   JSON.stringify(committedVersion11Manifest),
 );
 const version11Response = await app.inject({
   method: 'GET',
-  url: `/sticker/telegram/${versionedHttpPackName}/11/A.gif`,
+  url: `/sticker/telegram/${versionedHttpPackName}/11/A.avif`,
 });
 assert.equal(version11Response.statusCode, 200);
 assert.equal(version11Response.body, 'version-11-sticker');
+assert.equal(version11Response.headers['content-type'], 'image/avif');
 assert.ok(version11Response.headers['cache-control']?.includes('immutable'));
+const retainedVersion10 = await readStickerVersionIndex(
+  versionedHttpPackName,
+  10,
+);
+const committedVersion11 = await readStickerVersionIndex(
+  versionedHttpPackName,
+  11,
+);
+assert.equal(retainedVersion10?.stickers['A.gif'], version10StickerAsset);
+assert.equal(committedVersion11?.stickers['A.avif'], version11StickerAsset);
+const retainedGifResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/10/A.gif`,
+});
+assert.equal(retainedGifResponse.statusCode, 200);
+assert.equal(retainedGifResponse.headers['content-type'], 'image/gif');
+assert.equal(committedVersion11Manifest.dynamic.version, 11);
+assert.equal(committedVersion11Manifest.stickers[0].filename, 'A.avif');
+assert.ok(committedVersion11Manifest.stickers[0].image.endsWith('/11/A.avif'));
 const legacyLatestResponse = await app.inject({
   method: 'GET',
-  url: `/sticker/telegram/${versionedHttpPackName}/A.gif`,
+  url: `/sticker/telegram/${versionedHttpPackName}/A.avif`,
 });
 assert.equal(legacyLatestResponse.statusCode, 200);
 assert.equal(legacyLatestResponse.body, 'version-11-sticker');
@@ -2960,11 +2994,10 @@ const legacyAliasResponse = await app.inject({
   method: 'GET',
   url: `/sticker/telegram/${versionedHttpPackName}/A-160.gif`,
 });
-assert.equal(legacyAliasResponse.statusCode, 200);
-assert.equal(legacyAliasResponse.body, 'version-11-sticker');
 assert.equal(
-  legacyAliasResponse.headers['cache-control']?.includes('immutable'),
-  false,
+  legacyAliasResponse.statusCode,
+  404,
+  'Legacy GIF alias must not create or resolve an AVIF -160 alias',
 );
 const versionedPreviewResponse = await app.inject({
   method: 'GET',
@@ -3023,6 +3056,156 @@ assert.ok(
       })
     ).statusCode,
   ),
+);
+const refreshTransitionPackName = 'RefreshGifToAvifPack';
+const refreshTransitionPackDir = generateStickerPackDirPath(
+  refreshTransitionPackName,
+);
+const refreshTransitionPreviewDir = generateStickerPreviewDirPath(
+  refreshTransitionPackName,
+);
+await fsp.mkdir(refreshTransitionPreviewDir, {recursive: true});
+const refreshLegacyGifPath = path.join(
+  refreshTransitionPackDir,
+  'refresh-id.gif',
+);
+const refreshLegacyPreviewPath = path.join(
+  refreshTransitionPreviewDir,
+  'refresh-id.webp',
+);
+await fsp.copyFile(testGifPath, refreshLegacyGifPath);
+await fsp.writeFile(refreshLegacyPreviewPath, 'legacy refresh preview');
+const refreshLegacyGifAsset = await storeStickerAsset(
+  refreshTransitionPackName,
+  refreshLegacyGifPath,
+);
+const refreshLegacyPreviewAsset = await storeStickerAsset(
+  refreshTransitionPackName,
+  refreshLegacyPreviewPath,
+);
+await writeStickerVersionIndexAtomically(refreshTransitionPackName, {
+  version: 12,
+  signature: 'legacy-gif-version',
+  stickers: {'refresh-id.gif': refreshLegacyGifAsset},
+  previews: {'refresh-id.webp': refreshLegacyPreviewAsset},
+});
+const refreshLegacySticker = {
+  id: `MoreStickers:Telegram:Sticker:${refreshTransitionPackName}:refresh-id`,
+  image: `https://stickers.example.com/sticker/telegram/${refreshTransitionPackName}/12/refresh-id.gif`,
+  previewImage: `https://stickers.example.com/preview/telegram/${refreshTransitionPackName}/12/refresh-id.webp`,
+  title: '🔄',
+  stickerPackId: `MoreStickers:Telegram:Pack:${refreshTransitionPackName}`,
+  filename: 'refresh-id.gif',
+  isAnimated: true,
+  readyToUpload: true,
+};
+await fsp.writeFile(
+  generateStickerPackFilePath(refreshTransitionPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${refreshTransitionPackName}`,
+    title: 'Refresh transition',
+    logo: refreshLegacySticker,
+    stickers: [refreshLegacySticker],
+    dynamic: {
+      version: 12,
+      refreshUrl: generateStickerPackExternalUrl(refreshTransitionPackName),
+    },
+  }),
+);
+const refreshTransitionStickerSet = {
+  name: refreshTransitionPackName,
+  title: 'Refresh transition',
+  stickers: [
+    {
+      file_id: 'refresh-file',
+      file_unique_id: 'refresh-id',
+      emoji: '🔄',
+      is_video: true,
+      is_animated: false,
+      width: 512,
+      height: 512,
+      type: 'regular',
+    },
+  ],
+} as Parameters<typeof downloadStickerPack>[1];
+const refreshTransitionTelegram = {
+  getFile: async () => ({
+    file_id: 'refresh-file',
+    file_path: 'stickers/refresh-id.webm',
+  }),
+  getFileLink: async () => new URL('https://example.test/refresh-id.webm'),
+} as unknown as Telegram;
+const refreshTransitionWebm = await fsp.readFile(testWebmPath);
+const fetchBeforeRefreshTransition = globalThis.fetch;
+globalThis.fetch = (async () =>
+  new Response(refreshTransitionWebm, {status: 200})) as typeof fetch;
+try {
+  await downloadStickerPack(
+    refreshTransitionTelegram,
+    refreshTransitionStickerSet,
+  );
+} finally {
+  globalThis.fetch = fetchBeforeRefreshTransition;
+}
+const refreshTransitionManifest = validateLocalStickerPackManifest(
+  await readManifestOrUndefined(refreshTransitionPackName),
+);
+assert.equal(refreshTransitionManifest?.dynamic?.version, 13);
+assert.equal(
+  refreshTransitionManifest?.stickers[0].filename,
+  'refresh-id.avif',
+);
+assert.ok(
+  refreshTransitionManifest?.stickers[0].image.endsWith('/13/refresh-id.avif'),
+);
+assert.ok(
+  refreshTransitionManifest?.stickers[0].previewImage?.endsWith(
+    '/13/refresh-id.webp',
+  ),
+);
+const refreshVersion12 = await readStickerVersionIndex(
+  refreshTransitionPackName,
+  12,
+);
+const refreshVersion13 = await readStickerVersionIndex(
+  refreshTransitionPackName,
+  13,
+);
+assert.equal(
+  refreshVersion12?.stickers['refresh-id.gif'],
+  refreshLegacyGifAsset,
+);
+assert.match(
+  refreshVersion13?.stickers['refresh-id.avif'] ?? '',
+  /^[a-f0-9]{64}\.avif$/,
+);
+assert.equal(
+  fs.existsSync(path.join(refreshTransitionPackDir, 'refresh-id.webm')),
+  false,
+  'Raw source must be removed only after successful publication',
+);
+assert.equal(
+  (
+    await app.inject({
+      method: 'GET',
+      url: `/sticker/telegram/${refreshTransitionPackName}/12/refresh-id.gif`,
+    })
+  ).statusCode,
+  200,
+);
+const refreshedAvifResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${refreshTransitionPackName}/13/refresh-id.avif`,
+});
+assert.equal(refreshedAvifResponse.statusCode, 200);
+assert.equal(refreshedAvifResponse.headers['content-type'], 'image/avif');
+assert.ok(
+  refreshedAvifResponse.headers['cache-control']?.includes('immutable'),
+);
+await pruneOldStickerVersions(refreshTransitionPackName);
+assert.deepEqual(
+  await listStickerPackVersions(refreshTransitionPackName),
+  [12, 13],
 );
 console.log(
   'Verified: versioned history is immutable and legacy routes use latest',
@@ -3502,6 +3685,68 @@ assert.equal(
   `GIF preview center (${centerPrevX},${centerPrevY}) must be opaque (alpha=255)`,
 );
 
+const avifPreviewOutput = path.join(tempDir, 'real_avif_preview.webp');
+const avifPreviewResult = await generatePreview(
+  testAvifPath,
+  avifPreviewOutput,
+);
+assert.ok(fs.existsSync(avifPreviewOutput), 'AVIF preview file must exist');
+assert.ok(avifPreviewResult.sizeBytes <= PREVIEW_MAX_BYTES);
+const avifPreviewProbeResult = spawnSync('ffprobe', [
+  '-v',
+  'error',
+  '-select_streams',
+  'v:0',
+  '-show_entries',
+  'stream=codec_name,width,height',
+  '-of',
+  'json',
+  avifPreviewOutput,
+]);
+assert.equal(avifPreviewProbeResult.status, 0);
+const avifPreviewProbe = JSON.parse(
+  avifPreviewProbeResult.stdout.toString('utf8'),
+).streams[0];
+assert.equal(
+  avifPreviewProbe.codec_name,
+  'webp',
+  'Animated AVIF preview must remain WebP',
+);
+const readAvifPreviewAlpha = (x: number, y: number): number => {
+  const result = spawnSync('ffmpeg', [
+    '-v',
+    'error',
+    '-i',
+    avifPreviewOutput,
+    '-vf',
+    `format=rgba,crop=1:1:${x}:${y}`,
+    '-frames:v',
+    '1',
+    '-f',
+    'rawvideo',
+    'pipe:1',
+  ]);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout.length, 4);
+  return result.stdout[3];
+};
+assert.equal(readAvifPreviewAlpha(0, 0), 0);
+assert.equal(
+  readAvifPreviewAlpha(
+    Math.floor(Number(avifPreviewProbe.width) / 2),
+    Math.floor(Number(avifPreviewProbe.height) / 2),
+  ),
+  255,
+);
+const avifPreviewSemiAlpha = readAvifPreviewAlpha(
+  Math.floor(Number(avifPreviewProbe.width) * 0.78),
+  Math.floor(Number(avifPreviewProbe.height) * 0.49),
+);
+assert.ok(
+  avifPreviewSemiAlpha >= 120 && avifPreviewSemiAlpha <= 136,
+  `AVIF-derived WebP must preserve half-transparent alpha, got ${avifPreviewSemiAlpha}`,
+);
+
 // Real static WebP -> WebP preview
 const realWebpInput = path.join(tempDir, 'real_input_512.webp');
 const genWebpRes = spawnSync('ffmpeg', [
@@ -3660,6 +3905,15 @@ assert.equal(
   400,
   'Expected 400 for .gif on preview route',
 );
+const invalidAvifPreviewResponse = await app.inject({
+  method: 'GET',
+  url: `/preview/telegram/${legacyPreviewPackName}/test_sticker.avif`,
+});
+assert.equal(
+  invalidAvifPreviewResponse.statusCode,
+  400,
+  'Preview route must reject AVIF',
+);
 
 // Double extension -> 400
 const doubleExtPreviewResponse = await app.inject({
@@ -3687,245 +3941,196 @@ console.log(
   'Verified: Fastify preview route serves WebP with CORS and rejects invalid/missing requests',
 );
 // Test 9: Error handling on invalid/corrupt input
-console.log('Testing convertWebmToGif error handling with invalid input...');
+console.log('Testing convertWebmToAvif error handling with invalid input...');
 const invalidInputPath = path.join(tempDir, 'corrupt.webm');
 await fsp.writeFile(invalidInputPath, 'not a valid video file');
-const invalidOutputPath = path.join(tempDir, 'corrupt.gif');
-
+const invalidOutputPath = path.join(tempDir, 'corrupt.avif');
 await assert.rejects(
-  async () => {
-    await convertWebmToGif(invalidInputPath, invalidOutputPath);
-  },
-  /FFmpeg exited with code|Failed to spawn ffmpeg/,
-  'Expected convertWebmToGif to reject with informative error on corrupt input',
+  async () => convertWebmToAvif(invalidInputPath, invalidOutputPath),
+  /ffmpeg exited with code|Failed to spawn ffmpeg/i,
 );
+assert.equal(fs.existsSync(invalidOutputPath), false);
+const retainedRawPackName = 'RetainedRawConversionFailure';
+const retainedRawPackDir = generateStickerPackDirPath(retainedRawPackName);
+await fsp.mkdir(retainedRawPackDir, {recursive: true});
+await fsp.writeFile(
+  path.join(retainedRawPackDir, 'retained-raw-id.webm'),
+  'previous raw webm',
+);
+const retainedRawStickerSet = {
+  name: retainedRawPackName,
+  title: 'Retained raw conversion failure',
+  stickers: [
+    {
+      file_id: 'retained-raw-file',
+      file_unique_id: 'retained-raw-id',
+      is_video: true,
+      is_animated: false,
+      width: 512,
+      height: 512,
+      type: 'regular',
+    },
+  ],
+} as Parameters<typeof downloadStickerPack>[1];
+const retainedRawTelegram = {
+  getFile: async () => ({
+    file_id: 'retained-raw-file',
+    file_path: 'stickers/retained-raw-id.webm',
+  }),
+  getFileLink: async () => new URL('https://example.test/retained.webm'),
+} as unknown as Telegram;
+const fetchBeforeRetainedRawTest = globalThis.fetch;
+globalThis.fetch = (async () =>
+  new Response(Buffer.from('corrupt downloaded webm'), {
+    status: 200,
+  })) as typeof fetch;
+try {
+  await assert.rejects(
+    downloadStickerPack(retainedRawTelegram, retainedRawStickerSet),
+    /ffmpeg exited with code/i,
+  );
+} finally {
+  globalThis.fetch = fetchBeforeRetainedRawTest;
+}
 assert.equal(
-  fs.existsSync(invalidOutputPath),
-  false,
-  'No output GIF should exist after failed conversion',
+  await fsp.readFile(
+    path.join(retainedRawPackDir, 'retained-raw-id.webm'),
+    'utf8',
+  ),
+  'previous raw webm',
+  'Previous raw input must be restored when regeneration fails before publication',
 );
-console.log(
-  'Verified: convertWebmToGif correctly rejects corrupt input and leaves no output',
+assert.deepEqual(
+  (await fsp.readdir(retainedRawPackDir)).filter(
+    file => file.includes('.source.') || file.includes('.backup-'),
+  ),
+  [],
 );
 
-// Test 10: Deterministic Regression - 6 MB fallback cleaned up when 4 MB target is reached
-console.log(
-  'Testing deterministic regression: 6 MB fallback -> 4 MB target cleanup...',
-);
+// Test 10: Quality ladder order, hard limit, and cleanup.
+console.log('Testing deterministic AVIF quality ladder...');
 const reg1Dir = await fsp.mkdtemp(path.join(tempDir, 'reg1-'));
 const reg1Input = path.join(reg1Dir, 'input.webm');
-const reg1Output = path.join(reg1Dir, 'output.gif');
+const reg1Output = path.join(reg1Dir, 'output.avif');
 await fsp.writeFile(reg1Input, 'dummy-webm-input');
-
-let encodingCall = 0;
-const fallbackThenTargetEncoder: GifEncoder = async (
+const observedProfiles: (typeof AVIF_ENCODING_PROFILES)[number][] = [];
+const fallbackThenTargetEncoder: AvifEncoder = async (
   _inputPath,
   candidatePath,
+  profile,
 ) => {
-  const size = encodingCall++ === 0 ? 6_000_000 : 4_000_000;
+  observedProfiles.push(profile);
   await fsp.writeFile(candidatePath, '');
-  await fsp.truncate(candidatePath, size);
+  await fsp.truncate(
+    candidatePath,
+    observedProfiles.length === 1 ? AVIF_HARD_LIMIT_BYTES + 1 : 4_000_000,
+  );
 };
-
-const reg1Result = await convertWebmToGifWithEncoder(
+const reg1Result = await convertWebmToAvifWithEncoder(
   reg1Input,
   reg1Output,
   fallbackThenTargetEncoder,
 );
-
-assert.equal(reg1Result.profileIndex, 1, 'Profile 1 must be selected');
-assert.equal(reg1Result.sizeBytes, 4_000_000, 'Size must be 4 MB');
-assert.ok(fs.existsSync(reg1Output), 'Final output GIF must exist');
-
-const reg1Files = await fsp.readdir(reg1Dir);
-const reg1Candidates = reg1Files.filter(f => f.includes('.candidate-'));
+assert.equal(reg1Result.profileIndex, 1);
+assert.equal(reg1Result.sizeBytes, 4_000_000);
+assert.deepEqual(observedProfiles, AVIF_ENCODING_PROFILES.slice(0, 2));
+assert.ok(fs.existsSync(reg1Output));
+assert.ok((await fsp.stat(reg1Output)).size <= AVIF_HARD_LIMIT_BYTES);
 assert.deepEqual(
-  reg1Candidates,
+  (await fsp.readdir(reg1Dir)).filter(file => file.includes('.candidate-')),
   [],
-  'No candidate files (including 6MB fallback) should remain after target reached',
 );
-console.log('Verified: 6 MB fallback cleaned up when 4 MB target reached');
 
-// Test 11: Deterministic Regression - 6 MB fallback cleaned up when subsequent profile throws error
-console.log(
-  'Testing deterministic regression: 6 MB fallback -> subsequent encoder error cleanup...',
-);
 const reg2Dir = await fsp.mkdtemp(path.join(tempDir, 'reg2-'));
 const reg2Input = path.join(reg2Dir, 'input.webm');
-const reg2Output = path.join(reg2Dir, 'output.gif');
+const reg2Output = path.join(reg2Dir, 'output.avif');
 await fsp.writeFile(reg2Input, 'dummy-webm-input');
-
 let failingCall = 0;
-const failingEncoder: GifEncoder = async (_inputPath, candidatePath) => {
+const failingEncoder: AvifEncoder = async (_inputPath, candidatePath) => {
   if (failingCall++ === 0) {
     await fsp.writeFile(candidatePath, '');
-    await fsp.truncate(candidatePath, 6_000_000);
+    await fsp.truncate(candidatePath, AVIF_HARD_LIMIT_BYTES + 1);
     return;
   }
   throw new Error('simulated encoder failure');
 };
-
 await assert.rejects(
-  async () => {
-    await convertWebmToGifWithEncoder(reg2Input, reg2Output, failingEncoder);
-  },
+  async () =>
+    convertWebmToAvifWithEncoder(reg2Input, reg2Output, failingEncoder),
   /simulated encoder failure/,
-  'Expected convertWebmToGifWithEncoder to reject with encoder failure',
 );
-
-assert.equal(
-  fs.existsSync(reg2Output),
-  false,
-  'Final output GIF must not exist after error',
-);
-
-const reg2Files = await fsp.readdir(reg2Dir);
-const reg2Candidates = reg2Files.filter(f => f.includes('.candidate-'));
+assert.equal(fs.existsSync(reg2Output), false);
 assert.deepEqual(
-  reg2Candidates,
+  (await fsp.readdir(reg2Dir)).filter(file => file.includes('.candidate-')),
   [],
-  'All candidate files (including 6MB fallback) must be cleaned up after error',
-);
-console.log(
-  'Verified: 6 MB fallback cleaned up when subsequent profile throws error',
 );
 
-// Test 12: TGS uses the same candidate selection and cleanup policy
-console.log('Testing deterministic TGS conversion policy...');
-const tgsReg1Dir = await fsp.mkdtemp(path.join(tempDir, 'tgs-reg1-'));
-const tgsReg1Input = path.join(tgsReg1Dir, 'input.tgs');
-const tgsReg1Output = path.join(tgsReg1Dir, 'output.gif');
-await fsp.writeFile(tgsReg1Input, 'dummy-tgs-input');
-
-let tgsEncodingCall = 0;
-const tgsEncoderFps: number[] = [];
-const tgsFallbackThenTargetEncoder: GifEncoder = async (
+const allOversizedDir = await fsp.mkdtemp(path.join(tempDir, 'all-oversized-'));
+const allOversizedInput = path.join(allOversizedDir, 'input.webm');
+const allOversizedOutput = path.join(allOversizedDir, 'output.avif');
+await fsp.writeFile(allOversizedInput, 'dummy');
+const allOversizedProfiles: (typeof AVIF_ENCODING_PROFILES)[number][] = [];
+const allOversizedEncoder: AvifEncoder = async (
   _inputPath,
   candidatePath,
   profile,
 ) => {
-  tgsEncoderFps.push(profile.fps);
-  const size = tgsEncodingCall++ === 0 ? 6_000_000 : 4_000_000;
+  allOversizedProfiles.push(profile);
   await fsp.writeFile(candidatePath, '');
-  await fsp.truncate(candidatePath, size);
-};
-const tgsReg1Result = await convertTgsToGifWithEncoder(
-  tgsReg1Input,
-  tgsReg1Output,
-  tgsFallbackThenTargetEncoder,
-);
-assert.equal(tgsReg1Result.profileIndex, 1, 'TGS profile 1 must be selected');
-assert.equal(tgsReg1Result.sizeBytes, 4_000_000, 'TGS size must be 4 MB');
-assert.deepEqual(
-  tgsEncoderFps,
-  [20, 20],
-  'TGS encoder must receive timing-safe FPS values from its selected profiles',
-);
-assert.equal(
-  tgsReg1Result.profile.fps,
-  TGS_GIF_ENCODING_PROFILES[1].fps,
-  'TGS result profile must match the FPS passed to its encoder',
-);
-assert.ok(fs.existsSync(tgsReg1Output), 'TGS final output GIF must exist');
-assert.deepEqual(
-  (await fsp.readdir(tgsReg1Dir)).filter(f => f.includes('.candidate-')),
-  [],
-  'TGS candidate and fallback files must be cleaned up after target reached',
-);
-
-const tgsReg2Dir = await fsp.mkdtemp(path.join(tempDir, 'tgs-reg2-'));
-const tgsReg2Input = path.join(tgsReg2Dir, 'input.tgs');
-const tgsReg2Output = path.join(tgsReg2Dir, 'output.gif');
-await fsp.writeFile(tgsReg2Input, 'dummy-tgs-input');
-
-let tgsFailingCall = 0;
-const tgsFailingEncoder: GifEncoder = async (_inputPath, candidatePath) => {
-  if (tgsFailingCall++ === 0) {
-    await fsp.writeFile(candidatePath, '');
-    await fsp.truncate(candidatePath, 6_000_000);
-    return;
-  }
-  throw new Error('simulated TGS encoder failure');
+  await fsp.truncate(candidatePath, AVIF_HARD_LIMIT_BYTES + 1);
 };
 await assert.rejects(
-  async () => {
-    await convertTgsToGifWithEncoder(
-      tgsReg2Input,
-      tgsReg2Output,
-      tgsFailingEncoder,
-    );
-  },
-  /simulated TGS encoder failure/,
-  'TGS encoder errors must reject',
+  async () =>
+    convertWebmToAvifWithEncoder(
+      allOversizedInput,
+      allOversizedOutput,
+      allOversizedEncoder,
+    ),
+  /All quality profiles exceeded the hard limit/,
 );
-assert.equal(
-  fs.existsSync(tgsReg2Output),
-  false,
-  'TGS conversion errors must not leave a final GIF',
-);
+assert.deepEqual(allOversizedProfiles, AVIF_ENCODING_PROFILES);
+assert.equal(fs.existsSync(allOversizedOutput), false);
 assert.deepEqual(
-  (await fsp.readdir(tgsReg2Dir)).filter(f => f.includes('.candidate-')),
+  (await fsp.readdir(allOversizedDir)).filter(file =>
+    file.includes('.candidate-'),
+  ),
   [],
-  'TGS conversion errors must clean candidate and fallback files',
 );
-console.log('Verified: TGS shares GIF sizing and cleanup policy');
 
-// Test 13: Full TGS profile walk through 20, 10, and 5 FPS
-console.log('Testing full TGS profile walk through 20, 10, and 5 FPS...');
+// Test 11: TGS uses the same profile order and only lowers FPS after CRF 36.
 const tgsWalkDir = await fsp.mkdtemp(path.join(tempDir, 'tgs-walk-'));
 const tgsWalkInput = path.join(tgsWalkDir, 'input.tgs');
-const tgsWalkOutput = path.join(tgsWalkDir, 'output.gif');
+const tgsWalkOutput = path.join(tgsWalkDir, 'output.avif');
 await fsp.writeFile(tgsWalkInput, 'dummy-tgs-input');
-
-const observedTgsFps: number[] = [];
-const profileWalkEncoder: GifEncoder = async (
+const observedTgsProfiles: (typeof AVIF_ENCODING_PROFILES)[number][] = [];
+const profileWalkEncoder: AvifEncoder = async (
   _inputPath,
   candidatePath,
   profile,
 ) => {
-  observedTgsFps.push(profile.fps);
-  const isLast = observedTgsFps.length === TGS_GIF_ENCODING_PROFILES.length;
+  observedTgsProfiles.push(profile);
   await fsp.writeFile(candidatePath, '');
   await fsp.truncate(
     candidatePath,
-    isLast ? 4_000_000 : GIF_SAFE_HARD_LIMIT_BYTES + 1,
+    observedTgsProfiles.length === AVIF_ENCODING_PROFILES.length
+      ? 4_000_000
+      : AVIF_HARD_LIMIT_BYTES + 1,
   );
 };
-
-const walkResult = await convertTgsToGifWithEncoder(
+const walkResult = await convertTgsToAvifWithEncoder(
   tgsWalkInput,
   tgsWalkOutput,
   profileWalkEncoder,
 );
-
+assert.deepEqual(observedTgsProfiles, AVIF_ENCODING_PROFILES);
+assert.equal(walkResult.profileIndex, AVIF_ENCODING_PROFILES.length - 1);
+assert.equal(walkResult.profile.fps, 16);
+assert.equal(walkResult.sizeBytes, 4_000_000);
 assert.deepEqual(
-  observedTgsFps,
-  [20, 20, 20, 10, 10, 10, 10, 5, 5, 5],
-  'Profile walk must observe every TGS FPS level in order',
-);
-assert.equal(
-  walkResult.profileIndex,
-  9,
-  'Last profile (index 9) must be selected',
-);
-assert.equal(walkResult.profile.fps, 5, 'Selected profile FPS must be 5');
-assert.equal(
-  walkResult.sizeBytes,
-  4_000_000,
-  'Selected profile size must be 4 MB',
-);
-assert.ok(
-  fs.existsSync(tgsWalkOutput),
-  'Final output GIF from profile walk must exist',
-);
-assert.deepEqual(
-  (await fsp.readdir(tgsWalkDir)).filter(f => f.includes('.candidate-')),
+  (await fsp.readdir(tgsWalkDir)).filter(file => file.includes('.candidate-')),
   [],
-  'All candidate files from profile walk must be cleaned up',
 );
-console.log(
-  'Verified: full TGS profile walk exercises 20, 10, and 5 FPS with proper cleanup',
-);
+console.log('Verified: AVIF quality ladder order, limit, failure, and cleanup');
 
 // Test 14: TGS normalization logic, duration handling, and edge cases
 console.log('Testing TGS normalization logic and edge cases...');
@@ -3934,7 +4139,7 @@ const norm1Result = normalizeLottieJsonForConverter(
   'test1.tgs',
 );
 const norm1Parsed = JSON.parse(norm1Result);
-assert.equal(norm1Parsed.op, 89, 'op=90 must normalize to op=89');
+assert.equal(norm1Parsed.op, 89, 'Exclusive op must be normalized for rlottie');
 assert.equal(norm1Parsed.ip, 0, 'ip must remain unchanged');
 assert.equal(norm1Parsed.fr, 60, 'fr must remain unchanged');
 
@@ -3943,8 +4148,37 @@ const norm2Result = normalizeLottieJsonForConverter(
   'test2.tgs',
 );
 const norm2Parsed = JSON.parse(norm2Result);
-assert.equal(norm2Parsed.op, 89, 'op=90 with ip=30 must normalize to op=89');
+assert.equal(
+  norm2Parsed.op,
+  89,
+  'Non-zero ip timing must normalize for rlottie',
+);
 assert.equal(norm2Parsed.ip, 30, 'non-zero ip must remain unchanged');
+const cappedTgs = JSON.parse(
+  normalizeLottieJsonForConverter(
+    {fr: 60, ip: 0, op: 300},
+    'long-duration.tgs',
+  ),
+);
+assert.equal(cappedTgs.op, 179, 'TGS render input must be capped at 3 seconds');
+const cappedOffsetTgs = JSON.parse(
+  normalizeLottieJsonForConverter(
+    {fr: 30, ip: 15, op: 120},
+    'offset-long-duration.tgs',
+  ),
+);
+assert.equal(cappedOffsetTgs.op, 104);
+const fractionalDurationTgs = JSON.parse(
+  normalizeLottieJsonForConverter(
+    {fr: 30, ip: 0, op: 75},
+    'fractional-duration.tgs',
+  ),
+);
+assert.equal(
+  fractionalDurationTgs.op,
+  74,
+  'Sub-three-second duration must only receive rlottie inclusive-op normalization',
+);
 
 // Error cases for normalization
 assert.throws(
@@ -4067,17 +4301,44 @@ await fsp.writeFile(normCorruptTgs, Buffer.from('not gzip data'));
 await assert.rejects(async () => {
   await prepareTgsForLottieConverter(normCorruptTgs);
 }, /Failed to decompress TGS gzip payload from ".*corrupt\.tgs"/);
+const oversizedCompressedTgs = path.join(
+  normTestDir,
+  'oversized-compressed.tgs',
+);
+await fsp.writeFile(oversizedCompressedTgs, Buffer.alloc(64 * 1024 + 1));
+await assert.rejects(
+  prepareTgsForLottieConverter(oversizedCompressedTgs),
+  /exceeds 65536 bytes/,
+);
+const oversizedExpandedTgs = path.join(normTestDir, 'oversized-expanded.tgs');
+await fsp.writeFile(
+  oversizedExpandedTgs,
+  gzipSync(
+    Buffer.from(
+      JSON.stringify({
+        fr: 60,
+        ip: 0,
+        op: 60,
+        padding: 'x'.repeat(2 * 1024 * 1024),
+      }),
+    ),
+  ),
+);
+await assert.rejects(
+  prepareTgsForLottieConverter(oversizedExpandedTgs),
+  /Failed to decompress TGS gzip payload/,
+);
 
-// Test 1: convertTgsToGif cleans up normalized temporary file on encoder failure
+// Test 1: convertTgsToAvif cleans up normalized temporary file on encoder failure
 const failingConvInput = path.join(normTestDir, 'failing-conv.tgs');
 await fsp.writeFile(
   failingConvInput,
   gzipSync(Buffer.from(JSON.stringify({fr: 60, ip: 0, op: 60}))),
 );
-const failingConvOutput = path.join(normTestDir, 'failing-out.gif');
+const failingConvOutput = path.join(normTestDir, 'failing-out.avif');
 
 let observedPreparedInput: string | undefined;
-const failingNormEncoder: GifEncoder = async preparedInput => {
+const failingNormEncoder: AvifEncoder = async preparedInput => {
   observedPreparedInput = preparedInput;
   assert.notEqual(preparedInput, failingConvInput);
   assert.ok(preparedInput.includes('.lottieconverter-'));
@@ -4086,7 +4347,7 @@ const failingNormEncoder: GifEncoder = async preparedInput => {
 };
 
 await assert.rejects(async () => {
-  await convertTgsToGif(
+  await convertTgsToAvif(
     failingConvInput,
     failingConvOutput,
     failingNormEncoder,
@@ -4110,9 +4371,12 @@ await fsp.writeFile(
   cleanupFailInput,
   gzipSync(Buffer.from(JSON.stringify({fr: 60, ip: 0, op: 60}))),
 );
-const cleanupFailOutput = path.join(normTestDir, 'cleanup-fail-out.gif');
+const cleanupFailOutput = path.join(normTestDir, 'cleanup-fail-out.avif');
 let observedCleanupFailPreparedInput: string | undefined;
-const cleanupFailEncoder: GifEncoder = async (preparedInput, candidatePath) => {
+const cleanupFailEncoder: AvifEncoder = async (
+  preparedInput,
+  candidatePath,
+) => {
   observedCleanupFailPreparedInput = preparedInput;
   assert.notEqual(preparedInput, cleanupFailInput);
   assert.ok(preparedInput.includes('.lottieconverter-'));
@@ -4120,7 +4384,7 @@ const cleanupFailEncoder: GifEncoder = async (preparedInput, candidatePath) => {
   // Replace prepared file with a directory so subsequent unlink in removePreparedTgs fails with non-ENOENT (EISDIR/EPERM)
   await fsp.unlink(preparedInput);
   await fsp.mkdir(preparedInput);
-  // Encoder itself succeeds by producing a candidate under GIF_TARGET_BYTES
+  // Encoder itself succeeds by producing a candidate under the AVIF hard limit.
   await fsp.writeFile(candidatePath, '');
   await fsp.truncate(candidatePath, 1_000);
 };
@@ -4128,7 +4392,7 @@ const cleanupFailEncoder: GifEncoder = async (preparedInput, candidatePath) => {
 try {
   await assert.rejects(
     async () => {
-      await convertTgsToGif(
+      await convertTgsToAvif(
         cleanupFailInput,
         cleanupFailOutput,
         cleanupFailEncoder,
@@ -4160,10 +4424,10 @@ await fsp.writeFile(
   cleanupErrorInput,
   gzipSync(Buffer.from(JSON.stringify({fr: 60, ip: 0, op: 60}))),
 );
-const cleanupErrorOutput = path.join(normTestDir, 'cleanup-error-out.gif');
+const cleanupErrorOutput = path.join(normTestDir, 'cleanup-error-out.avif');
 const primaryError = new Error('primary simulated encoder failure');
 let observedCleanupErrorPreparedInput: string | undefined;
-const cleanupErrorEncoder: GifEncoder = async preparedInput => {
+const cleanupErrorEncoder: AvifEncoder = async preparedInput => {
   observedCleanupErrorPreparedInput = preparedInput;
   assert.ok(fs.existsSync(preparedInput));
   // Replace prepared file with a directory so cleanup unlink also fails
@@ -4175,7 +4439,7 @@ const cleanupErrorEncoder: GifEncoder = async preparedInput => {
 try {
   await assert.rejects(
     async () => {
-      await convertTgsToGif(
+      await convertTgsToAvif(
         cleanupErrorInput,
         cleanupErrorOutput,
         cleanupErrorEncoder,
@@ -5934,7 +6198,7 @@ const checkManifestPath = generateStickerPackFilePath(checkPackName);
 const checkDir = generateStickerPackDirPath(checkPackName);
 await fsp.mkdir(checkDir, {recursive: true});
 await fsp.writeFile(
-  path.join(checkDir, 'asset-1.webp'),
+  path.join(checkDir, 'asset-1.avif'),
   Buffer.from('fake-asset'),
 );
 await fsp.mkdir(path.join(checkDir, 'previews'), {recursive: true});
@@ -5944,7 +6208,7 @@ await fsp.writeFile(
 );
 const checkStickerAsset = await storeStickerAsset(
   checkPackName,
-  path.join(checkDir, 'asset-1.webp'),
+  path.join(checkDir, 'asset-1.avif'),
 );
 const checkPreviewAsset = await storeStickerAsset(
   checkPackName,
@@ -5953,7 +6217,7 @@ const checkPreviewAsset = await storeStickerAsset(
 await writeStickerVersionIndexAtomically(checkPackName, {
   version: 2,
   signature: 'check-pack',
-  stickers: {'asset-1.webp': checkStickerAsset},
+  stickers: {'asset-1.avif': checkStickerAsset},
   previews: {'asset-1.webp': checkPreviewAsset},
 });
 await fsp.writeFile(
@@ -5963,18 +6227,20 @@ await fsp.writeFile(
     title: 'Check Test Pack',
     logo: {
       id: `MoreStickers:Telegram:Sticker:${checkPackName}:asset-1`,
-      image: `https://stickers.example.com/sticker/telegram/${checkPackName}/asset-1.webp`,
+      image: `https://stickers.example.com/sticker/telegram/${checkPackName}/2/asset-1.avif`,
       title: '🐱',
       stickerPackId: `MoreStickers:Telegram:Pack:${checkPackName}`,
     },
     stickers: [
       {
         id: `MoreStickers:Telegram:Sticker:${checkPackName}:asset-1`,
-        image: `https://stickers.example.com/sticker/telegram/${checkPackName}/asset-1.webp`,
+        image: `https://stickers.example.com/sticker/telegram/${checkPackName}/2/asset-1.avif`,
+        previewImage: `https://stickers.example.com/preview/telegram/${checkPackName}/2/asset-1.webp`,
         title: '🐱',
         stickerPackId: `MoreStickers:Telegram:Pack:${checkPackName}`,
-        filename: 'asset-1.webp',
-        isAnimated: false,
+        filename: 'asset-1.avif',
+        isAnimated: true,
+        readyToUpload: true,
       },
     ],
     dynamic: {
@@ -5997,7 +6263,7 @@ const mockCheckTelegram = {
             file_unique_id: 'asset-1',
             emoji: '🐱',
             is_animated: false,
-            is_video: false,
+            is_video: true,
           },
         ],
       };

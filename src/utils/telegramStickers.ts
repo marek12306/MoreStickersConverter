@@ -1,7 +1,7 @@
 import fsp from 'fs/promises';
 import fs from 'fs';
 import path from 'path';
-import {Readable} from 'stream';
+import {Readable, Transform} from 'stream';
 import {pipeline} from 'stream/promises';
 import {randomUUID} from 'crypto';
 import {Telegram} from 'telegraf';
@@ -11,8 +11,8 @@ import {
   StickerPackDynamic,
 } from './mcStickerPack.js';
 import {Sticker, StickerSet} from 'telegraf/types';
-import {convertWebmToGif} from './webmToGif.js';
-import {convertTgsToGif} from './tgsToGif.js';
+import {convertWebmToAvif} from './webmToAvif.js';
+import {convertTgsToAvif} from './tgsToAvif.js';
 import {generatePreview} from './stickerPreview.js';
 import {
   DATA_DIR,
@@ -46,6 +46,21 @@ const CONCURRENCY = parseDownloadConcurrency(process.env.CONCURRENCY);
 const MC_STICKER_PACK_ID_PREFIX = 'MoreStickers:Telegram:Pack';
 const MC_STICKER_ID_PREFIX = 'MoreStickers:Telegram:Sticker';
 const EXTERNAL_URL = process.env.EXTERNAL_URL!;
+const TELEGRAM_TGS_MAX_BYTES = 64 * 1024;
+
+function createByteLimitTransform(maxBytes: number, label: string): Transform {
+  let totalBytes = 0;
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        callback(new Error(`${label} exceeds ${maxBytes} bytes`));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+}
 
 function toMcStickerPackId(stickerSetName: string) {
   return `${MC_STICKER_PACK_ID_PREFIX}:${stickerSetName}`;
@@ -311,7 +326,7 @@ export function getStickerMediaInfo(
   return {
     isVideoSticker,
     isTgsSticker,
-    outputFileType: isAnimated ? 'gif' : normalizedSourceFileType,
+    outputFileType: isAnimated ? 'avif' : normalizedSourceFileType,
     isAnimated,
   };
 }
@@ -366,16 +381,20 @@ function isLegacySticker(sticker: McSticker): boolean {
     image?.endsWith('.webm') ||
     image?.endsWith('.tgs');
 
-  const hasNonGifAnimatedOutput =
+  const hasUnsupportedAnimatedOutput =
     sticker.isAnimated === true &&
-    ((filename !== undefined && !filename.endsWith('.gif')) ||
-      (image !== undefined && !image.endsWith('.gif')));
+    ((filename !== undefined &&
+      !filename.endsWith('.gif') &&
+      !filename.endsWith('.avif')) ||
+      (image !== undefined &&
+        !image.endsWith('.gif') &&
+        !image.endsWith('.avif')));
 
   const hasLegacyAnimatedManifest =
     sticker.isAnimated === true && sticker.readyToUpload !== true;
   return Boolean(
     hasRawAnimatedSource ||
-      hasNonGifAnimatedOutput ||
+      hasUnsupportedAnimatedOutput ||
       hasLegacyAnimatedManifest,
   );
 }
@@ -462,26 +481,57 @@ async function downloadSingleSticker(
       stickerPackDirPath,
       `${sticker.file_unique_id}.source.${randomUUID()}.${sourceExtension}`,
     );
-    const finalGifPath = path.join(
+    const rawSourcePath = path.join(
       stickerPackDirPath,
-      `${sticker.file_unique_id}.gif`,
+      `${sticker.file_unique_id}.${sourceExtension}`,
+    );
+    const rawSourceBackupPath = `${rawSourcePath}.backup-${randomUUID()}`;
+    const finalAvifPath = path.join(
+      stickerPackDirPath,
+      `${sticker.file_unique_id}.avif`,
     );
 
     try {
-      await pipeline(
-        Readable.fromWeb(response.body!),
-        fs.createWriteStream(tempSourcePath),
-      );
-      if (mediaInfo.isVideoSticker) {
-        await convertWebmToGif(tempSourcePath, finalGifPath);
+      if (mediaInfo.isTgsSticker) {
+        await pipeline(
+          Readable.fromWeb(response.body!),
+          createByteLimitTransform(
+            TELEGRAM_TGS_MAX_BYTES,
+            `TGS sticker ${sticker.file_unique_id}`,
+          ),
+          fs.createWriteStream(tempSourcePath),
+        );
       } else {
-        await convertTgsToGif(tempSourcePath, finalGifPath);
+        await pipeline(
+          Readable.fromWeb(response.body!),
+          fs.createWriteStream(tempSourcePath),
+        );
+      }
+      let previousRawMoved = false;
+      try {
+        await fsp.rename(rawSourcePath, rawSourceBackupPath);
+        previousRawMoved = true;
+      } catch (err) {
+        if (getErrorCode(err) !== 'ENOENT') throw err;
+      }
+      try {
+        await fsp.rename(tempSourcePath, rawSourcePath);
+      } catch (err) {
+        if (previousRawMoved) {
+          await fsp.rename(rawSourceBackupPath, rawSourcePath);
+        }
+        throw err;
+      }
+      if (mediaInfo.isVideoSticker) {
+        await convertWebmToAvif(rawSourcePath, finalAvifPath);
+      } else {
+        await convertTgsToAvif(rawSourcePath, finalAvifPath);
       }
       const previewPath = generateStickerPreviewFilePath(
         stickerSet.name,
         sticker.file_unique_id,
       );
-      await generatePreview(finalGifPath, previewPath);
+      await generatePreview(finalAvifPath, previewPath);
     } finally {
       await fsp.unlink(tempSourcePath).catch(() => undefined);
     }
@@ -511,6 +561,49 @@ async function downloadSingleSticker(
   } finally {
     await fsp.unlink(tempDownloadPath).catch(() => undefined);
   }
+}
+
+const RAW_SOURCE_BACKUP_PATTERN =
+  /^([a-zA-Z0-9_-]+\.(?:webm|tgs))\.backup-[a-f0-9-]+$/;
+
+async function listRawSourceBackups(stickerSetName: string): Promise<string[]> {
+  const entries = await fsp.readdir(generateStickerPackDirPath(stickerSetName));
+  return entries.filter(entry => RAW_SOURCE_BACKUP_PATTERN.test(entry));
+}
+
+async function restoreRawSourceBackups(stickerSetName: string): Promise<void> {
+  const packDir = generateStickerPackDirPath(stickerSetName);
+  for (const backupFilename of await listRawSourceBackups(stickerSetName)) {
+    const match = RAW_SOURCE_BACKUP_PATTERN.exec(backupFilename);
+    if (!match) continue;
+    const canonicalPath = path.join(packDir, match[1]);
+    await fsp.rm(canonicalPath, {force: true});
+    await fsp.rename(path.join(packDir, backupFilename), canonicalPath);
+  }
+}
+
+async function removeRawSourceBackups(stickerSetName: string): Promise<void> {
+  const packDir = generateStickerPackDirPath(stickerSetName);
+  await Promise.all(
+    (await listRawSourceBackups(stickerSetName)).map(filename =>
+      fsp.unlink(path.join(packDir, filename)).catch(() => undefined),
+    ),
+  );
+}
+
+async function restoreRawSourcesAfterFailure(
+  stickerSetName: string,
+  primaryError: unknown,
+): Promise<never> {
+  try {
+    await restoreRawSourceBackups(stickerSetName);
+  } catch (restoreError) {
+    throw new AggregateError(
+      [primaryError, restoreError],
+      `Sticker pack "${stickerSetName}" failed and raw source restoration also failed`,
+    );
+  }
+  throw primaryError;
 }
 
 interface DownloadState {
@@ -555,10 +648,14 @@ async function downloadStickerPack(telegram: Telegram, stickerSet: StickerSet) {
   await Promise.all(downloadPromises);
 
   if (state.error !== undefined) {
-    throw state.error;
+    await restoreRawSourcesAfterFailure(stickerSet.name, state.error);
   }
 
-  await publishStickerPackManifest(telegram, stickerSet);
+  try {
+    await publishStickerPackManifest(telegram, stickerSet);
+  } catch (err) {
+    await restoreRawSourcesAfterFailure(stickerSet.name, err);
+  }
 }
 
 // Per-pack FIFO ensuring the read-previous-manifest -> compute-version ->
@@ -785,6 +882,7 @@ async function removePublishedWorkingFiles(
       ];
     }),
   );
+  await removeRawSourceBackups(stickerSetName);
 }
 
 function getErrorCode(err: unknown): string | undefined {
@@ -947,8 +1045,8 @@ export function getCanonicalStickerFilename(sticker: McSticker): string {
     !filename ||
     path.basename(filename) !== filename ||
     filename.includes('..') ||
-    !/^[a-zA-Z0-9_-]+\.(?:gif|webp)$/i.test(filename) ||
-    (extension !== '.gif' && extension !== '.webp')
+    !/^[a-zA-Z0-9_-]+\.(?:avif|gif|webp)$/i.test(filename) ||
+    (extension !== '.avif' && extension !== '.gif' && extension !== '.webp')
   ) {
     throw new Error('Legacy sticker has no safe final filename');
   }

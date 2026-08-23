@@ -53,7 +53,7 @@ async function serveStickerAsset(
   }
   const validExtension =
     kind === 'stickers'
-      ? /^(?:webp|gif)$/.test(fileExtension)
+      ? /^(?:avif|gif|webp)$/.test(fileExtension)
       : fileExtension === 'webp';
   if (!validExtension) {
     await reply.code(400).send('Invalid file extension');
@@ -140,7 +140,12 @@ async function serveStickerAsset(
     return;
   }
 
-  const contentType = fileExtension === 'gif' ? 'image/gif' : 'image/webp';
+  const contentType =
+    fileExtension === 'avif'
+      ? 'image/avif'
+      : fileExtension === 'gif'
+        ? 'image/gif'
+        : 'image/webp';
   const cacheControl =
     rawVersion === undefined
       ? 'public, max-age=300'

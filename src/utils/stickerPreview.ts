@@ -1,7 +1,8 @@
-import {spawn} from 'node:child_process';
+import {findAnimatedAvifStreamIndexes} from './avifEncoder.js';
 import {randomUUID} from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import {runMediaProcess} from './mediaProcess.js';
 
 export const PREVIEW_TARGET_BYTES = 12 * 1024;
 export const PREVIEW_MAX_BYTES = 24 * 1024;
@@ -32,10 +33,48 @@ export type PreviewEncoder = (
   profile: PreviewEncodingProfile,
 ) => Promise<void>;
 
-const MAX_STDERR_BUFFER = 64 * 1024;
-
 export function buildPreviewFilter(profile: PreviewEncodingProfile): string {
   return `scale=w='min(${profile.maxDimension},iw)':h='min(${profile.maxDimension},ih)':force_original_aspect_ratio=decrease:flags=lanczos`;
+}
+
+export function buildPreviewFfmpegArgs(
+  inputPath: string,
+  candidatePath: string,
+  profile: PreviewEncodingProfile,
+  avifStreams?: {colorStreamIndex: number; alphaStreamIndex: number},
+): string[] {
+  const filter = buildPreviewFilter(profile);
+  const filterArgs = avifStreams
+    ? [
+        '-filter_complex_threads',
+        '1',
+        '-filter_complex',
+        `[0:${avifStreams.colorStreamIndex}][0:${avifStreams.alphaStreamIndex}]alphamerge,format=rgba,premultiply=inplace=1,${filter},unpremultiply=inplace=1,format=rgba,lut=a='if(lte(val,1),0,if(gte(val,254),255,val))'[preview]`,
+        '-map',
+        '[preview]',
+      ]
+    : ['-filter_threads', '1', '-vf', filter];
+  return [
+    '-y',
+    '-v',
+    'error',
+    '-threads',
+    '1',
+    '-i',
+    inputPath,
+    ...filterArgs,
+    '-frames:v',
+    '1',
+    '-c:v',
+    'libwebp',
+    '-threads',
+    '1',
+    '-quality',
+    String(profile.quality),
+    '-compression_level',
+    '6',
+    candidatePath,
+  ];
 }
 
 export const executePreviewFfmpeg: PreviewEncoder = async (
@@ -43,86 +82,15 @@ export const executePreviewFfmpeg: PreviewEncoder = async (
   candidatePath: string,
   profile: PreviewEncodingProfile,
 ): Promise<void> => {
-  const filter = buildPreviewFilter(profile);
-  const args = [
-    '-y',
-    '-v',
-    'error',
-    '-i',
-    inputPath,
-    '-frames:v',
-    '1',
-    '-vf',
-    filter,
-    '-c:v',
-    'libwebp',
-    '-quality',
-    String(profile.quality),
-    '-compression_level',
-    '6',
-    candidatePath,
-  ];
-
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    const resolveOnce = () => {
-      if (!settled) {
-        settled = true;
-        resolve();
-      }
-    };
-    const rejectOnce = (err: Error) => {
-      if (!settled) {
-        settled = true;
-        reject(err);
-      }
-    };
-
-    let child;
-    try {
-      child = spawn('ffmpeg', args, {
-        stdio: ['ignore', 'ignore', 'pipe'],
-      });
-    } catch (err) {
-      rejectOnce(
-        new Error(
-          `Failed to spawn ffmpeg for preview input "${inputPath}" (profile: ${JSON.stringify(profile)}): ${err instanceof Error ? err.message : String(err)}`,
-        ),
-      );
-      return;
-    }
-
-    let stderrData = '';
-
-    child.stderr.on('data', chunk => {
-      if (stderrData.length < MAX_STDERR_BUFFER) {
-        stderrData += chunk.toString();
-      }
-    });
-
-    child.on('error', err => {
-      rejectOnce(
-        new Error(
-          `FFmpeg preview process encountered error for "${inputPath}": ${err.message}`,
-        ),
-      );
-    });
-
-    child.on('close', code => {
-      if (code === 0) {
-        resolveOnce();
-      } else {
-        const errorDetails = stderrData.trim()
-          ? ` Details: ${stderrData.trim()}`
-          : '';
-        rejectOnce(
-          new Error(
-            `FFmpeg preview process exited with code ${code} for "${inputPath}".${errorDetails}`,
-          ),
-        );
-      }
-    });
-  });
+  const avifStreams =
+    path.extname(inputPath).toLowerCase() === '.avif'
+      ? await findAnimatedAvifStreamIndexes(inputPath)
+      : undefined;
+  await runMediaProcess(
+    'ffmpeg',
+    buildPreviewFfmpegArgs(inputPath, candidatePath, profile, avifStreams),
+    `preview encode for "${inputPath}" (profile: ${JSON.stringify(profile)})`,
+  );
 };
 
 export async function generatePreviewWithEncoder(

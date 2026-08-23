@@ -75,14 +75,14 @@ function isSafePublicFilename(filename: string): boolean {
   return (
     path.basename(filename) === filename &&
     !filename.includes('..') &&
-    /^[a-zA-Z0-9_-]+\.(?:gif|webp)$/.test(filename)
+    /^[a-zA-Z0-9_-]+\.(?:avif|gif|webp)$/.test(filename)
   );
 }
 
 function isSafeAssetFilename(filename: unknown): filename is string {
   return (
     typeof filename === 'string' &&
-    /^[a-f0-9]{64}\.(?:gif|webp)$/.test(filename)
+    /^[a-f0-9]{64}\.(?:avif|gif|webp)$/.test(filename)
   );
 }
 
@@ -157,7 +157,7 @@ export async function storeStickerAsset(
   sourcePath: string,
 ): Promise<string> {
   const extension = path.extname(sourcePath).toLowerCase();
-  if (extension !== '.gif' && extension !== '.webp') {
+  if (extension !== '.avif' && extension !== '.gif' && extension !== '.webp') {
     throw new Error(`Unsupported sticker asset extension: ${extension}`);
   }
 
