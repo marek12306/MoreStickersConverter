@@ -465,6 +465,30 @@ const animatedPreviewObserver = new IntersectionObserver(
   },
 );
 
+function loadHighQualitySticker(element) {
+  const fullSrc = element.dataset.fullSrc;
+  const image = element.querySelector('img');
+  if (!fullSrc || !image) return;
+  const highQualityImage = new Image();
+  highQualityImage.onload = () => {
+    if (image.isConnected) image.src = highQualityImage.src;
+  };
+  highQualityImage.src = fullSrc;
+}
+
+const stickerQualityObserver = new IntersectionObserver(
+  entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting || !entry.target.isConnected) continue;
+      stickerQualityObserver.unobserve(entry.target);
+      loadHighQualitySticker(entry.target);
+    }
+  },
+  {
+    rootMargin: '200px',
+  },
+);
+
 function packMarkup(pack) {
   const animatedSource =
     pack.animatedPreview && pack.animatedPreview !== pack.preview
@@ -525,15 +549,24 @@ async function openPack(id) {
 }
 
 function stickerMarkup(sticker) {
-  const staticSrc = sticker.previewImage || sticker.image || '';
+  const previewSrc = sticker.previewImage || sticker.image || '';
   const animatedSrc =
-    sticker.isAnimated === true && sticker.image !== staticSrc
+    sticker.isAnimated === true && sticker.image !== previewSrc
+      ? sticker.image
+      : '';
+  const fullSrc =
+    sticker.isAnimated !== true &&
+    sticker.previewImage &&
+    sticker.image !== previewSrc
       ? sticker.image
       : '';
   const hoverSource = animatedSrc
     ? ` data-animated-src="${esc(animatedSrc)}"`
     : '';
-  return `<div class="st" title="${esc(sticker.title || '')}"${hoverSource}><img src="${esc(staticSrc)}" alt="${esc(sticker.title || '')}" loading="lazy" decoding="async"></div>`;
+  const qualitySource = fullSrc
+    ? ` data-full-src="${esc(fullSrc)}"`
+    : '';
+  return `<div class="st" title="${esc(sticker.title || '')}"${hoverSource}${qualitySource}><img src="${esc(previewSrc)}" alt="${esc(sticker.title || '')}" loading="lazy" decoding="async"></div>`;
 }
 
 function drawPack(p, m) {
@@ -545,6 +578,7 @@ function drawPack(p, m) {
     m.logo?.previewImage ||
     m.logo?.image ||
     '';
+  stickerQualityObserver.disconnect();
   $('#dcontent').innerHTML = `<section class="packhero"><div class="heroimg"><img src="${esc(prev)}" alt=""></div><div class="herocopy"><h2>${esc(p.title || m.title || p.name)}</h2><p>${Number(p.stickerCount || list.length || 0)} stickers</p></div><button class="hero-copy" id="copy" type="button" aria-live="polite">Copy pack URL</button></section><div class="stickers">${list.length ? list.map(stickerMarkup).join('') : '<div class="loading">No stickers available.</div>'}</div>`;
   const copyButton = $('#copy');
   copyButton.onclick = async () => {
@@ -553,6 +587,9 @@ function drawPack(p, m) {
   document
     .querySelectorAll('.st[data-animated-src]')
     .forEach(enableHoverAnimation);
+  document
+    .querySelectorAll('.st[data-full-src]')
+    .forEach(sticker => stickerQualityObserver.observe(sticker));
 }
 
 function close() {
