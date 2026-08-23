@@ -2994,10 +2994,71 @@ const legacyAliasResponse = await app.inject({
   method: 'GET',
   url: `/sticker/telegram/${versionedHttpPackName}/A-160.gif`,
 });
+assert.equal(legacyAliasResponse.statusCode, 200);
 assert.equal(
-  legacyAliasResponse.statusCode,
+  legacyAliasResponse.body,
+  'version-11-sticker',
+  'Legacy -160.gif alias must serve the current A.avif bytes',
+);
+assert.equal(
+  legacyAliasResponse.headers['content-type'],
+  'image/avif',
+  'Legacy -160.gif alias must report the resolved asset type, not the request extension',
+);
+assert.equal(
+  legacyAliasResponse.headers['cache-control'],
+  'public, max-age=300',
+  'Legacy -160.gif alias must keep the short legacy cache policy',
+);
+// CASE 3: versioned routes must stay strict - no cross-extension fallback
+const versionedGifFallbackResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/11/A.gif`,
+});
+assert.equal(
+  versionedGifFallbackResponse.statusCode,
   404,
-  'Legacy GIF alias must not create or resolve an AVIF -160 alias',
+  'Versioned routes must stay strict: /11/A.gif must not fall back to A.avif',
+);
+const versionedGifAliasFallbackResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/11/A-160.gif`,
+});
+assert.equal(
+  versionedGifAliasFallbackResponse.statusCode,
+  404,
+  'Versioned routes must stay strict: /11/A-160.gif must not resolve',
+);
+// CASE 4: plain legacy GIF URL resolves to the current AVIF sticker
+const legacyGifFallbackResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/A.gif`,
+});
+assert.equal(legacyGifFallbackResponse.statusCode, 200);
+assert.equal(
+  legacyGifFallbackResponse.body,
+  'version-11-sticker',
+  'Legacy A.gif must serve the current A.avif bytes',
+);
+assert.equal(
+  legacyGifFallbackResponse.headers['content-type'],
+  'image/avif',
+  'Content-Type must come from the resolved asset, not the request extension',
+);
+assert.equal(
+  legacyGifFallbackResponse.headers['cache-control'],
+  'public, max-age=300',
+  'Legacy A.gif alias must use the short legacy cache policy',
+);
+// CASE 7: no unrelated cross-extension fallback
+const legacyUnrelatedFallbackResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${versionedHttpPackName}/A.webp`,
+});
+assert.equal(
+  legacyUnrelatedFallbackResponse.statusCode,
+  404,
+  'No unrelated fallback: A.webp must not resolve to A.avif',
 );
 const versionedPreviewResponse = await app.inject({
   method: 'GET',
@@ -3028,6 +3089,88 @@ assert.equal(legacyPreviewResponse.body, 'version-11-preview');
 assert.equal(
   legacyPreviewResponse.headers['cache-control']?.includes('immutable'),
   false,
+);
+// CASE 6: a current real GIF keeps priority over the AVIF compatibility fallback
+const gifCurrentPackName = 'LegacyGifStillCurrentPack';
+const gifCurrentPackDir = generateStickerPackDirPath(gifCurrentPackName);
+await fsp.mkdir(gifCurrentPackDir, {recursive: true});
+const gifCurrentStickerSource = path.join(gifCurrentPackDir, 'current-b.gif');
+const gifCurrentPreviewSource = path.join(gifCurrentPackDir, 'current-b.webp');
+await fsp.writeFile(gifCurrentStickerSource, 'current-gif-sticker');
+await fsp.writeFile(gifCurrentPreviewSource, 'current-gif-preview');
+const gifCurrentStickerAsset = await storeStickerAsset(
+  gifCurrentPackName,
+  gifCurrentStickerSource,
+);
+const gifCurrentPreviewAsset = await storeStickerAsset(
+  gifCurrentPackName,
+  gifCurrentPreviewSource,
+);
+await writeStickerVersionIndexAtomically(gifCurrentPackName, {
+  version: 1,
+  signature: 'gif-current-version',
+  stickers: {'B.gif': gifCurrentStickerAsset},
+  previews: {'B.webp': gifCurrentPreviewAsset},
+});
+await fsp.writeFile(
+  generateStickerPackFilePath(gifCurrentPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${gifCurrentPackName}`,
+    title: 'GIF Current Pack',
+    logo: {
+      id: `MoreStickers:Telegram:Sticker:${gifCurrentPackName}:B`,
+      image: `https://stickers.example.com/sticker/telegram/${gifCurrentPackName}/1/B.gif`,
+      previewImage: `https://stickers.example.com/preview/telegram/${gifCurrentPackName}/1/B.webp`,
+      title: 'B',
+      stickerPackId: `MoreStickers:Telegram:Pack:${gifCurrentPackName}`,
+      filename: 'B.gif',
+      isAnimated: true,
+      readyToUpload: true,
+    },
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${gifCurrentPackName}:B`,
+        image: `https://stickers.example.com/sticker/telegram/${gifCurrentPackName}/1/B.gif`,
+        previewImage: `https://stickers.example.com/preview/telegram/${gifCurrentPackName}/1/B.webp`,
+        title: 'B',
+        stickerPackId: `MoreStickers:Telegram:Pack:${gifCurrentPackName}`,
+        filename: 'B.gif',
+        isAnimated: true,
+        readyToUpload: true,
+      },
+    ],
+    dynamic: {
+      version: 1,
+      refreshUrl: generateStickerPackExternalUrl(gifCurrentPackName),
+    },
+  }),
+);
+const currentGifResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${gifCurrentPackName}/B.gif`,
+});
+assert.equal(currentGifResponse.statusCode, 200);
+assert.equal(currentGifResponse.body, 'current-gif-sticker');
+assert.equal(currentGifResponse.headers['content-type'], 'image/gif');
+const currentGifAliasResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${gifCurrentPackName}/B-160.gif`,
+});
+assert.equal(currentGifAliasResponse.statusCode, 200);
+assert.equal(currentGifAliasResponse.body, 'current-gif-sticker');
+assert.equal(
+  currentGifAliasResponse.headers['content-type'],
+  'image/gif',
+  'Current real GIF must win over the AVIF compatibility fallback',
+);
+const currentGifReverseFallbackResponse = await app.inject({
+  method: 'GET',
+  url: `/sticker/telegram/${gifCurrentPackName}/B.avif`,
+});
+assert.equal(
+  currentGifReverseFallbackResponse.statusCode,
+  404,
+  'No reverse fallback: B.avif must not resolve to an existing B.gif',
 );
 assert.equal(
   (

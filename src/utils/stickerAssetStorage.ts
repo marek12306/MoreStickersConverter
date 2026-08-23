@@ -556,15 +556,36 @@ export async function resolveLegacyStickerAssetPath(
     filename,
     kind,
   );
-  if (exactPath || kind !== 'stickers' || !filename.endsWith('-160.gif')) {
+  if (exactPath || kind !== 'stickers') {
     return exactPath;
   }
-  return await resolveStickerAssetPath(
-    stickerSetName,
-    version,
-    filename.replace(/-160\.gif$/, '.gif'),
-    kind,
-  );
+  // Legacy -160 alias: A-160.gif -> A.gif (never materialized in an index).
+  const aliasedFilename = filename.endsWith('-160.gif')
+    ? filename.replace(/-160\.gif$/, '.gif')
+    : filename;
+  if (aliasedFilename !== filename) {
+    const aliasedPath = await resolveStickerAssetPath(
+      stickerSetName,
+      version,
+      aliasedFilename,
+      kind,
+    );
+    if (aliasedPath) {
+      return aliasedPath;
+    }
+  }
+  // Legacy animated-GIF compatibility: A.gif -> current A.avif. Applies only
+  // to the logical stickered name (after the -160 alias above), never to
+  // other extensions or to a physical A-160.avif.
+  if (aliasedFilename.endsWith('.gif')) {
+    return await resolveStickerAssetPath(
+      stickerSetName,
+      version,
+      aliasedFilename.replace(/\.gif$/, '.avif'),
+      kind,
+    );
+  }
+  return undefined;
 }
 
 async function garbageCollectStickerPack(stickerSetName: string): Promise<{

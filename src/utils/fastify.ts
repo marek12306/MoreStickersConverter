@@ -140,10 +140,13 @@ async function serveStickerAsset(
     return;
   }
 
+  // Content-Type must reflect the actually resolved asset, not the request
+  // filename: a legacy /A.gif request may resolve to the current A.avif.
+  const resolvedExtension = path.extname(assetPath).slice(1).toLowerCase();
   const contentType =
-    fileExtension === 'avif'
+    resolvedExtension === 'avif'
       ? 'image/avif'
-      : fileExtension === 'gif'
+      : resolvedExtension === 'gif'
         ? 'image/gif'
         : 'image/webp';
   const cacheControl =
