@@ -1116,9 +1116,135 @@ function setVersionAssetMapping(
   mapping[filename] = assetFilename;
 }
 
+interface LegacyMigrationInputs {
+  stickerSourcePaths?: ReadonlyMap<string, string>;
+  previewSourcePaths?: ReadonlyMap<string, string>;
+  sourceFilenames?: ReadonlySet<string>;
+}
+
+interface PreparedLegacyAnimatedPack {
+  pack: StickerPack;
+  inputs: LegacyMigrationInputs;
+  temporaryPaths: Set<string>;
+}
+
+function getLegacyAnimatedSourceExtension(
+  filename: string | undefined,
+): 'webm' | 'tgs' | undefined {
+  const extension = path
+    .extname(filename ?? '')
+    .slice(1)
+    .toLowerCase();
+  return extension === 'webm' || extension === 'tgs' ? extension : undefined;
+}
+function hasLegacyAnimatedReference(sticker: McSticker): boolean {
+  const image = sticker.image?.toLowerCase();
+  return Boolean(
+    getLegacyAnimatedSourceExtension(sticker.filename) ||
+      image?.endsWith('.webm') ||
+      image?.endsWith('.tgs'),
+  );
+}
+
+async function removeTemporaryMigrationPaths(
+  temporaryPaths: Iterable<string>,
+): Promise<void> {
+  await Promise.all(
+    [...temporaryPaths].map(file =>
+      fsp.rm(file, {force: true}).catch(() => undefined),
+    ),
+  );
+}
+
+async function prepareLegacyAnimatedPack(
+  stickerSetName: string,
+  pack: StickerPack,
+): Promise<PreparedLegacyAnimatedPack | undefined> {
+  if (!pack.stickers.some(hasLegacyAnimatedReference)) {
+    return undefined;
+  }
+
+  const migratedPack: StickerPack = {
+    ...pack,
+    logo: {...pack.logo},
+    stickers: pack.stickers.map(sticker => ({...sticker})),
+    ...(pack.dynamic ? {dynamic: {...pack.dynamic}} : {}),
+  };
+  const stickerSourcePaths = new Map<string, string>();
+  const previewSourcePaths = new Map<string, string>();
+  const sourceFilenames = new Set<string>();
+  const temporaryPaths = new Set<string>();
+  const packDir = generateStickerPackDirPath(stickerSetName);
+  await fsp.mkdir(generateStickerPreviewDirPath(stickerSetName), {
+    recursive: true,
+  });
+
+  try {
+    for (const sticker of migratedPack.stickers) {
+      const sourceExtension = getLegacyAnimatedSourceExtension(
+        sticker.filename,
+      );
+      if (!sourceExtension && hasLegacyAnimatedReference(sticker)) {
+        throw new Error(
+          'Legacy animated sticker reference has no matching source filename',
+        );
+      }
+      if (!sourceExtension) {
+        continue;
+      }
+      const sourceFilename = sticker.filename!;
+      const stickerId = sticker.id.split(':').pop();
+      if (
+        !stickerId ||
+        !/^[a-zA-Z0-9_-]+$/.test(stickerId) ||
+        path.basename(sourceFilename) !== sourceFilename ||
+        !/^[a-zA-Z0-9_-]+\.(?:webm|tgs)$/i.test(sourceFilename)
+      ) {
+        throw new Error('Legacy animated sticker has no safe source filename');
+      }
+
+      const migrationId = randomUUID();
+      const sourcePath = path.join(packDir, sourceFilename);
+      const avifPath = path.join(
+        packDir,
+        `.${stickerId}.legacy-${migrationId}.avif`,
+      );
+      const previewPath = path.join(
+        generateStickerPreviewDirPath(stickerSetName),
+        `.${stickerId}.legacy-${migrationId}.webp`,
+      );
+      temporaryPaths.add(avifPath);
+      temporaryPaths.add(previewPath);
+      if (sourceExtension === 'webm') {
+        await convertWebmToAvif(sourcePath, avifPath);
+      } else {
+        await convertTgsToAvif(sourcePath, avifPath);
+      }
+      await generatePreview(avifPath, previewPath);
+
+      sticker.filename = `${stickerId}.avif`;
+      sticker.isAnimated = true;
+      sticker.readyToUpload = true;
+      stickerSourcePaths.set(sticker.id, avifPath);
+      previewSourcePaths.set(sticker.id, previewPath);
+      sourceFilenames.add(sourceFilename);
+    }
+  } catch (err) {
+    await removeTemporaryMigrationPaths(temporaryPaths);
+    throw err;
+  }
+
+  return {
+    pack: migratedPack,
+    inputs: {stickerSourcePaths, previewSourcePaths, sourceFilenames},
+    temporaryPaths,
+  };
+}
+
 async function migrateLegacyStickerPackUnlocked(
   stickerSetName: string,
   pack: StickerPack,
+  inputs: LegacyMigrationInputs = {},
 ): Promise<boolean> {
   const version = pack.dynamic?.version ?? 1;
   const existingIndex = await readStickerVersionIndex(stickerSetName, version);
@@ -1139,11 +1265,10 @@ async function migrateLegacyStickerPackUnlocked(
     await assertStoredVersionComplete(stickerSetName, pack, existingIndex);
   }
   if (alreadyMigrated) {
-    await removeIndexedWorkingFiles(
-      stickerSetName,
-      existingIndex,
-      originalFilenames.values(),
-    );
+    await removeIndexedWorkingFiles(stickerSetName, existingIndex, [
+      ...originalFilenames.values(),
+      ...(inputs.sourceFilenames ?? []),
+    ]);
     return false;
   }
 
@@ -1160,12 +1285,17 @@ async function migrateLegacyStickerPackUnlocked(
       }
       const stickerAsset = await storeStickerAsset(
         stickerSetName,
-        path.join(generateStickerPackDirPath(stickerSetName), originalFilename),
+        inputs.stickerSourcePaths?.get(sticker.id) ??
+          path.join(
+            generateStickerPackDirPath(stickerSetName),
+            originalFilename,
+          ),
       );
       const previewFilename = `${stickerId}.webp`;
       const previewAsset = await storeStickerAsset(
         stickerSetName,
-        generateStickerPreviewFilePath(stickerSetName, stickerId),
+        inputs.previewSourcePaths?.get(sticker.id) ??
+          generateStickerPreviewFilePath(stickerSetName, stickerId),
       );
       setVersionAssetMapping(stickers, sticker.filename, stickerAsset);
       setVersionAssetMapping(previews, previewFilename, previewAsset);
@@ -1193,13 +1323,31 @@ async function migrateLegacyStickerPackUnlocked(
     generateStickerPackFilePath(stickerSetName),
     pack,
   );
-  await removeIndexedWorkingFiles(
-    stickerSetName,
-    index,
-    originalFilenames.values(),
-  );
+  await removeIndexedWorkingFiles(stickerSetName, index, [
+    ...originalFilenames.values(),
+    ...(inputs.sourceFilenames ?? []),
+  ]);
   console.log(`Legacy sticker pack migrated: ${stickerSetName}`);
   return true;
+}
+
+async function migrateLegacyStickerPackWithAnimatedSources(
+  stickerSetName: string,
+  pack: StickerPack,
+): Promise<boolean> {
+  const prepared = await prepareLegacyAnimatedPack(stickerSetName, pack);
+  if (!prepared) {
+    return await migrateLegacyStickerPackUnlocked(stickerSetName, pack);
+  }
+  try {
+    return await migrateLegacyStickerPackUnlocked(
+      stickerSetName,
+      prepared.pack,
+      prepared.inputs,
+    );
+  } finally {
+    await removeTemporaryMigrationPaths(prepared.temporaryPaths);
+  }
 }
 
 export async function migrateLegacyStickerPack(
@@ -1207,7 +1355,7 @@ export async function migrateLegacyStickerPack(
   pack: StickerPack,
 ): Promise<boolean> {
   return await withStickerStorageMutation(stickerSetName, async () =>
-    migrateLegacyStickerPackUnlocked(stickerSetName, pack),
+    migrateLegacyStickerPackWithAnimatedSources(stickerSetName, pack),
   );
 }
 
@@ -1232,23 +1380,10 @@ export async function migrateLegacyStickerStorage(): Promise<number> {
           if (!pack) {
             throw new Error('invalid manifest');
           }
-          if (
-            pack.stickers.some(sticker => {
-              const filename = sticker.filename?.toLowerCase();
-              const image = sticker.image?.toLowerCase();
-              return (
-                (filename !== undefined &&
-                  (filename.endsWith('.webm') || filename.endsWith('.tgs'))) ||
-                (image !== undefined &&
-                  (image.endsWith('.webm') || image.endsWith('.tgs')))
-              );
-            })
-          ) {
-            throw new Error(
-              'raw animated assets require regeneration; existing files were preserved',
-            );
-          }
-          return await migrateLegacyStickerPackUnlocked(entry.name, pack);
+          return await migrateLegacyStickerPackWithAnimatedSources(
+            entry.name,
+            pack,
+          );
         },
       );
       if (didMigrate) {

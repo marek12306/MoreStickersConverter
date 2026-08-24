@@ -1297,6 +1297,7 @@ const lottieConverterError = lottieConverterProbe.error as
   | NodeJS.ErrnoException
   | undefined;
 const lottieConverterUnavailable = lottieConverterError?.code === 'ENOENT';
+let realTgsFixturePath: string | undefined;
 if (lottieConverterUnavailable) {
   if (requireLottieConverter) {
     assert.fail(
@@ -1315,6 +1316,7 @@ if (lottieConverterUnavailable) {
   console.log('Testing real TGS to animated AVIF conversion...');
   const tgsIntegrationDir = await fsp.mkdtemp(path.join(tempDir, 'tgs-real-'));
   const inputTgsPath = path.join(tgsIntegrationDir, 'fixture.tgs');
+  realTgsFixturePath = inputTgsPath;
   const outputTgsAvifPath = path.join(tgsIntegrationDir, 'fixture.avif');
   const lottieJson = JSON.stringify({
     v: '5.7.4',
@@ -2484,7 +2486,123 @@ const migrationInvalidManifestPath =
 const migrationInvalidManifest = '{invalid-json';
 await fsp.writeFile(migrationInvalidManifestPath, migrationInvalidManifest);
 
+const upstreamAnimatedPackName = 'UpstreamAnimatedStoragePack';
+const upstreamAnimatedPackDir = generateStickerPackDirPath(
+  upstreamAnimatedPackName,
+);
+await fsp.mkdir(upstreamAnimatedPackDir, {recursive: true});
+const upstreamWebmFilename = 'upstream-webm.webm';
+const upstreamWebmPath = path.join(
+  upstreamAnimatedPackDir,
+  upstreamWebmFilename,
+);
+await fsp.copyFile(testWebmPath, upstreamWebmPath);
+const upstreamAnimatedStickers = [
+  {
+    id: `MoreStickers:Telegram:Sticker:${upstreamAnimatedPackName}:upstream-webm`,
+    image: `https://stickers.example.com/sticker/telegram/${upstreamAnimatedPackName}/${upstreamWebmFilename}`,
+    title: 'webm',
+    stickerPackId: `MoreStickers:Telegram:Pack:${upstreamAnimatedPackName}`,
+    filename: upstreamWebmFilename,
+    isAnimated: false,
+  },
+];
+let upstreamTgsPath: string | undefined;
+if (realTgsFixturePath) {
+  const upstreamTgsFilename = 'upstream-tgs.tgs';
+  upstreamTgsPath = path.join(upstreamAnimatedPackDir, upstreamTgsFilename);
+  await fsp.copyFile(realTgsFixturePath, upstreamTgsPath);
+  upstreamAnimatedStickers.push({
+    id: `MoreStickers:Telegram:Sticker:${upstreamAnimatedPackName}:upstream-tgs`,
+    image: `https://stickers.example.com/sticker/telegram/${upstreamAnimatedPackName}/${upstreamTgsFilename}`,
+    title: 'tgs',
+    stickerPackId: `MoreStickers:Telegram:Pack:${upstreamAnimatedPackName}`,
+    filename: upstreamTgsFilename,
+    isAnimated: true,
+  });
+}
+await fsp.writeFile(
+  generateStickerPackFilePath(upstreamAnimatedPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${upstreamAnimatedPackName}`,
+    title: 'Upstream Animated Storage Pack',
+    logo: upstreamAnimatedStickers[0],
+    stickers: upstreamAnimatedStickers,
+  }),
+);
+
+console.log('Testing startup migration of upstream WebM/TGS storage...');
 await migrateLegacyStickerStorage();
+const migratedUpstreamManifest = validateLocalStickerPackManifest(
+  await readManifestOrUndefined(upstreamAnimatedPackName),
+);
+assert.ok(migratedUpstreamManifest);
+assert.equal(migratedUpstreamManifest.dynamic?.version, 1);
+assert.deepEqual(
+  migratedUpstreamManifest.stickers.map(sticker => sticker.filename),
+  realTgsFixturePath
+    ? ['upstream-webm.avif', 'upstream-tgs.avif']
+    : ['upstream-webm.avif'],
+  'Startup migration must publish AVIF filenames for upstream animated assets',
+);
+assert.ok(
+  migratedUpstreamManifest.stickers.every(
+    sticker =>
+      sticker.readyToUpload === true &&
+      sticker.image.includes(`/${upstreamAnimatedPackName}/1/`) &&
+      sticker.image.endsWith('.avif'),
+  ),
+  'Migrated upstream stickers must be immediately publishable as version 1 AVIF',
+);
+assert.equal(
+  fs.existsSync(upstreamWebmPath),
+  false,
+  'Published migration must remove the obsolete WebM working copy',
+);
+if (upstreamTgsPath) {
+  assert.equal(
+    fs.existsSync(upstreamTgsPath),
+    false,
+    'Published migration must remove the obsolete TGS working copy',
+  );
+}
+for (const legacyFilename of upstreamAnimatedStickers.map(
+  sticker => sticker.filename,
+)) {
+  const legacyResponse = await app.inject({
+    method: 'GET',
+    url: `/sticker/telegram/${upstreamAnimatedPackName}/${legacyFilename}`,
+  });
+  assert.equal(
+    legacyResponse.statusCode,
+    200,
+    `Installed upstream URL ${legacyFilename} must work after startup migration`,
+  );
+  assert.equal(legacyResponse.headers['content-type'], 'image/avif');
+  assert.equal(legacyResponse.headers['cache-control'], 'public, max-age=300');
+  const stickerId = path.basename(legacyFilename, path.extname(legacyFilename));
+  const migratedAssetPath = await resolveStickerAssetPath(
+    upstreamAnimatedPackName,
+    1,
+    `${stickerId}.avif`,
+    'stickers',
+  );
+  assert.ok(migratedAssetPath);
+  assert.deepEqual(
+    legacyResponse.rawPayload,
+    await fsp.readFile(migratedAssetPath),
+    'Legacy upstream URL must serve the migrated AVIF bytes',
+  );
+  const versionedLegacyResponse = await app.inject({
+    method: 'GET',
+    url: `/sticker/telegram/${upstreamAnimatedPackName}/1/${legacyFilename}`,
+  });
+  assert.equal(
+    versionedLegacyResponse.statusCode,
+    400,
+    'Upstream extension compatibility must remain versionless-only',
+  );
+}
 assert.ok(
   await readStickerVersionIndex(migrationGoodBefore, 1),
   'A valid pack before a failing pack must migrate',
@@ -2502,6 +2620,13 @@ assert.equal(
   await fsp.readFile(migrationRawManifestPath, 'utf8'),
   migrationRawManifest,
   'Raw TGS manifest must remain untouched',
+);
+assert.deepEqual(
+  (await fsp.readdir(migrationRawDir)).filter(filename =>
+    filename.includes('.legacy-'),
+  ),
+  [],
+  'Failed raw migration must clean temporary AVIF and preview files',
 );
 assert.equal(
   await fsp.readFile(migrationInvalidManifestPath, 'utf8'),

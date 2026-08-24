@@ -574,6 +574,16 @@ export async function resolveLegacyStickerAssetPath(
       return aliasedPath;
     }
   }
+  // Compatibility for upstream manifests installed before the fork:
+  // versionless A.webm/A.tgs URLs resolve only to the current A.avif asset.
+  if (aliasedFilename.endsWith('.webm') || aliasedFilename.endsWith('.tgs')) {
+    return await resolveStickerAssetPath(
+      stickerSetName,
+      version,
+      aliasedFilename.replace(/\.(?:webm|tgs)$/, '.avif'),
+      kind,
+    );
+  }
   // Legacy animated-GIF compatibility: A.gif -> current A.avif. Applies only
   // to the logical stickered name (after the -160 alias above), never to
   // other extensions or to a physical A-160.avif.

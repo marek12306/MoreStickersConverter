@@ -51,9 +51,13 @@ async function serveStickerAsset(
     await reply.code(400).send('Invalid sticker id');
     return;
   }
+  const isLegacyAnimatedRequest =
+    kind === 'stickers' &&
+    rawVersion === undefined &&
+    /^(?:webm|tgs)$/.test(fileExtension);
   const validExtension =
     kind === 'stickers'
-      ? /^(?:avif|gif|webp)$/.test(fileExtension)
+      ? /^(?:avif|gif|webp)$/.test(fileExtension) || isLegacyAnimatedRequest
       : fileExtension === 'webp';
   if (!validExtension) {
     await reply.code(400).send('Invalid file extension');
@@ -100,6 +104,10 @@ async function serveStickerAsset(
     );
     version = manifest?.dynamic?.version;
   }
+  if (isLegacyAnimatedRequest && version === undefined) {
+    await reply.code(400).send('Invalid file extension');
+    return;
+  }
 
   let assetPath: string | undefined;
   if (version !== undefined) {
@@ -118,11 +126,20 @@ async function serveStickerAsset(
             kind,
           );
   }
-  if (rawVersion === undefined && version === undefined && !assetPath) {
+  if (
+    rawVersion === undefined &&
+    version === undefined &&
+    !assetPath &&
+    !isLegacyAnimatedRequest
+  ) {
     assetPath =
       kind === 'stickers'
         ? path.join(DATA_DIR, stickerPackName, filename)
         : generateStickerPreviewFilePath(stickerPackName, stickerId);
+  }
+  if (!assetPath && isLegacyAnimatedRequest) {
+    await reply.code(400).send('Invalid file extension');
+    return;
   }
   if (!assetPath) {
     await reply
