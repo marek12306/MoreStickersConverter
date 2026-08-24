@@ -2702,7 +2702,10 @@ for (const legacyFilename of upstreamAnimatedStickers.map(
     `Installed upstream URL ${legacyFilename} must work after startup migration`,
   );
   assert.equal(legacyResponse.headers['content-type'], 'image/avif');
-  assert.equal(legacyResponse.headers['cache-control'], 'public, max-age=300');
+  assert.equal(
+    legacyResponse.headers['cache-control'],
+    'public, max-age=300',
+  );
   const stickerId = path.basename(legacyFilename, path.extname(legacyFilename));
   const migratedAssetPath = await resolveStickerAssetPath(
     upstreamAnimatedPackName,
@@ -3145,9 +3148,9 @@ const version10Response = await app.inject({
 });
 assert.equal(version10Response.statusCode, 200);
 assert.equal(version10Response.body, 'version-10-sticker');
-assert.ok(version10Response.headers['cache-control']?.includes('immutable'));
-assert.ok(
-  version10Response.headers['cache-control']?.includes('max-age=31536000'),
+assert.equal(
+  version10Response.headers['cache-control'],
+  'public, max-age=604800',
 );
 const pendingVersion11Response = await app.inject({
   method: 'GET',
@@ -3190,7 +3193,10 @@ const version11Response = await app.inject({
 assert.equal(version11Response.statusCode, 200);
 assert.equal(version11Response.body, 'version-11-sticker');
 assert.equal(version11Response.headers['content-type'], 'image/avif');
-assert.ok(version11Response.headers['cache-control']?.includes('immutable'));
+assert.equal(
+  version11Response.headers['cache-control'],
+  'public, max-age=604800',
+);
 const retainedVersion10 = await readStickerVersionIndex(
   versionedHttpPackName,
   10,
@@ -3217,8 +3223,8 @@ const legacyLatestResponse = await app.inject({
 assert.equal(legacyLatestResponse.statusCode, 200);
 assert.equal(legacyLatestResponse.body, 'version-11-sticker');
 assert.equal(
-  legacyLatestResponse.headers['cache-control']?.includes('immutable'),
-  false,
+  legacyLatestResponse.headers['cache-control'],
+  'public, max-age=300',
 );
 const versionedLegacyAliasResponse = await app.inject({
   method: 'GET',
@@ -3256,7 +3262,7 @@ assert.equal(
 assert.equal(
   legacyAliasResponse.headers['cache-control'],
   'public, max-age=300',
-  'Legacy -160.gif alias must keep the short legacy cache policy',
+  'Legacy -160.gif alias must use the short mutable cache policy',
 );
 // CASE 3: versioned routes must stay strict - no cross-extension fallback
 const versionedGifFallbackResponse = await app.inject({
@@ -3296,7 +3302,7 @@ assert.equal(
 assert.equal(
   legacyGifFallbackResponse.headers['cache-control'],
   'public, max-age=300',
-  'Legacy A.gif alias must use the short legacy cache policy',
+  'Legacy A.gif alias must use the short mutable cache policy',
 );
 // CASE 7: no unrelated cross-extension fallback
 const legacyUnrelatedFallbackResponse = await app.inject({
@@ -3314,8 +3320,9 @@ const versionedPreviewResponse = await app.inject({
 });
 assert.equal(versionedPreviewResponse.statusCode, 200);
 assert.equal(versionedPreviewResponse.body, 'version-10-preview');
-assert.ok(
-  versionedPreviewResponse.headers['cache-control']?.includes('immutable'),
+assert.equal(
+  versionedPreviewResponse.headers['cache-control'],
+  'public, max-age=604800',
 );
 const committedVersion11PreviewResponse = await app.inject({
   method: 'GET',
@@ -3323,10 +3330,9 @@ const committedVersion11PreviewResponse = await app.inject({
 });
 assert.equal(committedVersion11PreviewResponse.statusCode, 200);
 assert.equal(committedVersion11PreviewResponse.body, 'version-11-preview');
-assert.ok(
-  committedVersion11PreviewResponse.headers['cache-control']?.includes(
-    'immutable',
-  ),
+assert.equal(
+  committedVersion11PreviewResponse.headers['cache-control'],
+  'public, max-age=604800',
 );
 const legacyPreviewResponse = await app.inject({
   method: 'GET',
@@ -3335,8 +3341,8 @@ const legacyPreviewResponse = await app.inject({
 assert.equal(legacyPreviewResponse.statusCode, 200);
 assert.equal(legacyPreviewResponse.body, 'version-11-preview');
 assert.equal(
-  legacyPreviewResponse.headers['cache-control']?.includes('immutable'),
-  false,
+  legacyPreviewResponse.headers['cache-control'],
+  'public, max-age=300',
 );
 // CASE 6: a current real GIF keeps priority over the AVIF compatibility fallback
 const gifCurrentPackName = 'LegacyGifStillCurrentPack';
@@ -3590,8 +3596,9 @@ const refreshedAvifResponse = await app.inject({
 });
 assert.equal(refreshedAvifResponse.statusCode, 200);
 assert.equal(refreshedAvifResponse.headers['content-type'], 'image/avif');
-assert.ok(
-  refreshedAvifResponse.headers['cache-control']?.includes('immutable'),
+assert.equal(
+  refreshedAvifResponse.headers['cache-control'],
+  'public, max-age=604800',
 );
 await pruneOldStickerVersions(refreshTransitionPackName);
 assert.deepEqual(

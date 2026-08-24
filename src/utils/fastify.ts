@@ -169,7 +169,7 @@ async function serveStickerAsset(
   const cacheControl =
     rawVersion === undefined
       ? 'public, max-age=300'
-      : 'public, max-age=31536000, immutable';
+      : 'public, max-age=604800';
   try {
     await reply
       .type(contentType)
