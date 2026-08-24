@@ -1156,6 +1156,32 @@ async function removeTemporaryMigrationPaths(
   );
 }
 
+async function ensureLegacyPreviewSourcePath(
+  stickerSetName: string,
+  stickerId: string,
+  stickerSourcePath: string,
+  providedPreviewPath: string | undefined,
+): Promise<string> {
+  if (providedPreviewPath) {
+    return providedPreviewPath;
+  }
+
+  const previewPath = generateStickerPreviewFilePath(stickerSetName, stickerId);
+  try {
+    await fsp.access(previewPath);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      throw err;
+    }
+    if (path.extname(stickerSourcePath).toLowerCase() !== '.webp') {
+      return previewPath;
+    }
+    await fsp.mkdir(path.dirname(previewPath), {recursive: true});
+    await generatePreview(stickerSourcePath, previewPath);
+  }
+  return previewPath;
+}
+
 async function prepareLegacyAnimatedPack(
   stickerSetName: string,
   pack: StickerPack,
@@ -1283,19 +1309,23 @@ async function migrateLegacyStickerPackUnlocked(
       if (!originalFilename || !sticker.filename || !stickerId) {
         throw new Error('Legacy sticker manifest contains invalid identity');
       }
+      const stickerSourcePath =
+        inputs.stickerSourcePaths?.get(sticker.id) ??
+        path.join(generateStickerPackDirPath(stickerSetName), originalFilename);
+      const previewSourcePath = await ensureLegacyPreviewSourcePath(
+        stickerSetName,
+        stickerId,
+        stickerSourcePath,
+        inputs.previewSourcePaths?.get(sticker.id),
+      );
       const stickerAsset = await storeStickerAsset(
         stickerSetName,
-        inputs.stickerSourcePaths?.get(sticker.id) ??
-          path.join(
-            generateStickerPackDirPath(stickerSetName),
-            originalFilename,
-          ),
+        stickerSourcePath,
       );
       const previewFilename = `${stickerId}.webp`;
       const previewAsset = await storeStickerAsset(
         stickerSetName,
-        inputs.previewSourcePaths?.get(sticker.id) ??
-          generateStickerPreviewFilePath(stickerSetName, stickerId),
+        previewSourcePath,
       );
       setVersionAssetMapping(stickers, sticker.filename, stickerAsset);
       setVersionAssetMapping(previews, previewFilename, previewAsset);

@@ -2486,6 +2486,42 @@ const migrationInvalidManifestPath =
 const migrationInvalidManifest = '{invalid-json';
 await fsp.writeFile(migrationInvalidManifestPath, migrationInvalidManifest);
 
+const upstreamStaticPackName = 'UpstreamStaticStoragePack';
+const upstreamStaticPackDir = generateStickerPackDirPath(
+  upstreamStaticPackName,
+);
+await fsp.mkdir(upstreamStaticPackDir, {recursive: true});
+const upstreamStaticFilename = 'upstream-static.webp';
+const upstreamStaticPath = path.join(
+  upstreamStaticPackDir,
+  upstreamStaticFilename,
+);
+await generatePreview(testAvifPath, upstreamStaticPath);
+const upstreamStaticSticker = {
+  id: `MoreStickers:Telegram:Sticker:${upstreamStaticPackName}:upstream-static`,
+  image: `https://stickers.example.com/sticker/telegram/${upstreamStaticPackName}/${upstreamStaticFilename}`,
+  title: 'static',
+  stickerPackId: `MoreStickers:Telegram:Pack:${upstreamStaticPackName}`,
+  filename: upstreamStaticFilename,
+  isAnimated: false,
+};
+await fsp.writeFile(
+  generateStickerPackFilePath(upstreamStaticPackName),
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${upstreamStaticPackName}`,
+    title: 'Upstream Static Storage Pack',
+    logo: upstreamStaticSticker,
+    stickers: [upstreamStaticSticker],
+  }),
+);
+assert.equal(
+  fs.existsSync(
+    generateStickerPreviewFilePath(upstreamStaticPackName, 'upstream-static'),
+  ),
+  false,
+  'The upstream fixture must not contain a fork preview',
+);
+
 const upstreamAnimatedPackName = 'UpstreamAnimatedStoragePack';
 const upstreamAnimatedPackDir = generateStickerPackDirPath(
   upstreamAnimatedPackName,
@@ -2533,6 +2569,52 @@ await fsp.writeFile(
 
 console.log('Testing startup migration of upstream WebM/TGS storage...');
 await migrateLegacyStickerStorage();
+const migratedUpstreamStaticManifest = validateLocalStickerPackManifest(
+  await readManifestOrUndefined(upstreamStaticPackName),
+);
+assert.ok(migratedUpstreamStaticManifest);
+assert.equal(migratedUpstreamStaticManifest.dynamic?.version, 1);
+assert.ok(
+  migratedUpstreamStaticManifest.stickers[0].image.endsWith(
+    `/${upstreamStaticPackName}/1/${upstreamStaticFilename}`,
+  ),
+);
+assert.ok(
+  migratedUpstreamStaticManifest.stickers[0].previewImage?.endsWith(
+    `/${upstreamStaticPackName}/1/upstream-static.webp`,
+  ),
+);
+const migratedUpstreamStaticIndex = await readStickerVersionIndex(
+  upstreamStaticPackName,
+  1,
+);
+assert.ok(migratedUpstreamStaticIndex?.stickers[upstreamStaticFilename]);
+assert.ok(migratedUpstreamStaticIndex?.previews['upstream-static.webp']);
+const migratedUpstreamStaticPreviewPath = await resolveStickerAssetPath(
+  upstreamStaticPackName,
+  1,
+  'upstream-static.webp',
+  'previews',
+);
+assert.ok(migratedUpstreamStaticPreviewPath);
+const migratedUpstreamStaticPreview = await fsp.readFile(
+  migratedUpstreamStaticPreviewPath,
+);
+assert.equal(migratedUpstreamStaticPreview.subarray(0, 4).toString(), 'RIFF');
+assert.equal(migratedUpstreamStaticPreview.subarray(8, 12).toString(), 'WEBP');
+assert.equal(
+  fs.existsSync(upstreamStaticPath),
+  false,
+  'Published migration must remove the static WebP working copy',
+);
+assert.equal(
+  await migrateLegacyStickerPack(
+    upstreamStaticPackName,
+    migratedUpstreamStaticManifest,
+  ),
+  false,
+  'Restart migration must treat the published static pack as a no-op',
+);
 const migratedUpstreamManifest = validateLocalStickerPackManifest(
   await readManifestOrUndefined(upstreamAnimatedPackName),
 );
