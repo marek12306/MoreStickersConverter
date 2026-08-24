@@ -625,16 +625,27 @@ const versionedPrevious = (
 });
 
 // Test 1 - first generation (no previous manifest)
-assert.equal(resolveStickerPackVersion(undefined, [stickerA]), 1);
+assert.equal(
+  resolveStickerPackVersion(undefined, [stickerA], 'Some pack title'),
+  1,
+);
 // Test 2 - identical regeneration keeps version
 assert.equal(
-  resolveStickerPackVersion(versionedPrevious([stickerA], 7), [stickerA]),
+  resolveStickerPackVersion(
+    versionedPrevious([stickerA], 7),
+    [stickerA],
+    'Some pack title',
+  ),
   7,
 );
-// Test 3 - pack title change does not affect version (title lives on pack)
+// Test 3 - pack title change increments
 assert.equal(
-  resolveStickerPackVersion(versionedPrevious([stickerA], 4), [stickerA]),
-  4,
+  resolveStickerPackVersion(
+    versionedPrevious([stickerA], 4),
+    [stickerA],
+    'Renamed pack title',
+  ),
+  5,
 );
 // Test 4 - technical URL changes (image, preview, refreshUrl) do not affect version
 const technicalChangedPrevious = {
@@ -655,36 +666,47 @@ const technicalChangedPrevious = {
   ],
 };
 assert.equal(
-  resolveStickerPackVersion(technicalChangedPrevious, [stickerA]),
+  resolveStickerPackVersion(
+    technicalChangedPrevious,
+    [stickerA],
+    'Some pack title',
+  ),
   5,
 );
 // Test 5 - emoji/title change increments
 assert.equal(
-  resolveStickerPackVersion(versionedPrevious([stickerA], 3), [
-    {...stickerA, title: 'emoji-changed'},
-  ]),
+  resolveStickerPackVersion(
+    versionedPrevious([stickerA], 3),
+    [{...stickerA, title: 'emoji-changed'}],
+    'Some pack title',
+  ),
   4,
 );
 // Test 6 - file_unique_id replacement (different id) increments
 assert.equal(
-  resolveStickerPackVersion(versionedPrevious([stickerA], 2), [
-    mkSticker('xyz', 'emoji-a'),
-  ]),
+  resolveStickerPackVersion(
+    versionedPrevious([stickerA], 2),
+    [mkSticker('xyz', 'emoji-a')],
+    'Some pack title',
+  ),
   3,
 );
 // Test 7 - add sticker increments
 assert.equal(
-  resolveStickerPackVersion(versionedPrevious([stickerA], 2), [
-    stickerA,
-    stickerB,
-  ]),
+  resolveStickerPackVersion(
+    versionedPrevious([stickerA], 2),
+    [stickerA, stickerB],
+    'Some pack title',
+  ),
   3,
 );
 // Test 8 - remove sticker increments
 assert.equal(
-  resolveStickerPackVersion(versionedPrevious([stickerA, stickerB], 2), [
-    stickerA,
-  ]),
+  resolveStickerPackVersion(
+    versionedPrevious([stickerA, stickerB], 2),
+    [stickerA],
+    'Some pack title',
+  ),
   3,
 );
 // Test 9 - reorder increments (signature preserves order)
@@ -692,6 +714,7 @@ assert.equal(
   resolveStickerPackVersion(
     versionedPrevious([stickerA, stickerB, stickerC], 2),
     [stickerB, stickerA, stickerC],
+    'Some pack title',
   ),
   3,
 );
@@ -711,21 +734,32 @@ const changed = [stickerA, stickerB, stickerD];
 const afterChange = resolveStickerPackVersion(
   versionedPrevious([stickerA, stickerB, stickerC], 1),
   changed,
+  'Some pack title',
 );
 assert.equal(afterChange, 2);
 assert.equal(
-  resolveStickerPackVersion(versionedPrevious(changed, afterChange), changed),
+  resolveStickerPackVersion(
+    versionedPrevious(changed, afterChange),
+    changed,
+    'Some pack title',
+  ),
   2,
 );
 // Test 11 - legacy manifest without dynamic migrates to version 1
 assert.equal(
-  resolveStickerPackVersion({id: 'x', stickers: [stickerA]}, [stickerA]),
+  resolveStickerPackVersion(
+    {id: 'x', stickers: [stickerA]},
+    [stickerA],
+    'Some pack title',
+  ),
   1,
 );
 assert.equal(
-  resolveStickerPackVersion({id: 'x', dynamic: {}, stickers: [stickerA]}, [
-    stickerA,
-  ]),
+  resolveStickerPackVersion(
+    {id: 'x', dynamic: {}, stickers: [stickerA]},
+    [stickerA],
+    'Some pack title',
+  ),
   1,
   'Manifest with empty dynamic block (no version) migrates to version 1',
 );
@@ -739,7 +773,7 @@ for (const invalidRoot of [
   ['not-an-object'],
 ]) {
   assert.throws(
-    () => resolveStickerPackVersion(invalidRoot, [stickerA]),
+    () => resolveStickerPackVersion(invalidRoot, [stickerA], 'Some pack title'),
     /invalid root structure|refusing/,
     `Invalid root ${String(invalidRoot)} must be rejected`,
   );
@@ -752,6 +786,7 @@ for (const invalidDynamic of [null, 'invalid', 123, true, []]) {
       resolveStickerPackVersion(
         {dynamic: invalidDynamic, stickers: [stickerA]},
         [stickerA],
+        'Some pack title',
       ),
     /invalid dynamic field|refusing/,
     `Invalid dynamic field ${String(invalidDynamic)} must be rejected`,
@@ -764,6 +799,7 @@ assert.throws(
     resolveStickerPackVersion(
       {dynamic: {version: 4, refreshUrl: 'u'}, stickers: []},
       [stickerA],
+      'Some pack title',
     ),
   /lacks a readable stickers\[\] list|refusing/,
 );
@@ -772,6 +808,7 @@ assert.throws(
     resolveStickerPackVersion(
       {dynamic: {version: 4, refreshUrl: 'u'}, stickers: [{}]},
       [stickerA],
+      'Some pack title',
     ),
   /unreadable sticker entries|refusing/,
 );
@@ -783,6 +820,7 @@ assert.throws(
         stickers: [{id: 123, title: 't'}],
       },
       [stickerA],
+      'Some pack title',
     ),
   /unreadable sticker entries|refusing/,
 );
@@ -794,6 +832,7 @@ assert.throws(
         stickers: [{id: 'id', title: 123}],
       },
       [stickerA],
+      'Some pack title',
     ),
   /unreadable sticker entries|refusing/,
 );
@@ -811,6 +850,7 @@ for (const bad of ['4', 0, -1, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) {
           stickers: [stickerA],
         },
         [stickerA],
+        'Some pack title',
       ),
     /invalid dynamic\.version|refusing/,
     `Invalid version ${String(bad)} must be rejected`,
@@ -822,6 +862,7 @@ assert.throws(
     resolveStickerPackVersion(
       versionedPrevious([stickerA], Number.MAX_SAFE_INTEGER),
       [stickerB],
+      'Some pack title',
     ),
   /overflow/,
 );
@@ -6249,10 +6290,11 @@ try {
     });
   }) as unknown as typeof fetch;
   // Case 1b: Divergent pending 6 is replaced; ghosts 7 and 8 are removed
+  let changedRefreshPackTitle = 'Refresh Test Pack';
   const mockChangedRefreshTelegram = {
     getStickerSet: async (name: string) => ({
       name,
-      title: 'Refresh Test Pack',
+      title: changedRefreshPackTitle,
       stickers: [
         {
           file_id: 'file-1',
@@ -6294,6 +6336,44 @@ try {
     await listStickerPackVersions(refreshPackName),
     [4, 5, 6],
     'Divergent publish must not create a version gap or retain ghost indexes',
+  );
+
+  changedRefreshPackTitle = 'Renamed Refresh Test Pack';
+  const ctxTitleChange = createMockContext({
+    userId: allowedUserId,
+    args: [refreshPackName],
+    telegram: mockChangedRefreshTelegram,
+  });
+  assert.equal(await handleRefreshCommand(ctxTitleChange), true);
+  assert.ok(
+    ctxTitleChange.replies.some(r => r.includes('Version: 7')),
+    'Changing only the pack title must advance the published version',
+  );
+  const titleChangedManifest = validateLocalStickerPackManifest(
+    JSON.parse(await fsp.readFile(refreshManifestPath, 'utf8')),
+  );
+  assert.equal(titleChangedManifest?.title, changedRefreshPackTitle);
+  assert.equal(titleChangedManifest?.dynamic?.version, 7);
+  const refreshVersion7 = await readStickerVersionIndex(refreshPackName, 7);
+  assert.deepEqual(refreshVersion7?.stickers, refreshVersion6.stickers);
+  assert.deepEqual(refreshVersion7?.previews, refreshVersion6.previews);
+  assert.equal(refreshVersion7?.signature, refreshVersion6.signature);
+
+  const ctxSameRenamedTitle = createMockContext({
+    userId: allowedUserId,
+    args: [refreshPackName],
+    telegram: mockChangedRefreshTelegram,
+  });
+  assert.equal(await handleRefreshCommand(ctxSameRenamedTitle), true);
+  assert.ok(
+    ctxSameRenamedTitle.replies.some(r => r.includes('Version: 7')),
+    'Refreshing the same renamed title must remain at the published version',
+  );
+  assert.equal(
+    validateLocalStickerPackManifest(
+      JSON.parse(await fsp.readFile(refreshManifestPath, 'utf8')),
+    )?.dynamic?.version,
+    7,
   );
 
   const firstCrashPackName = 'FirstPublicationCrashPack';

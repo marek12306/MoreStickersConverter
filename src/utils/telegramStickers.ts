@@ -220,6 +220,7 @@ function isStickerSignatureEntry(
 export function resolveStickerPackVersion(
   previousPack: unknown,
   nextStickers: McSticker[],
+  nextPackTitle: string,
 ): number {
   if (previousPack === undefined) {
     // Manifest does not exist on disk.
@@ -278,9 +279,10 @@ export function resolveStickerPackVersion(
     );
   }
 
+  const previousTitle = (previousPack as {title?: unknown}).title;
   const previousSignature = getStickerContentSignature(stickers as McSticker[]);
   const nextSignature = getStickerContentSignature(nextStickers);
-  if (previousSignature === nextSignature) {
+  if (previousTitle === nextPackTitle && previousSignature === nextSignature) {
     return version;
   }
 
@@ -736,7 +738,8 @@ async function toMcStickerPack(
       ? await readManifestOrUndefined(stickerSet.name)
       : undefined;
   const version =
-    forcedVersion ?? resolveStickerPackVersion(previous, stickers);
+    forcedVersion ??
+    resolveStickerPackVersion(previous, stickers, stickerSet.title);
   const pack = {
     id: toMcStickerPackId(stickerSet.name),
     title: stickerSet.title,
@@ -960,6 +963,7 @@ async function publishStickerPackManifest(
     await withStickerStorageMutation(stickerSet.name, async () => {
       const previous = await readManifestOrUndefined(stickerSet.name);
       const currentVersion = getStoredManifestVersion(previous);
+      const previousPack = validateLocalStickerPackManifest(previous);
       const stored = await storePackVersionAssets(stickerSet.name, pack);
       const currentIndex =
         currentVersion > 0
@@ -968,6 +972,7 @@ async function publishStickerPackManifest(
       const versions = await listStickerPackVersions(stickerSet.name);
       const unchanged =
         currentIndex !== undefined &&
+        previousPack?.title === stickerSet.title &&
         hasSameStoredVersion(currentIndex, stored);
       let version: number;
       if (unchanged) {
