@@ -6,9 +6,11 @@ import {getStickerPackMetadata} from './stickerPackMetadata.js';
 import {listLocalStickerPackNames} from './stickerPackCatalog.js';
 import {
   CommandContext,
+  extractArgs,
   formatCommandUsage,
   formatUptime,
   isAllowedTelegramUser,
+  parseGcRetentionArgument,
   resolveStickerPackNameFromCommand,
 } from './telegramCommandUtils.js';
 import {
@@ -866,6 +868,12 @@ export async function handleGcCommand(ctx: CommandContext): Promise<boolean> {
     return false;
   }
 
+  const parsedRetention = parseGcRetentionArgument(ctx);
+  if (!parsedRetention.success) {
+    await ctx.reply('Error: retention must be a positive integer (minimum 1).');
+    return false;
+  }
+
   const gcStatus = getGarbageCollectionStatus();
   if (gcStatus.running) {
     await ctx.reply('Garbage collection is already running.');
@@ -873,9 +881,13 @@ export async function handleGcCommand(ctx: CommandContext): Promise<boolean> {
   }
 
   try {
-    const result = await runGarbageCollection({mode: 'apply'});
+    const result = await runGarbageCollection({
+      mode: 'apply',
+      retention: parsedRetention.retention,
+    });
     let report =
       'Garbage collection finished.\n\n' +
+      `Retention: ${result.retention} version${result.retention === 1 ? '' : 's'}\n` +
       `Removed version indexes: ${result.versionsRemoved}\n` +
       `Removed orphaned assets: ${result.assetsRemoved}\n` +
       `Freed: ${formatByteSize(result.bytesFreed)}\n\n` +
@@ -909,12 +921,17 @@ export async function handleGcDryCommand(
     return false;
   }
 
+  const args = extractArgs(ctx);
+  if (args && args.length > 0) {
+    await ctx.reply('Error: /gc_dry does not accept arguments.');
+    return false;
+  }
+
   const gcStatus = getGarbageCollectionStatus();
   if (gcStatus.running) {
     await ctx.reply('Garbage collection is already running.');
     return false;
   }
-
   try {
     const result = await runGarbageCollection({mode: 'dry-run'});
     let report =
@@ -951,12 +968,17 @@ export async function handleGcStatsCommand(
     return false;
   }
 
+  const args = extractArgs(ctx);
+  if (args && args.length > 0) {
+    await ctx.reply('Error: /gc_stats does not accept arguments.');
+    return false;
+  }
+
   const gcStatus = getGarbageCollectionStatus();
   if (gcStatus.running) {
     await ctx.reply('Garbage collection is currently running.');
     return false;
   }
-
   try {
     const result = await runGarbageCollection({mode: 'stats'});
     let report =

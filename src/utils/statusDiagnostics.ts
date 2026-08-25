@@ -679,6 +679,9 @@ export function formatStatusResponse(
       'Garbage collection: running',
       `Mode: ${garbageCollection.current.mode ?? 'apply'}`,
     ];
+    if (garbageCollection.current.retention !== undefined) {
+      lines.push(`Retention: ${garbageCollection.current.retention}`);
+    }
     if (garbageCollection.current.startedAt) {
       const elapsedSeconds = Math.max(
         0,
@@ -691,6 +694,9 @@ export function formatStatusResponse(
         `Last run: ${formatTimeAgo(garbageCollection.last.finishedAt)}`,
       );
       lines.push(`Last mode: ${garbageCollection.last.mode}`);
+      if (garbageCollection.last.retention !== undefined) {
+        lines.push(`Last retention: ${garbageCollection.last.retention}`);
+      }
       lines.push(
         `Last result: ${garbageCollection.last.outcome} with ${garbageCollection.last.errors} error${garbageCollection.last.errors === 1 ? '' : 's'}`,
       );
@@ -711,6 +717,9 @@ export function formatStatusResponse(
         `Last run: ${formatTimeAgo(garbageCollection.last.finishedAt)}`,
       );
       lines.push(`Mode: ${garbageCollection.last.mode}`);
+      if (garbageCollection.last.retention !== undefined) {
+        lines.push(`Retention: ${garbageCollection.last.retention}`);
+      }
       lines.push(
         `Result: ${garbageCollection.last.outcome} with ${garbageCollection.last.errors} error${garbageCollection.last.errors === 1 ? '' : 's'}`,
       );

@@ -38,7 +38,7 @@ export type ResolvePackNameResult =
         | 'invalid_reply_sticker';
     };
 
-function extractArgs(ctx: CommandContext): string[] | undefined {
+export function extractArgs(ctx: CommandContext): string[] | undefined {
   if (ctx.args && Array.isArray(ctx.args)) {
     return ctx.args;
   }
@@ -101,6 +101,31 @@ export function resolveStickerPackNameFromCommand(
   }
 
   return {success: false, error: 'no_target'};
+}
+
+export type ParseGcRetentionResult =
+  | {success: true; retention: number | undefined}
+  | {success: false; error: 'too_many_args' | 'invalid_arg'};
+
+export function parseGcRetentionArgument(
+  ctx: CommandContext,
+): ParseGcRetentionResult {
+  const args = extractArgs(ctx);
+  if (!args || args.length === 0) {
+    return {success: true, retention: undefined};
+  }
+  if (args.length > 1) {
+    return {success: false, error: 'too_many_args'};
+  }
+  const raw = args[0];
+  if (!/^[1-9]\d*$/.test(raw)) {
+    return {success: false, error: 'invalid_arg'};
+  }
+  const num = Number(raw);
+  if (!Number.isSafeInteger(num) || num < 1) {
+    return {success: false, error: 'invalid_arg'};
+  }
+  return {success: true, retention: num};
 }
 
 export function formatCommandUsage(commandName: string): string {

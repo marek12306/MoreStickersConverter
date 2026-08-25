@@ -371,7 +371,13 @@ export interface StickerVersionRetention {
 export function getStickerVersionRetention(
   versions: number[],
   currentVersion = 0,
+  retention = STICKER_PACK_VERSION_RETENTION,
 ): StickerVersionRetention {
+  if (!Number.isSafeInteger(retention) || retention < 1) {
+    throw new Error(
+      `Retention must be a positive safe integer (received ${retention})`,
+    );
+  }
   if (currentVersion > 0 && !versions.includes(currentVersion)) {
     throw new Error(
       `Current sticker pack version ${currentVersion} has no version index`,
@@ -379,7 +385,7 @@ export function getStickerVersionRetention(
   }
   const publishedVersions = versions
     .filter(version => version <= currentVersion)
-    .slice(-STICKER_PACK_VERSION_RETENTION);
+    .slice(-retention);
   const nextVersion = currentVersion + 1;
   return {
     publishedVersions,
@@ -418,18 +424,20 @@ async function verifyReferencedAssets(
 
 async function buildValidatedStickerRetentionPlan(
   stickerSetName: string,
+  retention = STICKER_PACK_VERSION_RETENTION,
 ): Promise<StickerRetentionPlan> {
   const versions = await listStickerPackVersions(stickerSetName);
   const currentManifest =
     await readCurrentStickerStorageManifest(stickerSetName);
-  const retention = getStickerVersionRetention(
+  const retentionPlan = getStickerVersionRetention(
     versions,
     currentManifest?.version,
+    retention,
   );
-  const preservedVersions = new Set(retention.publishedVersions);
+  const preservedVersions = new Set(retentionPlan.publishedVersions);
   const retainedIndexes = new Map<number, StickerVersionIndex>();
   const referencedAssets = new Set<string>();
-  for (const version of retention.publishedVersions) {
+  for (const version of retentionPlan.publishedVersions) {
     const index = await readStickerVersionIndex(stickerSetName, version);
     if (!index) {
       throw new Error(`Missing retained sticker version index ${version}`);
@@ -455,11 +463,11 @@ async function buildValidatedStickerRetentionPlan(
   }
   await verifyReferencedAssets(stickerSetName, referencedAssets);
 
-  if (retention.pendingVersion !== undefined) {
+  if (retentionPlan.pendingVersion !== undefined) {
     try {
       const pendingIndex = await readStickerVersionIndex(
         stickerSetName,
-        retention.pendingVersion,
+        retentionPlan.pendingVersion,
       );
       if (!pendingIndex) {
         throw new Error('Pending recovery index is missing');
@@ -467,13 +475,13 @@ async function buildValidatedStickerRetentionPlan(
       const pendingAssets = new Set<string>();
       addIndexAssets(pendingIndex, pendingAssets);
       await verifyReferencedAssets(stickerSetName, pendingAssets);
-      preservedVersions.add(retention.pendingVersion);
+      preservedVersions.add(retentionPlan.pendingVersion);
       for (const asset of pendingAssets) {
         referencedAssets.add(asset);
       }
     } catch (err) {
       console.warn(
-        `Discarding invalid pending sticker version ${retention.pendingVersion} for "${stickerSetName}":`,
+        `Discarding invalid pending sticker version ${retentionPlan.pendingVersion} for "${stickerSetName}":`,
         err,
       );
     }
@@ -626,14 +634,21 @@ export function formatDurationSeconds(ms: number): string {
 
 export type GarbageCollectionMode = 'apply' | 'dry-run' | 'stats';
 
+export interface GarbageCollectionOptions {
+  mode?: GarbageCollectionMode;
+  retention?: number;
+}
+
 export interface GarbageCollectionState {
   running: boolean;
   mode?: GarbageCollectionMode;
+  retention?: number;
   startedAt?: number;
 }
 
 export interface LastGarbageCollectionSummary {
   mode: GarbageCollectionMode;
+  retention: number;
   startedAt: number;
   finishedAt: number;
   durationMs: number;
@@ -644,7 +659,6 @@ export interface LastGarbageCollectionSummary {
   remainingAssets?: number;
   outcome: 'success' | 'completed-with-errors' | 'failed';
 }
-
 export interface PackGcPlan {
   stickerSetName: string;
   totalVersionCount: number;
@@ -676,6 +690,7 @@ export interface StorageGcSummary {
   bytesFreed: number;
   remainingAssets: number;
   durationMs: number;
+  retention: number;
   errors?: number;
 }
 
@@ -706,6 +721,7 @@ export function resetLastGarbageCollectionForTests(): void {
 
 async function analyzeStickerPackForGc(
   stickerSetName: string,
+  retention = STICKER_PACK_VERSION_RETENTION,
 ): Promise<PackGcPlan> {
   const versions = await listStickerPackVersions(stickerSetName);
   const totalVersionCount = versions.length;
@@ -713,12 +729,11 @@ async function analyzeStickerPackForGc(
   let analysisErrors = 0;
   let plan: StickerRetentionPlan | undefined;
   try {
-    plan = await buildValidatedStickerRetentionPlan(stickerSetName);
+    plan = await buildValidatedStickerRetentionPlan(stickerSetName, retention);
   } catch (err) {
     analysisErrors++;
     console.warn(`Sticker pack "${stickerSetName}" GC analysis skipped:`, err);
   }
-
   const staleVersions = plan ? plan.staleVersions : [];
   const referencedAssetSet = plan ? plan.referencedAssets : undefined;
 
@@ -797,9 +812,15 @@ async function analyzeStickerPackForGc(
 }
 
 export async function runGarbageCollection(
-  options: {mode?: GarbageCollectionMode} = {},
+  options: GarbageCollectionOptions = {},
 ): Promise<StorageGcSummary> {
   const mode = options.mode ?? 'apply';
+  const retention = options.retention ?? STICKER_PACK_VERSION_RETENTION;
+  if (!Number.isSafeInteger(retention) || retention < 1) {
+    throw new Error(
+      `Retention must be a positive safe integer (received ${retention})`,
+    );
+  }
   if (garbageCollectionState?.running) {
     const error = new Error('Garbage collection is already running');
     error.name = 'GarbageCollectionRunningError';
@@ -810,9 +831,9 @@ export async function runGarbageCollection(
   garbageCollectionState = {
     running: true,
     mode,
+    retention,
     startedAt: startTime,
   };
-
   try {
     if (mode === 'apply') {
       await fsp.mkdir(DATA_DIR, {recursive: true});
@@ -850,7 +871,7 @@ export async function runGarbageCollection(
       const packName = entry.name;
       try {
         await withStickerStorageMutation(packName, async () => {
-          const plan = await analyzeStickerPackForGc(packName);
+          const plan = await analyzeStickerPackForGc(packName, retention);
 
           totalVersionIndexes += plan.totalVersionCount;
           prunableVersionIndexes += plan.staleVersions.length;
@@ -947,11 +968,13 @@ export async function runGarbageCollection(
       bytesFreed,
       remainingAssets,
       durationMs,
+      retention,
       ...(totalErrors > 0 ? {errors: totalErrors} : {}),
     };
 
     lastGarbageCollection = {
       mode,
+      retention,
       startedAt: startTime,
       finishedAt: Date.now(),
       durationMs,
@@ -967,6 +990,7 @@ export async function runGarbageCollection(
   } catch (err) {
     lastGarbageCollection = {
       mode,
+      retention,
       startedAt: startTime,
       finishedAt: Date.now(),
       durationMs: Math.max(0, Date.now() - startTime),

@@ -97,6 +97,7 @@ const {
   generateStickerVersionsDirPath,
   getGarbageCollectionStatus,
   getLastGarbageCollection,
+  getStickerVersionRetention,
   listStickerPackVersions,
   pruneOldStickerVersions,
   readStickerVersionIndex,
@@ -127,9 +128,8 @@ const {
   isAllowedTelegramUser,
   resolveStickerPackNameFromCommand,
 } = await import('../src/utils/stickerPackVisibilityCommands.js');
-const {formatCommandUsage, formatUptime} = await import(
-  '../src/utils/telegramCommandUtils.js'
-);
+const {formatCommandUsage, formatUptime, parseGcRetentionArgument} =
+  await import('../src/utils/telegramCommandUtils.js');
 const {
   getLastRefreshAll,
   getRefreshAllStatus,
@@ -10515,6 +10515,728 @@ await writeStickerPackManifestAtomically(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Test Section 5: Custom retention /gc [retention] commands, safety invariants, and diagnostics
+// ---------------------------------------------------------------------------
+console.log(
+  'Testing custom retention /gc [retention] commands, safety invariants, and diagnostics...',
+);
+
+// 1. Argument validation and rejection at command level
+{
+  const invalidInputs = [
+    {args: ['0'], desc: '/gc 0'},
+    {args: ['-1'], desc: '/gc -1'},
+    {args: ['1.5'], desc: '/gc 1.5'},
+    {args: ['abc'], desc: '/gc abc'},
+    {args: ['NaN'], desc: '/gc NaN'},
+    {args: ['Infinity'], desc: '/gc Infinity'},
+    {args: ['2foo'], desc: '/gc 2foo'},
+    {args: ['1', '2'], desc: '/gc 1 2'},
+  ];
+
+  resetLastGarbageCollectionForTests();
+  assert.equal(getLastGarbageCollection(), undefined);
+
+  assert.deepEqual(parseGcRetentionArgument(createMockContext({args: []})), {
+    success: true,
+    retention: undefined,
+  });
+  assert.deepEqual(parseGcRetentionArgument(createMockContext({args: ['5']})), {
+    success: true,
+    retention: 5,
+  });
+  assert.deepEqual(parseGcRetentionArgument(createMockContext({args: ['1']})), {
+    success: true,
+    retention: 1,
+  });
+  assert.deepEqual(parseGcRetentionArgument(createMockContext({args: ['0']})), {
+    success: false,
+    error: 'invalid_arg',
+  });
+  for (const item of invalidInputs) {
+    const ctx = createMockContext({
+      userId: allowedUserId,
+      args: item.args,
+    });
+    const handled = await handleGcCommand(ctx);
+    assert.equal(
+      handled,
+      false,
+      `${item.desc} must return false and reject invalid retention`,
+    );
+    assert.equal(ctx.replies.length, 1);
+    assert.ok(
+      ctx.replies[0]?.includes(
+        'Error: retention must be a positive integer (minimum 1).',
+      ),
+      `${item.desc} must reply with positive integer error, got: ${ctx.replies[0]}`,
+    );
+    assert.equal(
+      getGarbageCollectionStatus().running,
+      false,
+      'GC state must not be running after rejected command',
+    );
+    assert.equal(
+      getLastGarbageCollection(),
+      undefined,
+      'lastGarbageCollection must not be recorded on invalid command input',
+    );
+  }
+
+  // Unauthorized user calling /gc 1
+  const unauthCtx = createMockContext({
+    userId: 99999999,
+    args: ['1'],
+  });
+  const unauthHandled = await handleGcCommand(unauthCtx);
+  assert.equal(
+    unauthHandled,
+    false,
+    'Unauthorized user calling /gc 1 must be rejected',
+  );
+  assert.equal(unauthCtx.replies.length, 0);
+
+  // Extra arguments on /gc_dry and /gc_stats
+  const dryWithArgsCtx = createMockContext({
+    userId: allowedUserId,
+    args: ['2'],
+  });
+  const dryWithArgsHandled = await handleGcDryCommand(dryWithArgsCtx);
+  assert.equal(
+    dryWithArgsHandled,
+    false,
+    '/gc_dry 2 must be rejected with error',
+  );
+  assert.ok(
+    dryWithArgsCtx.replies[0]?.includes(
+      'Error: /gc_dry does not accept arguments.',
+    ),
+  );
+
+  const statsWithArgsCtx = createMockContext({
+    userId: allowedUserId,
+    args: ['2'],
+  });
+  const statsWithArgsHandled = await handleGcStatsCommand(statsWithArgsCtx);
+  assert.equal(
+    statsWithArgsHandled,
+    false,
+    '/gc_stats 2 must be rejected with error',
+  );
+  assert.ok(
+    statsWithArgsCtx.replies[0]?.includes(
+      'Error: /gc_stats does not accept arguments.',
+    ),
+  );
+}
+
+// 2. Core validation defense-in-depth
+{
+  await assert.rejects(
+    async () => runGarbageCollection({mode: 'apply', retention: 0}),
+    /Retention must be a positive safe integer/,
+    'Core runGarbageCollection must reject retention 0',
+  );
+  await assert.rejects(
+    async () => runGarbageCollection({mode: 'apply', retention: -1}),
+    /Retention must be a positive safe integer/,
+    'Core runGarbageCollection must reject retention -1',
+  );
+  await assert.rejects(
+    async () => runGarbageCollection({mode: 'apply', retention: 1.5}),
+    /Retention must be a positive safe integer/,
+    'Core runGarbageCollection must reject retention 1.5',
+  );
+  await assert.rejects(
+    async () => runGarbageCollection({mode: 'apply', retention: NaN}),
+    /Retention must be a positive safe integer/,
+    'Core runGarbageCollection must reject retention NaN',
+  );
+  await assert.rejects(
+    async () => runGarbageCollection({mode: 'apply', retention: Infinity}),
+    /Retention must be a positive safe integer/,
+    'Core runGarbageCollection must reject retention Infinity',
+  );
+
+  assert.throws(
+    () => getStickerVersionRetention([1, 2, 3], 3, 0),
+    /Retention must be a positive safe integer/,
+  );
+  assert.throws(
+    () => getStickerVersionRetention([1, 2, 3], 3, -1),
+    /Retention must be a positive safe integer/,
+  );
+}
+
+// 3. /gc 1 on a pack with v1..v5: keeps ONLY latest published version v5
+{
+  const packName = 'GcRetentionOneTestPack';
+  const packDir = generateStickerPackDirPath(packName);
+  const assetsDir = generateStickerAssetsDirPath(packName);
+  await fsp.mkdir(assetsDir, {recursive: true});
+
+  const assetFiles: Record<string, string> = {};
+  for (let v = 1; v <= 5; v++) {
+    const rawPath = path.join(packDir, `raw-v${v}.webp`);
+    await fsp.writeFile(rawPath, `unique-content-for-v${v}-blob`);
+    const assetFilename = await storeStickerAsset(packName, rawPath);
+    await fsp.unlink(rawPath).catch(() => undefined);
+    assetFiles[`v${v}`] = assetFilename;
+
+    await writeStickerVersionIndexAtomically(packName, {
+      version: v,
+      signature: `sig-v${v}`,
+      stickers: {[`sticker_${v}.webp`]: assetFilename},
+      previews: {[`sticker_${v}.webp`]: assetFilename},
+    });
+  }
+
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(packName),
+    {
+      id: packName,
+      title: 'Retention 1 Test Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${packName}:sticker_5`,
+          filename: 'sticker_5.webp',
+          emojis: ['1️⃣'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker_5.webp',
+            previewPath: 'sticker_5.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 5,
+        url: `https://example.com/stickerpack/telegram/${packName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  const ctx = createMockContext({
+    userId: allowedUserId,
+    args: ['1'],
+  });
+  const handled = await handleGcCommand(ctx);
+  assert.equal(handled, true, '/gc 1 must succeed');
+  assert.equal(ctx.replies.length, 1);
+  const reply = ctx.replies[0]!;
+  assert.ok(reply.includes('Garbage collection finished.'));
+  assert.ok(reply.includes('Retention: 1 version'));
+
+  // Exactly version 5 is retained
+  const retainedVersions = await listStickerPackVersions(packName);
+  assert.deepEqual(
+    retainedVersions,
+    [5],
+    '/gc 1 must keep ONLY the newest published version 5',
+  );
+
+  // Stale version indexes 1..4 are deleted
+  for (let v = 1; v <= 4; v++) {
+    await assert.rejects(
+      async () =>
+        await fsp.access(
+          generateStickerVersionIndexPath(packName, v),
+          fs.constants.R_OK,
+        ),
+      `Version ${v} index must be deleted after /gc 1`,
+    );
+  }
+
+  // Version 5 index and asset exist
+  await fsp.access(
+    generateStickerVersionIndexPath(packName, 5),
+    fs.constants.R_OK,
+  );
+  await fsp.access(path.join(assetsDir, assetFiles['v5']!), fs.constants.R_OK);
+
+  // Stale orphaned assets v1..v4 are deleted
+  for (let v = 1; v <= 4; v++) {
+    await assert.rejects(
+      async () =>
+        await fsp.access(
+          path.join(assetsDir, assetFiles[`v${v}`]!),
+          fs.constants.R_OK,
+        ),
+      `Asset for v${v} must be removed as orphan after /gc 1`,
+    );
+  }
+}
+
+// 4. /gc 2 on a pack with v1..v5: keeps EXACTLY newest 2 versions [4, 5]
+{
+  const packName = 'GcRetentionTwoTestPack';
+  const packDir = generateStickerPackDirPath(packName);
+  const assetsDir = generateStickerAssetsDirPath(packName);
+  await fsp.mkdir(assetsDir, {recursive: true});
+
+  for (let v = 1; v <= 5; v++) {
+    const rawPath = path.join(packDir, `raw-v${v}.webp`);
+    await fsp.writeFile(rawPath, `unique-content-for-v${v}-blob-two`);
+    const assetFilename = await storeStickerAsset(packName, rawPath);
+    await fsp.unlink(rawPath).catch(() => undefined);
+
+    await writeStickerVersionIndexAtomically(packName, {
+      version: v,
+      signature: `sig-v${v}`,
+      stickers: {[`sticker_${v}.webp`]: assetFilename},
+      previews: {[`sticker_${v}.webp`]: assetFilename},
+    });
+  }
+
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(packName),
+    {
+      id: packName,
+      title: 'Retention 2 Test Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${packName}:sticker_5`,
+          filename: 'sticker_5.webp',
+          emojis: ['2️⃣'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker_5.webp',
+            previewPath: 'sticker_5.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 5,
+        url: `https://example.com/stickerpack/telegram/${packName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  const ctx = createMockContext({
+    userId: allowedUserId,
+    args: ['2'],
+  });
+  const handled = await handleGcCommand(ctx);
+  assert.equal(handled, true, '/gc 2 must succeed');
+  assert.ok(ctx.replies[0]?.includes('Retention: 2 versions'));
+
+  const retainedVersions = await listStickerPackVersions(packName);
+  assert.deepEqual(
+    retainedVersions,
+    [4, 5],
+    '/gc 2 must keep EXACTLY the 2 newest versions [4, 5] (not [3, 4, 5], not [1, 2])',
+  );
+}
+
+// 5. /gc 10 on a pack with 3 versions (v1..v3): prunes nothing
+{
+  const packName = 'GcRetentionTenTestPack';
+  const packDir = generateStickerPackDirPath(packName);
+  const assetsDir = generateStickerAssetsDirPath(packName);
+  await fsp.mkdir(assetsDir, {recursive: true});
+
+  for (let v = 1; v <= 3; v++) {
+    const rawPath = path.join(packDir, `raw-v${v}.webp`);
+    await fsp.writeFile(rawPath, `unique-content-for-v${v}-blob-ten`);
+    const assetFilename = await storeStickerAsset(packName, rawPath);
+    await fsp.unlink(rawPath).catch(() => undefined);
+
+    await writeStickerVersionIndexAtomically(packName, {
+      version: v,
+      signature: `sig-v${v}`,
+      stickers: {[`sticker_${v}.webp`]: assetFilename},
+      previews: {[`sticker_${v}.webp`]: assetFilename},
+    });
+  }
+
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(packName),
+    {
+      id: packName,
+      title: 'Retention 10 Test Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${packName}:sticker_3`,
+          filename: 'sticker_3.webp',
+          emojis: ['🔟'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker_3.webp',
+            previewPath: 'sticker_3.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 3,
+        url: `https://example.com/stickerpack/telegram/${packName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  const ctx = createMockContext({
+    userId: allowedUserId,
+    args: ['10'],
+  });
+  const handled = await handleGcCommand(ctx);
+  assert.equal(handled, true, '/gc 10 must succeed');
+  assert.ok(ctx.replies[0]?.includes('Retention: 10 versions'));
+
+  const retainedVersions = await listStickerPackVersions(packName);
+  assert.deepEqual(
+    retainedVersions,
+    [1, 2, 3],
+    '/gc 10 on a pack with 3 versions must retain all 3 versions',
+  );
+}
+
+// 6. One-shot isolation: manual /gc 1 does not alter background GC or publication pruning defaults (5)
+{
+  const oneShotPackName = 'GcOneShotIsolationPack';
+  const packDir = generateStickerPackDirPath(oneShotPackName);
+  const assetsDir = generateStickerAssetsDirPath(oneShotPackName);
+  await fsp.mkdir(assetsDir, {recursive: true});
+
+  // Create 8 versions
+  for (let v = 1; v <= 8; v++) {
+    const rawPath = path.join(packDir, `raw-v${v}.webp`);
+    await fsp.writeFile(rawPath, `unique-content-for-v${v}-isolation`);
+    const assetFilename = await storeStickerAsset(oneShotPackName, rawPath);
+    await fsp.unlink(rawPath).catch(() => undefined);
+
+    await writeStickerVersionIndexAtomically(oneShotPackName, {
+      version: v,
+      signature: `sig-v${v}`,
+      stickers: {[`sticker_${v}.webp`]: assetFilename},
+      previews: {[`sticker_${v}.webp`]: assetFilename},
+    });
+  }
+
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(oneShotPackName),
+    {
+      id: oneShotPackName,
+      title: 'One-Shot Isolation Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${oneShotPackName}:sticker_8`,
+          filename: 'sticker_8.webp',
+          emojis: ['🔒'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker_8.webp',
+            previewPath: 'sticker_8.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 8,
+        url: `https://example.com/stickerpack/telegram/${oneShotPackName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  // 1. Run /gc 1 on all packs
+  const gcOneCtx = createMockContext({
+    userId: allowedUserId,
+    args: ['1'],
+  });
+  await handleGcCommand(gcOneCtx);
+  assert.deepEqual(
+    await listStickerPackVersions(oneShotPackName),
+    [8],
+    'Pack should now have only version 8 retained',
+  );
+
+  // 2. Add versions 9, 10, 11, 12, 13, 14 (total 7 versions: 8, 9, 10, 11, 12, 13, 14)
+  for (let v = 9; v <= 14; v++) {
+    const rawPath = path.join(packDir, `raw-v${v}.webp`);
+    await fsp.writeFile(rawPath, `unique-content-for-v${v}-isolation-next`);
+    const assetFilename = await storeStickerAsset(oneShotPackName, rawPath);
+    await fsp.unlink(rawPath).catch(() => undefined);
+
+    await writeStickerVersionIndexAtomically(oneShotPackName, {
+      version: v,
+      signature: `sig-v${v}`,
+      stickers: {[`sticker_${v}.webp`]: assetFilename},
+      previews: {[`sticker_${v}.webp`]: assetFilename},
+    });
+  }
+
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(oneShotPackName),
+    {
+      id: oneShotPackName,
+      title: 'One-Shot Isolation Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${oneShotPackName}:sticker_14`,
+          filename: 'sticker_14.webp',
+          emojis: ['🔒'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker_14.webp',
+            previewPath: 'sticker_14.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 14,
+        url: `https://example.com/stickerpack/telegram/${oneShotPackName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  // 3. Normal publication pruning must use default 5
+  const pruned = await pruneOldStickerVersions(oneShotPackName);
+  assert.equal(
+    pruned,
+    2,
+    'pruneOldStickerVersions should prune 2 oldest (8, 9) keeping 5',
+  );
+  assert.deepEqual(
+    await listStickerPackVersions(oneShotPackName),
+    [10, 11, 12, 13, 14],
+    'Publication pruning must retain last 5 versions (10..14)',
+  );
+
+  // 4. Background GC / default runGarbageCollection() must use default 5
+  const defaultSummary = await runGarbageCollection({mode: 'apply'});
+  assert.equal(
+    defaultSummary.retention,
+    5,
+    'Default GC summary retention must be 5',
+  );
+  const lastGc = getLastGarbageCollection();
+  assert.ok(lastGc !== undefined);
+  assert.equal(lastGc.retention, 5, 'Default last GC retention must be 5');
+}
+
+// 7. Shared CAS blob preservation and subsequent cleanup under custom retention
+{
+  const sharedPackName = 'GcSharedCasCustomTestPack';
+  const packDir = generateStickerPackDirPath(sharedPackName);
+  const assetsDir = generateStickerAssetsDirPath(sharedPackName);
+  await fsp.mkdir(assetsDir, {recursive: true});
+
+  // Blob A (used by v1 and v2)
+  const rawA = path.join(packDir, 'raw-a.webp');
+  await fsp.writeFile(rawA, 'shared-cas-blob-A-custom-gc');
+  const assetA = await storeStickerAsset(sharedPackName, rawA);
+  await fsp.unlink(rawA).catch(() => undefined);
+
+  // Blob B (used by v3)
+  const rawB = path.join(packDir, 'raw-b.webp');
+  await fsp.writeFile(rawB, 'unique-cas-blob-B-custom-gc');
+  const assetB = await storeStickerAsset(sharedPackName, rawB);
+  await fsp.unlink(rawB).catch(() => undefined);
+
+  // v1 -> A
+  await writeStickerVersionIndexAtomically(sharedPackName, {
+    version: 1,
+    signature: 'sig-v1',
+    stickers: {'sticker.webp': assetA},
+    previews: {'sticker.webp': assetA},
+  });
+  // v2 -> A
+  await writeStickerVersionIndexAtomically(sharedPackName, {
+    version: 2,
+    signature: 'sig-v2',
+    stickers: {'sticker.webp': assetA},
+    previews: {'sticker.webp': assetA},
+  });
+  // v3 -> B
+  await writeStickerVersionIndexAtomically(sharedPackName, {
+    version: 3,
+    signature: 'sig-v3',
+    stickers: {'sticker.webp': assetB},
+    previews: {'sticker.webp': assetB},
+  });
+
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(sharedPackName),
+    {
+      id: sharedPackName,
+      title: 'Shared CAS Custom Retention Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${sharedPackName}:sticker`,
+          filename: 'sticker.webp',
+          emojis: ['🔗'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker.webp',
+            previewPath: 'sticker.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 3,
+        url: `https://example.com/stickerpack/telegram/${sharedPackName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  // Run /gc 2: retains [2, 3]. v1 index is pruned, but asset A is still referenced by v2!
+  const ctxGc2 = createMockContext({userId: allowedUserId, args: ['2']});
+  await handleGcCommand(ctxGc2);
+  assert.deepEqual(await listStickerPackVersions(sharedPackName), [2, 3]);
+
+  // Asset A MUST SURVIVE because v2 is retained
+  await fsp.access(path.join(assetsDir, assetA), fs.constants.R_OK);
+  // Asset B exists
+  await fsp.access(path.join(assetsDir, assetB), fs.constants.R_OK);
+
+  // Now run /gc 1: retains ONLY [3]. v2 is pruned. Asset A is no longer referenced anywhere!
+  const ctxGc1 = createMockContext({userId: allowedUserId, args: ['1']});
+  await handleGcCommand(ctxGc1);
+  assert.deepEqual(await listStickerPackVersions(sharedPackName), [3]);
+
+  // Asset A MUST NOW BE REMOVED as an orphan
+  await assert.rejects(
+    async () =>
+      await fsp.access(path.join(assetsDir, assetA), fs.constants.R_OK),
+    'Asset A must be removed when all versions referencing it are pruned',
+  );
+  // Asset B must still survive
+  await fsp.access(path.join(assetsDir, assetB), fs.constants.R_OK);
+}
+
+// 8. Pending/recovery index safety under custom retention
+{
+  const pendingPackName = 'GcPendingRecoveryTestPack';
+  const packDir = generateStickerPackDirPath(pendingPackName);
+  const assetsDir = generateStickerAssetsDirPath(pendingPackName);
+  await fsp.mkdir(assetsDir, {recursive: true});
+
+  for (let v = 1; v <= 4; v++) {
+    const rawPath = path.join(packDir, `raw-v${v}.webp`);
+    await fsp.writeFile(rawPath, `pending-recovery-content-v${v}`);
+    const assetFilename = await storeStickerAsset(pendingPackName, rawPath);
+    await fsp.unlink(rawPath).catch(() => undefined);
+
+    await writeStickerVersionIndexAtomically(pendingPackName, {
+      version: v,
+      signature: `sig-v${v}`,
+      stickers: {[`sticker_${v}.webp`]: assetFilename},
+      previews: {[`sticker_${v}.webp`]: assetFilename},
+    });
+  }
+
+  // Published manifest is version 3 (version 4 is pending recovery index)
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(pendingPackName),
+    {
+      id: pendingPackName,
+      title: 'Pending Recovery Test Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${pendingPackName}:sticker_3`,
+          filename: 'sticker_3.webp',
+          emojis: ['⏳'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker_3.webp',
+            previewPath: 'sticker_3.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 3,
+        url: `https://example.com/stickerpack/telegram/${pendingPackName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  // Run /gc 1: should retain published version 3 AND pending version 4
+  const ctx = createMockContext({userId: allowedUserId, args: ['1']});
+  await handleGcCommand(ctx);
+
+  const retainedVersions = await listStickerPackVersions(pendingPackName);
+  assert.ok(
+    retainedVersions.includes(3),
+    'Current published version 3 must be retained',
+  );
+  assert.ok(
+    retainedVersions.includes(4),
+    'Pending recovery version 4 must be retained',
+  );
+  assert.ok(!retainedVersions.includes(1), 'Version 1 must be deleted');
+  assert.ok(!retainedVersions.includes(2), 'Version 2 must be deleted');
+}
+
+// 9. /status reflects custom retention diagnostics in running and last GC states
+{
+  // 1. Running GC status formatting with custom retention
+  const runningSnapshot: Parameters<typeof formatStatusResponse>[0] = {
+    runtime: {
+      status: 'OK',
+      uptimeSeconds: 300,
+      nodeVersion: process.version,
+      ffmpegAvailable: true,
+      lottieConverterAvailable: true,
+      concurrency: 1,
+      dataDirOk: true,
+      externalUrlConfigured: true,
+    },
+    work: {activeDownloads: 0, activeEncodes: 0, queueLength: 0},
+    storage: {sizeBytes: 1000, legacyGifPackCount: 0, warnings: 0},
+    refreshAll: {
+      current: {
+        running: false,
+        cancelRequested: false,
+        total: 0,
+        processed: 0,
+        successful: 0,
+        failed: 0,
+      },
+    },
+    garbageCollection: {
+      current: {
+        running: true,
+        mode: 'apply',
+        retention: 3,
+        startedAt: Date.now() - 5000,
+      },
+    },
+  };
+  const runningFormatted = formatStatusResponse(runningSnapshot, formatUptime);
+  assert.ok(runningFormatted.includes('Garbage collection: running'));
+  assert.ok(runningFormatted.includes('Retention: 3'));
+
+  // 2. Run /gc 2 and verify last GC snapshot
+  const gc2Ctx = createMockContext({userId: allowedUserId, args: ['2']});
+  await handleGcCommand(gc2Ctx);
+
+  const lastGc2 = getLastGarbageCollection();
+  assert.ok(lastGc2 !== undefined);
+  assert.equal(
+    lastGc2.retention,
+    2,
+    'lastGarbageCollection must record retention = 2',
+  );
+
+  const snapshot2 = await getConverterStatusSnapshot({forceRefresh: true});
+  const formattedStatus2 = formatStatusResponse(snapshot2, formatUptime);
+  assert.ok(
+    formattedStatus2.includes('Retention: 2'),
+    `/status output must include "Retention: 2", got:\n${formattedStatus2}`,
+  );
+}
+
 console.log(
   'Testing P2: /status command diagnostics, tool probes, counters, storage scan, and lifecycles...',
 );
@@ -11082,6 +11804,7 @@ console.log(
       },
       last: {
         mode: 'apply' as const,
+        retention: 5,
         startedAt: Date.now() - 120_000,
         finishedAt: Date.now() - 110_000,
         durationMs: 10_000,

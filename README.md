@@ -82,7 +82,7 @@ Authorized users can manage and inspect sticker packs using the following bot co
 /unlisted <pack-name>      Remove a pack from the public catalog
 /stats                     Show local library statistics
 /status                    Show runtime, work, storage, refresh and GC diagnostics
-/gc                        Run storage garbage collection
+/gc [retention]            Run storage garbage collection, optionally keeping only the newest N versions
 /gc_dry                    Preview garbage collection without deleting files
 /gc_stats                  Show storage garbage collection statistics
 ```
@@ -126,7 +126,7 @@ Returns a comprehensive read-only snapshot of runtime health, work queues, stora
   * `Legacy GIF packs`: Count of sticker *packs* that still reference legacy GIF assets in their active version retention history (`last 5 versions`). Stale GIF assets outside the retention window are not counted. If index/manifest scanning encounters unreadable files or corruption, reports `unavailable` to avoid displaying an inaccurate partial count.
   * Storage diagnostics are cached process-local with a **60-second TTL**.
 * **Refresh all diagnostics**: Shows current status (idle or running with progress, current pack, counts, and elapsed time) and the outcome of the last run (`completed`, `cancelled` with refreshed/failed/skipped counts, or `failed`).
-* **Garbage collection diagnostics**: Shows current GC status (idle or running with mode and elapsed time) and the summary of the last run across all execution modes (mode, outcome, error count, and bytes freed for `apply` mode).
+* **Garbage collection diagnostics**: Shows current GC status (idle or running with mode, retention, and elapsed time) and the summary of the last run across all execution modes (mode, retention, outcome, error count, and bytes freed for `apply` mode).
 * **Fail-soft & process-local semantics**: `/status` is strictly read-only and never performs repair or cleanup actions. If an individual probe fails (e.g. FFmpeg unavailable or storage unreadable), the remaining sections still render without crashing. Counters, queue lengths, tool cache, and lifecycle summaries are process-local (not aggregated across multiple container replicas).
 
 Example output:
@@ -159,16 +159,26 @@ Result: 121 refreshed, 2 failed
 Garbage collection: idle
 Last run: 2h ago
 Mode: apply
+Retention: 5
 Result: success with 0 errors
 Freed: 186.4 MiB
 ```
 
-#### `/gc`
-Manually triggers real storage garbage collection using the exact same core engine and retention policy as the background GC (it does not replace or disable the periodic background GC):
-* Applies the retention policy: keeps the **last 5 version indexes** per pack.
-* Prunes stale version indexes eligible for cleanup.
-* Deletes orphaned / unreferenced CAS assets.
+#### `/gc [retention]`
+Manually triggers real storage garbage collection:
+* **Default retention**: Running `/gc` without arguments uses the standard retention policy (`STICKER_PACK_VERSION_RETENTION`, currently keeping the **last 5 version indexes** per pack).
+* **Custom retention override**: Running `/gc <retention>` (e.g. `/gc 1`, `/gc 2`) performs a one-shot manual GC retaining only up to the specified number of newest published versions per pack and pruning older generations.
+  * Similar to keeping only the newest N Nix generations, `/gc N` keeps the newest N published sticker-pack versions and prunes older versions that fall outside the retention window.
+  * Examples:
+    * `/gc 1` keeps only the single newest published version per pack (e.g. for versions 1..5, keeps 5 and prunes 1..4).
+    * `/gc 2` keeps the two newest published versions per pack (e.g. for versions 1..5, keeps 4 and 5).
+    * `/gc 5` is equivalent to the default retention window.
+  * **One-shot override**: The numeric argument is a one-shot manual retention override for that specific run. It does not alter `STICKER_PACK_VERSION_RETENTION`, background GC, normal publication pruning, or future `/gc` runs without an argument.
+  * **Strict argument validation**: The retention argument must be a positive integer $\ge 1$ (`/^[1-9]\d*$/`, safe integer). Invalid arguments such as `/gc 0`, `/gc -1`, `/gc 1.5`, `/gc abc`, or multiple arguments are rejected immediately without performing any file mutations or recording a failed GC run.
+* Prunes stale version indexes eligible for cleanup under the active retention window.
+* Deletes orphaned / unreferenced CAS assets only after stale version indexes are safely deleted.
 * Preserves all assets referenced by any retained version index for that pack (a CAS blob shared by multiple retained versions is kept as long as at least one retained version references it).
+* Preserves valid pending recovery indexes (`currentVersion + 1`).
 * Synchronized with sticker pack publication through the per-pack storage mutation lock.
 * Concurrent GC operations within the same process are rejected with `Garbage collection is already running.`.
 
@@ -176,6 +186,7 @@ Example output:
 ```text
 Garbage collection finished.
 
+Retention: 2 versions
 Removed version indexes: 18
 Removed orphaned assets: 42
 Freed: 186.4 MiB
@@ -325,7 +336,7 @@ The fork includes a comprehensive smoke test suite covering:
 * Startup migration for raw upstream WebM/TGS and static WebP packs without previews, and 5-hour background GC scheduling,
 * `/refresh` and `/refresh_all` lifecycle (sequential execution, per-pack locking, cooperative cancellation via `/refresh_all_cancel`, summary reporting, outcome recording),
 * Dynamic version lifecycle, pack-title version bump, and content-addressed storage (CAS) retention / GC (last 5 versions),
-* Storage garbage collection and administrative commands (`/gc`, `/gc_dry`, `/gc_stats`, dry-run / stats read-only safety, error reporting, publication lock synchronization),
+* Storage garbage collection and administrative commands (`/gc [retention]`, `/gc_dry`, `/gc_stats`, custom retention `/gc 1`, `/gc 2`, `/gc 10`, rejection of `/gc 0` and invalid args, dry-run / stats read-only safety, shared CAS blob retention, deletion failure safety, publication lock synchronization),
 * `/status` diagnostics (FFmpeg and lottieconverter probes with 5-minute TTL cache, active download / encode counters, queue length tracking, storage size scanner with 60-second TTL cache and `unavailable` on read errors, legacy GIF pack count with fail-soft `unavailable` reporting on partial/corrupt legacy GIF scans, fail-soft rendering),
 * HTTP endpoints, CORS headers, `ETag` generation, `If-None-Match` matching (exact, weak, list, wildcard, RFC 9110 fail-safe), 304 conditional responses, and binary asset caching (`max-age=300` for legacy, `max-age=604800` for versioned without `immutable`),
 * Public catalog web interface and progressive loading behavior (WebP preview first, hover-activated animations, viewport proximity loading),
