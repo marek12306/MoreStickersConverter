@@ -5137,6 +5137,33 @@ await fsp.writeFile(
   JSON.stringify({visibility: 'public'}),
 );
 
+const publicPack3Name = 'PublicCatalogStaticPreviewPack';
+const publicPack3ManifestPath = generateStickerPackFilePath(publicPack3Name);
+await fsp.writeFile(
+  publicPack3ManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${publicPack3Name}`,
+    title: 'Public Catalog Static Preview Pack',
+    stickers: [
+      {
+        id: 's1',
+        image: `https://stickers.example.com/sticker/telegram/${publicPack3Name}/s1.webp`,
+        previewImage: `https://stickers.example.com/preview/telegram/${publicPack3Name}/s1.webp`,
+      },
+    ],
+    logo: {
+      id: 'logo',
+      image: `https://stickers.example.com/sticker/telegram/${publicPack3Name}/logo.webp`,
+      previewImage: `https://stickers.example.com/preview/telegram/${publicPack3Name}/logo.webp`,
+      isAnimated: false,
+    },
+  }),
+);
+await fsp.writeFile(
+  getStickerPackMetadataPath(publicPack3Name),
+  JSON.stringify({visibility: 'public'}),
+);
+
 const unlistedPackName = 'UnlistedCatalogPack';
 const unlistedPackManifestPath = generateStickerPackFilePath(unlistedPackName);
 await fsp.writeFile(
@@ -5202,12 +5229,12 @@ await fsp.writeFile(
 const catalogPacks = await getPublicStickerPacks();
 assert.equal(
   catalogPacks.length,
-  2,
-  'Catalog must contain exactly the 2 valid public packs',
+  3,
+  'Catalog must contain exactly the 3 valid public packs',
 );
 assert.deepEqual(
   catalogPacks.map(p => p.name),
-  [publicPack2Name, publicPack1Name],
+  [publicPack2Name, publicPack1Name, publicPack3Name],
   'Catalog must sort packs alphabetically by name',
 );
 
@@ -5229,6 +5256,11 @@ assert.equal(
   `https://stickers.example.com/sticker/telegram/${publicPack1Name}/logo.gif`,
   'Animated public pack must expose its animated logo',
 );
+assert.equal(
+  pubSummary1.fullPreview,
+  undefined,
+  'Animated public pack must not expose fullPreview to avoid redundant static image downloads',
+);
 
 const pubSummary2 = catalogPacks.find(p => p.name === publicPack2Name)!;
 assert.equal(pubSummary2.stickerCount, 2);
@@ -5242,7 +5274,31 @@ assert.equal(
   undefined,
   'Static public pack must not expose an animated logo',
 );
+assert.equal(
+  pubSummary2.fullPreview,
+  undefined,
+  'Static public pack without distinct previewImage must not set fullPreview',
+);
 
+const pubSummary3 = catalogPacks.find(p => p.name === publicPack3Name)!;
+assert.equal(pubSummary3.id, `MoreStickers:Telegram:Pack:${publicPack3Name}`);
+assert.equal(pubSummary3.title, 'Public Catalog Static Preview Pack');
+assert.equal(pubSummary3.stickerCount, 1);
+assert.equal(
+  pubSummary3.preview,
+  `https://stickers.example.com/preview/telegram/${publicPack3Name}/logo.webp`,
+  'Static public pack with previewImage must use previewImage for preview',
+);
+assert.equal(
+  pubSummary3.animatedPreview,
+  undefined,
+  'Static public pack must not set animatedPreview',
+);
+assert.equal(
+  pubSummary3.fullPreview,
+  `https://stickers.example.com/sticker/telegram/${publicPack3Name}/logo.webp`,
+  'Static public pack with distinct previewImage must expose fullPreview for progressive loading',
+);
 const apiResponse = await app.inject({
   method: 'GET',
   url: '/api/stickerpacks',
@@ -5273,12 +5329,12 @@ assert.equal(
 const apiPacks = JSON.parse(apiResponse.body);
 assert.equal(
   apiPacks.length,
-  2,
-  'API response must contain exactly 2 public packs',
+  3,
+  'API response must contain exactly 3 public packs',
 );
 assert.deepEqual(
   apiPacks.map((p: {name: string}) => p.name),
-  [publicPack2Name, publicPack1Name],
+  [publicPack2Name, publicPack1Name, publicPack3Name],
 );
 
 // Direct unlisted access
@@ -5386,6 +5442,31 @@ assert.ok(
 assert.ok(
   rootHtml.includes('/api/stickerpacks'),
   'HTML must use /api/stickerpacks endpoint',
+);
+assert.ok(
+  rootHtml.includes('cardQualityObserver'),
+  'HTML must define cardQualityObserver for progressive static cover loading',
+);
+assert.ok(
+  rootHtml.includes('data-full-src'),
+  'HTML must support data-full-src for progressive high-quality image loading',
+);
+assert.ok(
+  rootHtml.includes('data-animated-src'),
+  'HTML must support data-animated-src for animated preview hover animation',
+);
+assert.ok(
+  rootHtml.includes('enableHoverAnimation'),
+  'HTML must define enableHoverAnimation for on-demand hover loading',
+);
+assert.ok(
+  rootHtml.includes('isHovered'),
+  'HTML must guard hover animation race conditions with isHovered check',
+);
+assert.equal(
+  rootHtml.includes('animatedPreviewObserver'),
+  false,
+  'HTML must NOT use animatedPreviewObserver to avoid preloading heavy animated AVIF on viewport scroll',
 );
 
 // Verify proper Unicode characters from mockup are preserved via ASCII-safe HTML entities / JS escapes
