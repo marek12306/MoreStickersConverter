@@ -1,5 +1,6 @@
 import Fastify, {type FastifyReply} from 'fastify';
 import cors from '@fastify/cors';
+import crypto from 'crypto';
 import path from 'path';
 import {
   DATA_DIR,
@@ -31,7 +32,90 @@ const app = Fastify();
 await app.register(cors, {
   origin: '*',
   methods: ['GET', 'HEAD', 'OPTIONS'],
+  exposedHeaders: ['ETag'],
 });
+
+export function createEtag(body: string | Buffer): string {
+  const hash = crypto.createHash('sha256').update(body).digest('base64url');
+  return `"${hash}"`;
+}
+
+function parseEntityTag(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!/^(?:W\/)?"[\x21\x23-\x7e\x80-\xff]*"$/.test(trimmed)) {
+    return undefined;
+  }
+  return trimmed.startsWith('W/') ? trimmed.slice(2) : trimmed;
+}
+
+function splitHttpHeaderList(header: string): string[] {
+  const items: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < header.length; i++) {
+    const char = header[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      current += char;
+    } else if (char === ',' && !inQuotes) {
+      const trimmedItem = current.trim();
+      if (trimmedItem) {
+        items.push(trimmedItem);
+      }
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  const lastItem = current.trim();
+  if (lastItem) {
+    items.push(lastItem);
+  }
+  return items;
+}
+
+export function ifNoneMatchMatches(
+  ifNoneMatch: string | string[] | undefined | null,
+  etag: string,
+): boolean {
+  if (!ifNoneMatch) {
+    return false;
+  }
+  const header = Array.isArray(ifNoneMatch)
+    ? ifNoneMatch.join(', ')
+    : typeof ifNoneMatch === 'string'
+      ? ifNoneMatch
+      : '';
+  const trimmed = header.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (trimmed === '*') {
+    return true;
+  }
+
+  const targetOpaque = parseEntityTag(etag);
+  if (!targetOpaque) {
+    return false;
+  }
+
+  const parts = splitHttpHeaderList(trimmed);
+  if (parts.length === 0) {
+    return false;
+  }
+
+  let matched = false;
+  for (const part of parts) {
+    const candidateOpaque = parseEntityTag(part);
+    if (!candidateOpaque) {
+      return false;
+    }
+    if (candidateOpaque === targetOpaque) {
+      matched = true;
+    }
+  }
+  return matched;
+}
 
 async function serveStickerAsset(
   reply: FastifyReply,
@@ -235,34 +319,59 @@ app.get<{Params: StickerPackParamsType}>(
     const stickerPackFilePath = generateStickerPackFilePath(stickerPackName);
 
     try {
-      await fs.promises.access(stickerPackFilePath, fs.constants.R_OK);
-      const fileStream = fs.createReadStream(stickerPackFilePath, {
-        highWaterMark: 64 * 1024,
-      });
-
+      const manifestContent = await fs.promises.readFile(
+        stickerPackFilePath,
+        'utf8',
+      );
       const safeFilename = stickerPackName.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const etag = createEtag(manifestContent);
+      if (ifNoneMatchMatches(request.headers['if-none-match'], etag)) {
+        await reply
+          .header('ETag', etag)
+          .header(
+            'Content-Disposition',
+            `attachment; filename="${safeFilename}.stickerpack"`,
+          )
+          .header('Cache-Control', 'no-cache')
+          .code(304)
+          .send();
+        return;
+      }
 
       await reply
-        .type('application/json; charset=utf-8')
+        .header('ETag', etag)
         .header(
           'Content-Disposition',
           `attachment; filename="${safeFilename}.stickerpack"`,
         )
         .header('Cache-Control', 'no-cache')
-        .send(fileStream);
+        .type('application/json; charset=utf-8')
+        .send(manifestContent);
     } catch {
       await reply.code(404).send('Sticker pack not found');
     }
   },
 );
 
-app.get('/api/stickerpacks', async (_request, reply) => {
+app.get('/api/stickerpacks', async (request, reply) => {
   const packs = await getPublicStickerPacks();
+  const body = JSON.stringify(packs);
+  const etag = createEtag(body);
+
+  if (ifNoneMatchMatches(request.headers['if-none-match'], etag)) {
+    await reply
+      .header('ETag', etag)
+      .header('Cache-Control', 'no-cache')
+      .code(304)
+      .send();
+    return;
+  }
 
   await reply
-    .type('application/json; charset=utf-8')
+    .header('ETag', etag)
     .header('Cache-Control', 'no-cache')
-    .send(packs);
+    .type('application/json; charset=utf-8')
+    .send(body);
 });
 
 const browserIndexPath = path.resolve('public/index.html');

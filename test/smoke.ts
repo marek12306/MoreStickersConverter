@@ -121,9 +121,97 @@ const {
 const {listLocalStickerPackNames} = await import(
   '../src/utils/stickerPackCatalog.js'
 );
-const {app} = await import('../src/utils/fastify.js');
+const {app, createEtag, ifNoneMatchMatches} = await import(
+  '../src/utils/fastify.js'
+);
 
 console.log('--- Starting Smoke Tests in Nix Environment ---');
+
+console.log('Testing createEtag and ifNoneMatchMatches contract...');
+const unitEtag1 = createEtag('{"test":123}');
+assert.match(
+  unitEtag1,
+  /^"[A-Za-z0-9_-]+"$/,
+  'createEtag must return a quoted base64url SHA-256 string',
+);
+const unitEtag2 = createEtag('{"test":123}');
+assert.equal(unitEtag1, unitEtag2, 'createEtag must be deterministic');
+const unitEtag3 = createEtag('{"test":124}');
+assert.notEqual(
+  unitEtag1,
+  unitEtag3,
+  'createEtag must produce different hashes for different content',
+);
+const unicodeEtag = createEtag('{"title":"Zażółć gęślą jaźń 🚀"}');
+assert.match(
+  unicodeEtag,
+  /^"[A-Za-z0-9_-]+"$/,
+  'createEtag must handle Unicode UTF-8 payloads',
+);
+
+assert.equal(ifNoneMatchMatches(undefined, unitEtag1), false);
+assert.equal(ifNoneMatchMatches(null, unitEtag1), false);
+assert.equal(ifNoneMatchMatches('', unitEtag1), false);
+assert.equal(ifNoneMatchMatches('   ', unitEtag1), false);
+assert.equal(ifNoneMatchMatches('*', unitEtag1), true);
+assert.equal(ifNoneMatchMatches(' * ', unitEtag1), true);
+assert.equal(ifNoneMatchMatches(unitEtag1, unitEtag1), true);
+assert.equal(ifNoneMatchMatches(` ${unitEtag1} `, unitEtag1), true);
+assert.equal(ifNoneMatchMatches(`W/${unitEtag1}`, unitEtag1), true);
+assert.equal(ifNoneMatchMatches(unitEtag1, `W/${unitEtag1}`), true);
+assert.equal(
+  ifNoneMatchMatches(`"other", ${unitEtag1}, "third"`, unitEtag1),
+  true,
+);
+assert.equal(
+  ifNoneMatchMatches(`"other", W/${unitEtag1}, "third"`, unitEtag1),
+  true,
+);
+assert.equal(ifNoneMatchMatches(['"other"', unitEtag1], unitEtag1), true);
+assert.equal(ifNoneMatchMatches('"other-tag"', unitEtag1), false);
+
+// RFC 9110 strict syntax rejections -> false (fail-safe to 200, no crash)
+assert.equal(
+  ifNoneMatchMatches('"other", *', unitEtag1),
+  false,
+  'Wildcard mixed in list is invalid syntax and must return false',
+);
+assert.equal(
+  ifNoneMatchMatches(`*, ${unitEtag1}`, unitEtag1),
+  false,
+  'Wildcard at start of list is invalid syntax and must return false',
+);
+assert.equal(
+  ifNoneMatchMatches(`w/${unitEtag1}`, unitEtag1),
+  false,
+  'Lowercase w/ is invalid syntax and must return false',
+);
+assert.equal(
+  ifNoneMatchMatches(`W/ ${unitEtag1}`, unitEtag1),
+  false,
+  'Whitespace between W/ and quote is invalid syntax and must return false',
+);
+assert.equal(
+  ifNoneMatchMatches(`W/   ${unitEtag1}`, unitEtag1),
+  false,
+  'Whitespace after W/ is invalid syntax and must return false',
+);
+assert.equal(ifNoneMatchMatches('"unclosed', unitEtag1), false);
+assert.equal(ifNoneMatchMatches('malformed no quotes', unitEtag1), false);
+assert.equal(
+  ifNoneMatchMatches('""', unitEtag1),
+  false,
+  'Empty opaque tag is valid syntax but does not match non-empty SHA-256 ETag',
+);
+assert.equal(
+  ifNoneMatchMatches('""', '""'),
+  true,
+  'Empty opaque tag matches identical empty opaque tag',
+);
+assert.equal(ifNoneMatchMatches('"a,b", "c"', '"a,b"'), true);
+assert.equal(ifNoneMatchMatches('"a,b", "c"', '"c"'), true);
+assert.equal(ifNoneMatchMatches('"a,b", "c"', '"a"'), false);
+console.log('Verified: createEtag and ifNoneMatchMatches contract passed');
 
 assert.deepEqual(
   AVIF_ENCODING_PROFILES,
@@ -2973,7 +3061,256 @@ assert.equal(
   `attachment; filename="${packName}.stickerpack"`,
   `Expected Content-Disposition header for manifest, got ${manifestResponse.headers['content-disposition']}`,
 );
+assert.match(
+  manifestResponse.headers['etag'] as string,
+  /^"[A-Za-z0-9_-]+"$/,
+  'Manifest response must include a valid quoted ETag',
+);
+assert.equal(
+  manifestResponse.headers['access-control-expose-headers'],
+  'ETag',
+  'Manifest response must expose ETag header via CORS',
+);
+const manifestEtag = manifestResponse.headers['etag'] as string;
 
+// Exact If-None-Match conditional GET -> 304 Not Modified
+const manifestExactConditional = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': manifestEtag,
+  },
+});
+assert.equal(
+  manifestExactConditional.statusCode,
+  304,
+  'Exact If-None-Match for manifest must return 304',
+);
+assert.equal(
+  manifestExactConditional.body,
+  '',
+  '304 manifest response body must be empty',
+);
+assert.equal(
+  manifestExactConditional.headers['etag'],
+  manifestEtag,
+  '304 manifest response must preserve current ETag',
+);
+assert.equal(
+  manifestExactConditional.headers['cache-control'],
+  'no-cache',
+  '304 manifest response must preserve Cache-Control: no-cache',
+);
+assert.equal(
+  manifestExactConditional.headers['content-disposition'],
+  `attachment; filename="${packName}.stickerpack"`,
+  '304 manifest response must preserve Content-Disposition',
+);
+
+// Weak If-None-Match conditional GET -> 304
+const manifestWeakConditional = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': `W/${manifestEtag}`,
+  },
+});
+assert.equal(
+  manifestWeakConditional.statusCode,
+  304,
+  'Weak If-None-Match for manifest must return 304',
+);
+assert.equal(manifestWeakConditional.body, '');
+assert.equal(manifestWeakConditional.headers['etag'], manifestEtag);
+
+// Multi-tag If-None-Match conditional GET -> 304
+const manifestMultiConditional = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': `"stale-1", ${manifestEtag}, "stale-2"`,
+  },
+});
+assert.equal(
+  manifestMultiConditional.statusCode,
+  304,
+  'Multi-tag If-None-Match for manifest must return 304',
+);
+assert.equal(manifestMultiConditional.body, '');
+
+// Wildcard If-None-Match conditional GET -> 304
+const manifestWildcardConditional = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': '*',
+  },
+});
+assert.equal(
+  manifestWildcardConditional.statusCode,
+  304,
+  'Wildcard If-None-Match for manifest must return 304',
+);
+assert.equal(manifestWildcardConditional.body, '');
+
+// Stale If-None-Match -> 200 with current representation
+const manifestStaleConditional = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': '"stale-manifest-etag"',
+  },
+});
+assert.equal(
+  manifestStaleConditional.statusCode,
+  200,
+  'Stale If-None-Match for manifest must return 200',
+);
+assert.equal(manifestStaleConditional.headers['etag'], manifestEtag);
+assert.equal(
+  JSON.parse(manifestStaleConditional.body).id,
+  `MoreStickers:Telegram:Pack:${packName}`,
+);
+
+// Empty opaque tag / malformed / unclosed If-None-Match -> 200 without 500 error
+const manifestMalformed1 = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': '""',
+  },
+});
+assert.equal(
+  manifestMalformed1.statusCode,
+  200,
+  'Empty opaque tag If-None-Match does not match and must return 200',
+);
+const manifestMalformed2 = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': '"unclosed',
+  },
+});
+assert.equal(
+  manifestMalformed2.statusCode,
+  200,
+  'Unclosed quote If-None-Match must return 200 without error',
+);
+const manifestMalformed3 = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': '"other", *',
+  },
+});
+assert.equal(
+  manifestMalformed3.statusCode,
+  200,
+  'Wildcard in list is invalid syntax and must return 200',
+);
+const manifestMalformed4 = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': `w/${manifestEtag}`,
+  },
+});
+assert.equal(
+  manifestMalformed4.statusCode,
+  200,
+  'Lowercase w/ is invalid syntax and must return 200',
+);
+
+// Non-existent pack with If-None-Match -> 404
+const manifestNonExistent = await app.inject({
+  method: 'GET',
+  url: '/stickerpack/telegram/NonExistentStickerPack12345',
+  headers: {
+    'if-none-match': '*',
+  },
+});
+assert.equal(
+  manifestNonExistent.statusCode,
+  404,
+  'Non-existent pack with wildcard If-None-Match must return 404',
+);
+
+// Manifest change invalidation test
+const invalidationPackName = 'ManifestInvalidationPack';
+const invalidationPackPath = generateStickerPackFilePath(invalidationPackName);
+const v1Manifest = {
+  id: `MoreStickers:Telegram:Pack:${invalidationPackName}`,
+  title: 'Invalidation Pack V1',
+  stickers: [],
+  dynamic: {
+    version: 1,
+    refreshUrl: generateStickerPackExternalUrl(invalidationPackName),
+  },
+};
+await fsp.writeFile(invalidationPackPath, JSON.stringify(v1Manifest));
+const invV1Resp = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${invalidationPackName}`,
+});
+assert.equal(invV1Resp.statusCode, 200);
+const invEtagV1 = invV1Resp.headers['etag'] as string;
+assert.match(invEtagV1, /^"[A-Za-z0-9_-]+"$/);
+
+// Modify manifest (version 2)
+const v2Manifest = {
+  ...v1Manifest,
+  title: 'Invalidation Pack V2 Updated',
+  dynamic: {
+    version: 2,
+    refreshUrl: generateStickerPackExternalUrl(invalidationPackName),
+  },
+};
+await fsp.writeFile(invalidationPackPath, JSON.stringify(v2Manifest));
+const invV2Resp = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${invalidationPackName}`,
+});
+assert.equal(invV2Resp.statusCode, 200);
+const invEtagV2 = invV2Resp.headers['etag'] as string;
+assert.notEqual(
+  invEtagV1,
+  invEtagV2,
+  'Manifest ETag must change when manifest content changes',
+);
+
+// Request with old etag1 -> must return 200 with new manifest, not 304
+const invStaleResp = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${invalidationPackName}`,
+  headers: {
+    'if-none-match': invEtagV1,
+  },
+});
+assert.equal(
+  invStaleResp.statusCode,
+  200,
+  'Request with stale ETag after manifest update must return 200',
+);
+assert.equal(invStaleResp.headers['etag'], invEtagV2);
+assert.equal(
+  JSON.parse(invStaleResp.body).title,
+  'Invalidation Pack V2 Updated',
+);
+
+// Request with new etag2 -> must return 304
+const invFreshResp = await app.inject({
+  method: 'GET',
+  url: `/stickerpack/telegram/${invalidationPackName}`,
+  headers: {
+    'if-none-match': invEtagV2,
+  },
+});
+assert.equal(
+  invFreshResp.statusCode,
+  304,
+  'Request with fresh ETag must return 304',
+);
 const manifestHeadResponse = await app.inject({
   method: 'HEAD',
   url: `/stickerpack/telegram/${packName}`,
@@ -2987,6 +3324,26 @@ assert.equal(
   200,
   `Expected 200 for manifest HEAD, got ${manifestHeadResponse.statusCode}`,
 );
+assert.equal(
+  manifestHeadResponse.headers['etag'],
+  manifestEtag,
+  'HEAD response must include identical ETag to GET',
+);
+
+const manifestHeadConditional = await app.inject({
+  method: 'HEAD',
+  url: `/stickerpack/telegram/${packName}`,
+  headers: {
+    'if-none-match': manifestEtag,
+  },
+});
+assert.equal(
+  manifestHeadConditional.statusCode,
+  304,
+  'HEAD with matching ETag must return 304',
+);
+assert.equal(manifestHeadConditional.body, '');
+assert.equal(manifestHeadConditional.headers['etag'], manifestEtag);
 assert.equal(
   manifestHeadResponse.headers['access-control-allow-origin'],
   '*',
@@ -5326,6 +5683,157 @@ assert.equal(
   '*',
   'GET /api/stickerpacks must include CORS *',
 );
+assert.match(
+  apiResponse.headers['etag'] as string,
+  /^"[A-Za-z0-9_-]+"$/,
+  'GET /api/stickerpacks must include a valid quoted ETag',
+);
+assert.equal(
+  apiResponse.headers['access-control-expose-headers'],
+  'ETag',
+  'GET /api/stickerpacks must expose ETag header via CORS',
+);
+const catalogEtag = apiResponse.headers['etag'] as string;
+
+// Exact If-None-Match conditional GET -> 304 Not Modified
+const apiExactConditional = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': catalogEtag,
+  },
+});
+assert.equal(
+  apiExactConditional.statusCode,
+  304,
+  'Exact If-None-Match for catalog must return 304',
+);
+assert.equal(
+  apiExactConditional.body,
+  '',
+  '304 catalog response body must be empty',
+);
+assert.equal(
+  apiExactConditional.headers['etag'],
+  catalogEtag,
+  '304 catalog response must preserve current ETag',
+);
+assert.equal(
+  apiExactConditional.headers['cache-control'],
+  'no-cache',
+  '304 catalog response must preserve Cache-Control: no-cache',
+);
+
+// Weak If-None-Match conditional GET -> 304
+const apiWeakConditional = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': `W/${catalogEtag}`,
+  },
+});
+assert.equal(
+  apiWeakConditional.statusCode,
+  304,
+  'Weak If-None-Match for catalog must return 304',
+);
+assert.equal(apiWeakConditional.body, '');
+assert.equal(apiWeakConditional.headers['etag'], catalogEtag);
+
+// Multi-tag If-None-Match conditional GET -> 304
+const apiMultiConditional = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': `"stale-1", ${catalogEtag}, "stale-2"`,
+  },
+});
+assert.equal(
+  apiMultiConditional.statusCode,
+  304,
+  'Multi-tag If-None-Match for catalog must return 304',
+);
+assert.equal(apiMultiConditional.body, '');
+
+// Wildcard If-None-Match conditional GET -> 304
+const apiWildcardConditional = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': '*',
+  },
+});
+assert.equal(
+  apiWildcardConditional.statusCode,
+  304,
+  'Wildcard If-None-Match for catalog must return 304',
+);
+assert.equal(apiWildcardConditional.body, '');
+
+// Stale If-None-Match -> 200 with current catalog
+const apiStaleConditional = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': '"stale-catalog-etag"',
+  },
+});
+assert.equal(
+  apiStaleConditional.statusCode,
+  200,
+  'Stale If-None-Match for catalog must return 200',
+);
+assert.equal(apiStaleConditional.headers['etag'], catalogEtag);
+
+// Empty opaque tag / malformed / unclosed If-None-Match -> 200 without 500 error
+const apiMalformed1 = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': '""',
+  },
+});
+assert.equal(
+  apiMalformed1.statusCode,
+  200,
+  'Empty opaque tag If-None-Match does not match and must return 200',
+);
+const apiMalformed2 = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': '"unclosed',
+  },
+});
+assert.equal(
+  apiMalformed2.statusCode,
+  200,
+  'Unclosed quote If-None-Match must return 200 without error',
+);
+const apiMalformed3 = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': '"other", *',
+  },
+});
+assert.equal(
+  apiMalformed3.statusCode,
+  200,
+  'Wildcard in list is invalid syntax and must return 200',
+);
+const apiMalformed4 = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': `w/${catalogEtag}`,
+  },
+});
+assert.equal(
+  apiMalformed4.statusCode,
+  200,
+  'Lowercase w/ is invalid syntax and must return 200',
+);
 const apiPacks = JSON.parse(apiResponse.body);
 assert.equal(
   apiPacks.length,
@@ -5336,7 +5844,6 @@ assert.deepEqual(
   apiPacks.map((p: {name: string}) => p.name),
   [publicPack2Name, publicPack1Name, publicPack3Name],
 );
-
 // Direct unlisted access
 const unlistedManifestResp = await app.inject({
   method: 'GET',
@@ -5385,6 +5892,52 @@ assert.equal(
   false,
   'Dynamically unlisted pack must disappear from catalog without restart',
 );
+
+const etagBefore = dynamicPublicResp.headers['etag'] as string;
+const etagAfter = dynamicUnlistedResp.headers['etag'] as string;
+assert.match(etagBefore, /^"[A-Za-z0-9_-]+"$/);
+assert.match(etagAfter, /^"[A-Za-z0-9_-]+"$/);
+assert.notEqual(
+  etagBefore,
+  etagAfter,
+  'Catalog ETag must change when catalog items change',
+);
+
+// Request with stale etagBefore -> 200 with new etagAfter
+const staleCatalogResp = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': etagBefore,
+  },
+});
+assert.equal(
+  staleCatalogResp.statusCode,
+  200,
+  'Stale catalog ETag after visibility change must return 200',
+);
+assert.equal(staleCatalogResp.headers['etag'], etagAfter);
+const stalePacks = JSON.parse(staleCatalogResp.body);
+assert.equal(
+  stalePacks.some((p: {name: string}) => p.name === unlistedPackName),
+  false,
+);
+
+// Request with fresh etagAfter -> 304
+const freshCatalogResp = await app.inject({
+  method: 'GET',
+  url: '/api/stickerpacks',
+  headers: {
+    'if-none-match': etagAfter,
+  },
+});
+assert.equal(
+  freshCatalogResp.statusCode,
+  304,
+  'Fresh catalog ETag must return 304',
+);
+assert.equal(freshCatalogResp.body, '');
+assert.equal(freshCatalogResp.headers['etag'], etagAfter);
 console.log(
   'Verified: Public Catalog and /api/stickerpacks endpoint pass all tests',
 );
