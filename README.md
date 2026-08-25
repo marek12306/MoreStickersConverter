@@ -13,8 +13,15 @@
 The fork supports all common Telegram sticker formats:
 
 * Static **WebP** stickers are preserved as-is.
-* Video stickers in **WebM** format are converted to animated **AVIF** (AV1 with preserved alpha transparency, 10-bit color, up to 160x160, up to 24 fps with lower-FPS fallback profiles, max 3 seconds, hard 5 MiB limit).
-* Animated **TGS** stickers are rendered to frames using `lottieconverter` and encoded as animated **AVIF**.
+* Video stickers in **WebM** format are converted to animated **AVIF** (AV1 with preserved alpha transparency, 10-bit color, max 160x160, max 3 seconds, hard 5 MiB limit):
+  * Source frame rate is detected using `ffprobe` (preferring `avg_frame_rate`, falling back to `r_frame_rate`).
+  * Output frame rate is capped at `min(source FPS, 30)` and is never artificially upsampled above the source frame rate (e.g. 60 FPS -> max 30, 30 FPS -> max 30, 29.97 FPS -> max 29.97, 25 FPS -> max 25, 24 FPS -> max 24, 15 FPS -> max 15).
+  * Dynamic fallback FPS candidates are built from `30 -> 24 -> 20 -> 16`, using only rungs strictly below the effective source/cap rate. The highest FPS candidate is tried across multiple quality profiles before lower-FPS fallback candidates are attempted.
+* Animated **TGS** stickers are rendered to lossless PNG frames using `lottieconverter` and encoded as animated **AVIF**:
+  * Original Lottie timeline frame rate (`fr`) is preserved during normalization.
+  * Rendered via `lottieconverter` at `min(60, floor(source FPS))` integer FPS (capped at 60 fps max, without upsampling above source, e.g. 120 FPS -> render max 60, 60 FPS -> 60, 50 FPS -> 50, 30 FPS -> 30, 29.6 FPS -> render 29 with 29.6 timeline, 12 FPS -> 12).
+  * Dynamic fallback ladder uses filtered rungs from `60 -> 48 -> 30 -> 24 -> 20 -> 16` fps.
+* **Frame rate compatibility**: Candidate and output FPS never exceed the source frame rate. Missing or invalid FPS metadata uses a compatibility fallback of 24 FPS. Valid frame rates in `0 < FPS < 1` are explicitly unsupported because the constant-frame-rate animated AVIF pipeline cannot preserve such rates within the 3-second duration limit.
 * New animated stickers are encoded exclusively as animated AVIF; historical GIF assets from older versions remain supported for backward compatibility.
 * Previews are generated automatically as **WebP** for both static and animated stickers.
 
@@ -53,23 +60,31 @@ These commands can also be used by replying to a sticker from the target pack.
 
 Unlisted packs do not appear in the public catalog but remain accessible through their direct link.
 
+#### Progressive loading and performance
+* **Preview-first rendering**: Animated pack cards and animated stickers initially display lightweight static **WebP preview** images; heavy animated AVIF/GIF files are not loaded upfront.
+* **Hover-activated animations**: Animated assets are fetched on first hover and play while hovered, returning to static previews on mouse leave.
+* **Viewport-proximity quality loading**: Static stickers and full-resolution previews load high-quality assets via `IntersectionObserver` when scrolling near the viewport (`rootMargin: 200px`).
+* **On-demand manifest retrieval**: Sticker pack manifests and full galleries are fetched on demand when opening a pack drawer, rather than loading all manifests upfront.
+* Standard image lazy loading (`loading="lazy"`) is used across the catalog.
+
 ### Telegram bot commands
 
 Authorized users can manage and inspect sticker packs using the following bot commands:
 
 ```text
-/pack <pack-name>       Import or get a hosted sticker pack
-/refresh <pack-name>    Refresh a single pack from Telegram
-/refresh_all            Refresh all local sticker packs from Telegram sequentially
-/check <pack-name>      Check whether a local pack is up to date with Telegram
-/info <pack-name>       Show information about a pack
-/public <pack-name>     Add a pack to the public catalog
-/unlisted <pack-name>   Remove a pack from the public catalog
-/stats                  Show local library statistics
-/status                 Show converter and garbage collection status
-/gc                     Run storage garbage collection
-/gc_dry                 Preview garbage collection without deleting files
-/gc_stats               Show storage garbage collection statistics
+/pack <pack-name>          Import or get a hosted sticker pack
+/refresh <pack-name>       Refresh a single pack from Telegram
+/refresh_all               Refresh all local sticker packs from Telegram sequentially
+/refresh_all_cancel        Request cooperative cancellation of the current bulk refresh
+/check <pack-name>         Check whether a local pack is up to date with Telegram
+/info <pack-name>          Show information about a pack
+/public <pack-name>        Add a pack to the public catalog
+/unlisted <pack-name>      Remove a pack from the public catalog
+/stats                     Show local library statistics
+/status                    Show runtime, work, storage, refresh and GC diagnostics
+/gc                        Run storage garbage collection
+/gc_dry                    Preview garbage collection without deleting files
+/gc_stats                  Show storage garbage collection statistics
 ```
 
 Pack-specific commands (`/pack`, `/refresh`, `/check`, `/info`, `/public`, `/unlisted`) can be used either with an explicit pack name (e.g. `/info MyPack`) or by replying to a sticker from that pack.
@@ -82,8 +97,71 @@ An administrative command that reads all locally known sticker packs from local 
 * Refreshes run one pack at a time; an error in one pack does not stop processing of the remaining packs.
 * When finished, it replies with a summary showing total, successful, and failed packs.
 * Concurrent `/refresh_all` invocations are rejected with `Refresh all is already running.`.
+* Progress is maintained process-local and can be monitored via `/status` (showing processed/total, current pack, successful, failed, cancel requested, and elapsed time).
+* Once finished, the result is recorded in a process-local summary with one of three outcomes: `completed`, `cancelled`, or `failed`.
 * Individual `/refresh` commands are not globally blocked by `/refresh_all`, as per-pack queues safely isolate operations on the same pack.
 * It is the recommended way to migrate all historical GIF packs to the current AVIF pipeline by re-downloading sources from Telegram.
+
+#### `/refresh_all_cancel`
+Requests cooperative cancellation of an active `/refresh_all` operation:
+* It stops processing between packs: the currently active pack is not killed mid-download or mid-conversion and finishes its full publication cycle normally.
+* Processing halts before starting the next pack in the queue.
+* Multiple cancellation requests are handled idempotently.
+* If `/refresh_all` is not running, the bot responds that there is no active bulk refresh to cancel.
+
+#### `/status`
+Returns a comprehensive read-only snapshot of runtime health, work queues, storage diagnostics, bulk refresh state, and garbage collection:
+
+* **Runtime diagnostics**:
+  * Status: `OK` or `DEGRADED` (degraded if `DATA_DIR` is inaccessible or `EXTERNAL_URL` is not configured).
+  * Uptime, Node.js version (`process.version`), FFmpeg availability/version (via lightweight `ffmpeg -version` probe), `lottieconverter` availability (via lightweight probe), download worker concurrency (`CONCURRENCY`), data directory access check (`OK`/`Inaccessible`), and external URL configuration status (`configured`/`missing`).
+  * Tool diagnostics (FFmpeg, lottieconverter) are cached process-local with a **5-minute TTL**.
+* **Work diagnostics**:
+  * `Active downloads`: Number of currently running Telegram sticker download operations (process-local counter).
+  * `Active encodes`: Number of logical animated conversion jobs in progress (process-local counter; a single sticker conversion across multiple profile fallback attempts counts as 1 active encode).
+  * `Queue length`: Total number of sticker jobs waiting in active download queues (excluding jobs already acquired by download workers).
+  * *Note*: `Active encodes` is a diagnostic metric, not a separate concurrency limit; download concurrency is governed by `CONCURRENCY`.
+* **Storage diagnostics**:
+  * `Storage size`: Read-only snapshot of total bytes stored in `DATA_DIR`, formatted in binary units (B, KiB, MiB, GiB, TiB). Strictly read-only: does not create `DATA_DIR` if missing (reporting `0 B`). If an unexpected read error occurs (such as permission or I/O failure), reports `unavailable` rather than an understated partial sum.
+  * `Legacy GIF packs`: Count of sticker *packs* that still reference legacy GIF assets in their active version retention history (`last 5 versions`). Stale GIF assets outside the retention window are not counted. If index/manifest scanning encounters unreadable files or corruption, reports `unavailable` to avoid displaying an inaccurate partial count.
+  * Storage diagnostics are cached process-local with a **60-second TTL**.
+* **Refresh all diagnostics**: Shows current status (idle or running with progress, current pack, counts, and elapsed time) and the outcome of the last run (`completed`, `cancelled` with refreshed/failed/skipped counts, or `failed`).
+* **Garbage collection diagnostics**: Shows current GC status (idle or running with mode and elapsed time) and the summary of the last run across all execution modes (mode, outcome, error count, and bytes freed for `apply` mode).
+* **Fail-soft & process-local semantics**: `/status` is strictly read-only and never performs repair or cleanup actions. If an individual probe fails (e.g. FFmpeg unavailable or storage unreadable), the remaining sections still render without crashing. Counters, queue lengths, tool cache, and lifecycle summaries are process-local (not aggregated across multiple container replicas).
+
+Example output:
+```text
+MoreStickersConverter status
+
+Runtime
+Status: OK
+Uptime: 2h 4m
+Node.js: v22.x.x
+FFmpeg: 7.x
+lottieconverter: available
+Download concurrency: 5
+Data directory: OK
+External URL: configured
+
+Work
+Active downloads: 2
+Active encodes: 1
+Queue length: 4
+
+Storage
+Storage size: 3.74 GiB
+Legacy GIF packs: 2
+
+Refresh all: idle
+Last run: 18m ago
+Result: 121 refreshed, 2 failed
+
+Garbage collection: idle
+Last run: 2h ago
+Mode: apply
+Result: success with 0 errors
+Freed: 186.4 MiB
+```
 
 #### `/gc`
 Manually triggers real storage garbage collection using the exact same core engine and retention policy as the background GC (it does not replace or disable the periodic background GC):
@@ -154,16 +232,9 @@ Retention: last 5 versions
 
 #### Garbage collection safety and concurrency
 * **Conservative fail-safe design**: All three GC modes report `Errors: N` if any sticker pack or version index cannot be safely analyzed or cleaned. When storage state cannot be safely validated (such as a corrupted manifest or an unreadable index), potentially required data is retained rather than deleted. If removing a stale version index fails, orphaned asset deletion for that pack is skipped to prevent leaving valid indexes without their corresponding blobs.
-* **Process-local concurrency**: GC guards and per-pack storage mutation locks are **process-local**. They prevent race conditions between GC and concurrent pack downloads or publications within the same Node.js process, but do not provide distributed locking across multiple container replicas sharing the same `DATA_DIR`.
-* **`/status` reporting**: The `/status` command displays the current state of garbage collection:
-  * Idle: `Garbage collection: idle`
-  * Running:
-    ```text
-    Garbage collection: running
-    Mode: apply
-    Elapsed: 12s
-    ```
-    (where `Mode` reflects `apply`, `dry-run`, or `stats`).
+* **Process-local concurrency**: GC guards and per-pack storage mutation locks are **process-local**. They synchronize GC with concurrent storage mutations and pack publications within the same Node.js process (without locking during network downloads), but do not provide distributed locking across multiple container replicas sharing the same `DATA_DIR`.
+* **Periodic background GC**: Background GC runs automatically on startup after migrations, and periodically every **5 hours** (`STICKER_STORAGE_GC_INTERVAL_MS`). Every background execution updates the unified `last GC` summary reported in `/status`.
+* **`/status` reporting**: Real-time GC state and the last completed GC summary are visible via the `/status` command.
 
 ### Telegram access control
 
@@ -173,7 +244,7 @@ Bot access can be limited with:
 ALLOWED_TELEGRAM_USER_IDS
 ```
 
-Only listed Telegram users can import packs, trigger refreshes (`/refresh`, `/refresh_all`), run garbage collection (`/gc`, `/gc_dry`, `/gc_stats`), or manage visibility (`/public`, `/unlisted`).
+Only allowlisted Telegram users can import stickers by sending them to the bot or use bot management and diagnostic commands (`/pack`, `/refresh`, `/refresh_all`, `/refresh_all_cancel`, `/check`, `/info`, `/stats`, `/status`, `/gc`, `/gc_dry`, `/gc_stats`, `/public`, `/unlisted`).
 
 Example:
 
@@ -181,7 +252,7 @@ Example:
 ALLOWED_TELEGRAM_USER_IDS=123456789,987654321
 ```
 
-If the allowlist is empty or not configured, Telegram requests are ignored.
+If the allowlist is empty or not configured, all incoming Telegram messages and commands are ignored.
 
 ### Faster and more reliable downloads
 
@@ -201,17 +272,30 @@ CONCURRENCY=8
 
 Failed Telegram downloads are retried automatically, and download handling has been improved to avoid incomplete or corrupted files.
 
-### Startup migration and caching
+### Startup migration, routing compatibility, and caching
 
 On startup, the server automatically inspects local sticker packs and performs failure-safe startup migrations:
 * **Raw upstream WebM/TGS**: If a local manifest references raw `.webm` or `.tgs` assets from upstream MoreStickersConverter, the startup migration converts them to animated AVIF, generates WebP previews, stores assets in CAS, creates version index 1, and atomically publishes the new manifest before cleaning up raw working files (retaining original sources if conversion fails).
 * **Static WebP without previews**: For older packs with static `.webp` stickers and missing preview files, the missing WebP previews are generated automatically before publishing the pack to CAS version 1.
 * **Historical GIF packs**: Historical GIF packs from earlier fork versions remain fully compatible and are served as-is (they are not converted at startup). To migrate them to AVIF, run `/refresh <pack-name>` or `/refresh_all` to re-download the original WebM/TGS sources from Telegram.
+* **Background GC scheduling**: The server automatically schedules periodic background garbage collection every 5 hours upon startup.
+
+#### Legacy URL routing compatibility
+To maintain backward compatibility with links generated before migration:
+* **Versionless WebM/TGS URLs** (`/sticker/telegram/:pack/A.webm`, `/sticker/telegram/:pack/A.tgs`): Automatically resolve to the current `.avif` asset.
+* **Versionless GIF URLs and aliases** (`/sticker/telegram/:pack/A.gif`, `/sticker/telegram/:pack/A-160.gif`): Automatically resolve to the current `.avif` asset if no exact GIF file exists in the active version.
+* **Strict versioned routing**: Cross-extension compatibility fallbacks apply exclusively to unversioned legacy routes. Versioned routes (`/sticker/telegram/:pack/:version/:filename`) use strict exact-match resolution and remain available only while that version is retained.
 
 #### HTTP cache policy
-* **Versionless / legacy URLs** (`/sticker/telegram/:pack/:filename`, `/preview/telegram/:pack/:filename`): `Cache-Control: public, max-age=300` (5 minutes).
-* **Versioned URLs** (`/sticker/telegram/:pack/:version/:filename`, `/preview/telegram/:pack/:version/:filename`): `Cache-Control: public, max-age=604800` (7 days).
-* HTTP responses do not use `immutable`. Since retention keeps the last 5 versions in storage, versioned URLs are not permanent.
+* **Versionless / legacy asset URLs** (`/sticker/telegram/:pack/:filename`, `/preview/telegram/:pack/:filename`): `Cache-Control: public, max-age=300` (5 minutes).
+* **Versioned asset URLs** (`/sticker/telegram/:pack/:version/:filename`, `/preview/telegram/:pack/:version/:filename`): `Cache-Control: public, max-age=604800` (7 days).
+* Binary asset HTTP responses do not use `immutable`. Since retention keeps the last 5 versions in storage, versioned URLs are not permanent archives.
+
+#### Conditional JSON caching
+* The hosted manifest endpoint (`/stickerpack/telegram/:stickerPackName`) and public catalog API (`/api/stickerpacks`) return `Cache-Control: no-cache` along with a deterministic, SHA-256-based `ETag`.
+* Full `If-None-Match` conditional request support is provided: clients sending a matching entity tag (including exact tags, weak `W/` tags, comma-separated tag lists, or `*`) receive a `304 Not Modified` response without a response body.
+* Malformed `If-None-Match` headers fail-safe to a standard `200 OK` response without errors.
+* The `ETag` header is exposed to browser clients via CORS (`Access-Control-Expose-Headers: ETag`).
 
 ### Safer and more robust server
 
@@ -233,17 +317,19 @@ A Nix development environment is also available with Node.js, pnpm, FFmpeg, and 
 
 The fork includes a comprehensive smoke test suite covering:
 
-* WebM and TGS conversion to animated AVIF (alpha preservation, 160x160 / up to 24 fps / <= 3 s / <= 5 MiB constraints),
-* Quality ladder profile fallback and temporary file cleanup,
-* Static WebP handling and WebP preview generation,
-* Legacy GIF asset compatibility and unversioned GIF-to-AVIF routing fallback,
-* Startup migration for raw upstream WebM/TGS and static WebP packs without previews,
-* `/refresh` and `/refresh_all` (sequential execution, concurrent guard, error isolation, summary reporting),
+* Source-aware WebM conversion to animated AVIF (up to 30 fps cap, no upsampling, rational 29.97 parsing, dynamic fallback ladder `30 -> 24 -> 20 -> 16` fps, 10-bit yuv420p10le color + gray10le alpha, <= 3 s / <= 5 MiB / 160x160 constraints, candidate cleanup),
+* Source-aware TGS Lottie rendering and conversion (`lottieconverter` at `min(60, floor(source FPS))` integer fps, timeline preservation, ladder `60 -> 48 -> 30 -> 24 -> 20 -> 16` fps, zip-bomb / frame-count limits),
+* Invalid and unsupported FPS edge cases (24 fps fallback for missing/invalid metadata, rejection of `0 < FPS < 1`),
+* Static WebP handling and WebP preview generation (with premultiply/unpremultiply alpha scaling),
+* Legacy GIF asset compatibility and unversioned URL routing fallbacks (`.webm`/`.tgs`/`.gif`/`-160.gif` -> `.avif`),
+* Startup migration for raw upstream WebM/TGS and static WebP packs without previews, and 5-hour background GC scheduling,
+* `/refresh` and `/refresh_all` lifecycle (sequential execution, per-pack locking, cooperative cancellation via `/refresh_all_cancel`, summary reporting, outcome recording),
 * Dynamic version lifecycle, pack-title version bump, and content-addressed storage (CAS) retention / GC (last 5 versions),
 * Storage garbage collection and administrative commands (`/gc`, `/gc_dry`, `/gc_stats`, dry-run / stats read-only safety, error reporting, publication lock synchronization),
-* HTTP endpoints, CORS headers, and cache policies (`max-age=300` for legacy, `max-age=604800` for versioned),
-* Public catalog and `/public` / `/unlisted` visibility commands,
-* Telegram authorization allowlist,
+* `/status` diagnostics (FFmpeg and lottieconverter probes with 5-minute TTL cache, active download / encode counters, queue length tracking, storage size scanner with 60-second TTL cache and `unavailable` on read errors, legacy GIF pack count with fail-soft `unavailable` reporting on partial/corrupt legacy GIF scans, fail-soft rendering),
+* HTTP endpoints, CORS headers, `ETag` generation, `If-None-Match` matching (exact, weak, list, wildcard, RFC 9110 fail-safe), 304 conditional responses, and binary asset caching (`max-age=300` for legacy, `max-age=604800` for versioned without `immutable`),
+* Public catalog web interface and progressive loading behavior (WebP preview first, hover-activated animations, viewport proximity loading),
+* Telegram authorization allowlist (`ALLOWED_TELEGRAM_USER_IDS`) for sticker imports and all bot management/diagnostic commands,
 * Malformed input handling, path traversal protection, atomic file operations, per-pack serialization, and worker-drain safety.
 
 Run the test suite with:
@@ -251,7 +337,6 @@ Run the test suite with:
 ```bash
 pnpm test
 ```
-
 ---
 
 # MoreStickersConverter
