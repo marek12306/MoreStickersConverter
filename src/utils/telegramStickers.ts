@@ -1433,7 +1433,7 @@ export async function migrateLegacyStickerStorage(): Promise<number> {
 
 export async function initializeTelegramStickerStorage(
   migrate: () => Promise<unknown> = migrateLegacyStickerStorage,
-  collect: () => Promise<void> = garbageCollectStickerAssets,
+  collect: () => Promise<unknown> = garbageCollectStickerAssets,
 ): Promise<NodeJS.Timeout> {
   await migrate();
   try {

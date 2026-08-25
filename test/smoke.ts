@@ -74,12 +74,18 @@ const {
   toMcStickerPack,
 } = await import('../src/utils/telegramStickers.js');
 const {
+  formatByteSize,
+  formatDurationSeconds,
   garbageCollectStickerAssets,
   generateStickerAssetsDirPath,
+  generateStickerVersionIndexPath,
+  generateStickerVersionsDirPath,
+  getGarbageCollectionStatus,
   listStickerPackVersions,
-  readStickerVersionIndex,
   pruneOldStickerVersions,
+  readStickerVersionIndex,
   resolveStickerAssetPath,
+  runGarbageCollection,
   scheduleStickerAssetGarbageCollection,
   STICKER_PACK_VERSION_RETENTION,
   STICKER_STORAGE_GC_INTERVAL_MS,
@@ -110,6 +116,9 @@ const {formatCommandUsage, formatUptime} = await import(
 const {
   getRefreshAllStatus,
   handleCheckCommand,
+  handleGcCommand,
+  handleGcDryCommand,
+  handleGcStatsCommand,
   handleInfoCommand,
   handlePackCommand,
   handleRefreshAllCancelCommand,
@@ -9506,6 +9515,728 @@ console.log(
       await fsp.rename(path.join(backupDir, file), path.join(DATA_DIR, file));
     }
     await fsp.rm(backupDir, {recursive: true, force: true});
+  }
+}
+
+// =========================================================================
+// Comprehensive test suite for /gc, /gc_dry, /gc_stats and unified GC engine
+// =========================================================================
+console.log('\nTesting /gc, /gc_dry, /gc_stats and unified GC engine...');
+
+// Unit tests: formatByteSize and formatDurationSeconds
+{
+  assert.equal(formatByteSize(0), '0 B');
+  assert.equal(formatByteSize(823), '823 B');
+  assert.equal(formatByteSize(1024), '1 KiB');
+  assert.equal(formatByteSize(12.4 * 1024), '12.4 KiB');
+  assert.equal(formatByteSize(18.7 * 1024 * 1024), '18.7 MiB');
+  assert.equal(formatByteSize(186.4 * 1024 * 1024), '186.4 MiB');
+  assert.equal(formatByteSize(3.74 * 1024 * 1024 * 1024), '3.74 GiB');
+
+  assert.equal(formatDurationSeconds(50), '50 ms');
+  assert.equal(formatDurationSeconds(1800), '1.8 s');
+}
+
+// Test 1: Authorization for /gc, /gc_dry, /gc_stats
+{
+  const unauthCtx = createMockContext({userId: 'unauthorized_stranger'});
+  assert.equal(
+    await handleGcCommand(unauthCtx),
+    false,
+    '/gc must reject unauthorized user',
+  );
+  assert.equal(
+    await handleGcDryCommand(unauthCtx),
+    false,
+    '/gc_dry must reject unauthorized user',
+  );
+  assert.equal(
+    await handleGcStatsCommand(unauthCtx),
+    false,
+    '/gc_stats must reject unauthorized user',
+  );
+  assert.equal(
+    unauthCtx.replies.length,
+    0,
+    'Unauthorized user must receive 0 replies',
+  );
+}
+
+// Setup controlled fixture for Tests 2 - 9
+const gcTestPackName = 'GcComprehensiveTestPack';
+const gcTestPackDir = generateStickerPackDirPath(gcTestPackName);
+const gcTestAssetsDir = generateStickerAssetsDirPath(gcTestPackName);
+const gcTestVersionsDir = generateStickerVersionsDirPath(gcTestPackName);
+await fsp.mkdir(gcTestAssetsDir, {recursive: true});
+await fsp.mkdir(gcTestVersionsDir, {recursive: true});
+
+const testAssetFiles: Record<string, string> = {};
+for (let v = 1; v <= 7; v++) {
+  const src = path.join(gcTestPackDir, `raw-${v}.webp`);
+  await fsp.writeFile(src, `content-v${v}-${'x'.repeat(100)}`);
+  const asset = await storeStickerAsset(gcTestPackName, src);
+  testAssetFiles[`v${v}`] = asset;
+  await fsp.unlink(src).catch(() => undefined);
+}
+// Orphaned asset (not referenced anywhere)
+const orphanSrc = path.join(gcTestPackDir, 'raw-orphan.webp');
+await fsp.writeFile(orphanSrc, `orphan-content-${'y'.repeat(200)}`);
+const orphanAssetFilename = await storeStickerAsset(gcTestPackName, orphanSrc);
+await fsp.unlink(orphanSrc).catch(() => undefined);
+
+// Write version indexes 1..7
+for (let v = 1; v <= 7; v++) {
+  await writeStickerVersionIndexAtomically(gcTestPackName, {
+    version: v,
+    signature: `sig-v${v}`,
+    stickers: {[`sticker_${v}.webp`]: testAssetFiles[`v${v}`]!},
+    previews: {[`sticker_${v}.webp`]: testAssetFiles[`v${v}`]!},
+  });
+}
+
+// Write manifest for current version 7
+await writeStickerPackManifestAtomically(
+  generateStickerPackFilePath(gcTestPackName),
+  {
+    id: gcTestPackName,
+    title: 'GC Test Pack',
+    animated: false,
+    stickers: [
+      {
+        id: `${gcTestPackName}:sticker_7`,
+        filename: 'sticker_7.webp',
+        emojis: ['🧪'],
+        isAnimated: false,
+        media: {
+          type: 'static',
+          canonicalPath: 'sticker_7.webp',
+          previewPath: 'sticker_7.webp',
+        },
+      },
+    ],
+    dynamic: {
+      version: 7,
+      url: `https://example.com/stickerpack/telegram/${gcTestPackName}`,
+    },
+  } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+);
+
+// Test 2: /gc_stats on controlled storage
+{
+  const ctx = createMockContext({userId: allowedUserId});
+  const handled = await handleGcStatsCommand(ctx);
+  assert.equal(handled, true, '/gc_stats must handle authorized command');
+  assert.equal(ctx.replies.length, 1, '/gc_stats must reply with 1 message');
+  const reply = ctx.replies[0]!;
+  assert.ok(reply.includes('Storage GC statistics'));
+  assert.ok(reply.includes('Version indexes:'));
+  assert.ok(reply.includes('CAS assets:'));
+  assert.ok(reply.includes('CAS size:'));
+  assert.ok(reply.includes('Referenced assets:'));
+  assert.ok(reply.includes('Orphaned assets:'));
+  assert.ok(reply.includes('Prunable version indexes:'));
+  assert.ok(reply.includes('Estimated reclaimable:'));
+  assert.ok(reply.includes('Retention: last 5 versions'));
+}
+
+// Test 3: /gc_stats is strictly read-only
+{
+  // Verify all 7 version indexes and all assets still exist
+  for (let v = 1; v <= 7; v++) {
+    const indexPath = generateStickerVersionIndexPath(gcTestPackName, v);
+    await fsp.access(indexPath, fs.constants.R_OK);
+    const assetPath = path.join(gcTestAssetsDir, testAssetFiles[`v${v}`]!);
+    await fsp.access(assetPath, fs.constants.R_OK);
+  }
+  const orphanPath = path.join(gcTestAssetsDir, orphanAssetFilename);
+  await fsp.access(orphanPath, fs.constants.R_OK);
+  const manifestPath = generateStickerPackFilePath(gcTestPackName);
+  await fsp.access(manifestPath, fs.constants.R_OK);
+}
+
+// Test 4: /gc_dry
+{
+  const ctx = createMockContext({userId: allowedUserId});
+  const handled = await handleGcDryCommand(ctx);
+  assert.equal(handled, true, '/gc_dry must handle authorized command');
+  assert.equal(ctx.replies.length, 1, '/gc_dry must reply with 1 message');
+  const reply = ctx.replies[0]!;
+  assert.ok(reply.includes('Garbage collection dry run.'));
+  assert.ok(reply.includes('Would remove version indexes:'));
+  assert.ok(reply.includes('Would remove orphaned assets:'));
+  assert.ok(reply.includes('Would free:'));
+  assert.ok(reply.includes('No files were deleted.'));
+}
+
+// Test 5: /gc_dry does not delete any files
+{
+  for (let v = 1; v <= 7; v++) {
+    const indexPath = generateStickerVersionIndexPath(gcTestPackName, v);
+    await fsp.access(indexPath, fs.constants.R_OK);
+  }
+  const orphanPath = path.join(gcTestAssetsDir, orphanAssetFilename);
+  await fsp.access(orphanPath, fs.constants.R_OK);
+}
+
+// Test 6: /gc executes cleanup and reports summary
+{
+  const ctx = createMockContext({userId: allowedUserId});
+  const handled = await handleGcCommand(ctx);
+  assert.equal(handled, true, '/gc must handle authorized command');
+  assert.equal(ctx.replies.length, 1, '/gc must reply with 1 message');
+  const reply = ctx.replies[0]!;
+  assert.ok(reply.includes('Garbage collection finished.'));
+  assert.ok(reply.includes('Removed version indexes:'));
+  assert.ok(reply.includes('Removed orphaned assets:'));
+  assert.ok(reply.includes('Freed:'));
+  assert.ok(reply.includes('Remaining CAS assets:'));
+  assert.ok(reply.includes('Duration:'));
+
+  // Verify stale version indexes 1 and 2 are removed
+  await assert.rejects(
+    async () =>
+      await fsp.access(
+        generateStickerVersionIndexPath(gcTestPackName, 1),
+        fs.constants.R_OK,
+      ),
+    'Version 1 index must be deleted',
+  );
+  await assert.rejects(
+    async () =>
+      await fsp.access(
+        generateStickerVersionIndexPath(gcTestPackName, 2),
+        fs.constants.R_OK,
+      ),
+    'Version 2 index must be deleted',
+  );
+
+  // Verify orphan asset is removed
+  await assert.rejects(
+    async () =>
+      await fsp.access(
+        path.join(gcTestAssetsDir, orphanAssetFilename),
+        fs.constants.R_OK,
+      ),
+    'Orphan asset must be deleted',
+  );
+}
+
+// Test 7: Referenced data survives after /gc
+{
+  for (let v = 3; v <= 7; v++) {
+    const indexPath = generateStickerVersionIndexPath(gcTestPackName, v);
+    await fsp.access(indexPath, fs.constants.R_OK);
+    const assetPath = path.join(gcTestAssetsDir, testAssetFiles[`v${v}`]!);
+    await fsp.access(assetPath, fs.constants.R_OK);
+  }
+}
+
+// Test 8: Current manifest survives
+{
+  const manifestPath = generateStickerPackFilePath(gcTestPackName);
+  await fsp.access(manifestPath, fs.constants.R_OK);
+  const raw = await fsp.readFile(manifestPath, 'utf8');
+  const parsed = JSON.parse(raw);
+  assert.equal(parsed.dynamic.version, 7, 'Manifest version must remain 7');
+}
+
+// Test 9: Retention = 5 policy verified exactly
+{
+  const versions = await listStickerPackVersions(gcTestPackName);
+  assert.deepEqual(
+    versions,
+    [3, 4, 5, 6, 7],
+    'Only the last 5 versions (3..7) must be retained',
+  );
+}
+
+// Test 10: Shared CAS asset referenced by multiple versions survives
+{
+  const sharedPackName = 'GcSharedAssetPack';
+  const sharedPackDir = generateStickerPackDirPath(sharedPackName);
+  const sharedAssetsDir = generateStickerAssetsDirPath(sharedPackName);
+  await fsp.mkdir(sharedAssetsDir, {recursive: true});
+
+  const sharedSrc = path.join(sharedPackDir, 'shared.webp');
+  await fsp.writeFile(sharedSrc, 'shared-cas-blob-content-12345');
+  const sharedAssetFilename = await storeStickerAsset(
+    sharedPackName,
+    sharedSrc,
+  );
+  await fsp.unlink(sharedSrc).catch(() => undefined);
+
+  // Write 7 versions: shared asset is used in version 1 (stale) AND version 7 (retained)
+  for (let v = 1; v <= 7; v++) {
+    await writeStickerVersionIndexAtomically(sharedPackName, {
+      version: v,
+      signature: `shared-v${v}`,
+      stickers: {'sticker.webp': sharedAssetFilename},
+      previews: {'sticker.webp': sharedAssetFilename},
+    });
+  }
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(sharedPackName),
+    {
+      id: sharedPackName,
+      title: 'Shared Asset Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${sharedPackName}:sticker`,
+          filename: 'sticker.webp',
+          emojis: ['⭐'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker.webp',
+            previewPath: 'sticker.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 7,
+        url: `https://example.com/stickerpack/telegram/${sharedPackName}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  // Run /gc
+  const ctx = createMockContext({userId: allowedUserId});
+  await handleGcCommand(ctx);
+
+  // Stale version indexes 1 and 2 were removed
+  assert.deepEqual(
+    await listStickerPackVersions(sharedPackName),
+    [3, 4, 5, 6, 7],
+  );
+  // BUT shared asset file MUST survive because it is referenced in retained versions 3..7
+  const sharedPath = path.join(sharedAssetsDir, sharedAssetFilename);
+  await fsp.access(sharedPath, fs.constants.R_OK);
+}
+
+// Test 11: Concurrent /gc, /gc_dry, and /gc_stats guard
+{
+  // Acquire mutation lock for a test pack to artificially hold GC in flight
+  const barrierPackName = 'GcBarrierPack';
+  await fsp.mkdir(generateStickerAssetsDirPath(barrierPackName), {
+    recursive: true,
+  });
+
+  let releaseBarrier!: () => void;
+  const barrierPromise = new Promise<void>(resolve => {
+    releaseBarrier = resolve;
+  });
+
+  const backgroundGcPromise = withStickerStorageMutation(
+    barrierPackName,
+    async () => {
+      await barrierPromise;
+    },
+  );
+
+  // Start a GC in background that will queue on barrierPackName
+  const firstGcCtx = createMockContext({userId: allowedUserId});
+  const firstGcPromise = handleGcCommand(firstGcCtx);
+
+  // Wait briefly for first GC to set running state
+  let attempts = 0;
+  while (!getGarbageCollectionStatus().running && attempts < 50) {
+    await new Promise(r => setTimeout(r, 10));
+    attempts++;
+  }
+  assert.equal(
+    getGarbageCollectionStatus().running,
+    true,
+    'GC must be in running state while in flight',
+  );
+
+  // Concurrent /gc invocation must be rejected
+  const concurrentGcCtx = createMockContext({userId: allowedUserId});
+  const concurrentHandled = await handleGcCommand(concurrentGcCtx);
+  assert.equal(
+    concurrentHandled,
+    false,
+    'Concurrent /gc must be rejected while already running',
+  );
+  assert.ok(
+    concurrentGcCtx.replies[0]?.includes(
+      'Garbage collection is already running.',
+    ),
+    'Must report already running message to user',
+  );
+
+  // Concurrent /gc_dry invocation must also be rejected
+  const concurrentDryCtx = createMockContext({userId: allowedUserId});
+  const concurrentDryHandled = await handleGcDryCommand(concurrentDryCtx);
+  assert.equal(
+    concurrentDryHandled,
+    false,
+    'Concurrent /gc_dry must be rejected while already running',
+  );
+  assert.ok(
+    concurrentDryCtx.replies[0]?.includes(
+      'Garbage collection is already running.',
+    ),
+  );
+
+  // Concurrent /gc_stats invocation must also be rejected
+  const concurrentStatsCtx = createMockContext({userId: allowedUserId});
+  const concurrentStatsHandled = await handleGcStatsCommand(concurrentStatsCtx);
+  assert.equal(
+    concurrentStatsHandled,
+    false,
+    'Concurrent /gc_stats must be rejected while already running',
+  );
+  assert.ok(
+    concurrentStatsCtx.replies[0]?.includes(
+      'Garbage collection is currently running.',
+    ),
+  );
+
+  // Test 12: Background GC during active manual GC must also reject via shared guard
+  await assert.rejects(
+    garbageCollectStickerAssets(),
+    (err: unknown) =>
+      err !== null &&
+      typeof err === 'object' &&
+      'name' in err &&
+      (err as {name: string}).name === 'GarbageCollectionRunningError',
+    'garbageCollectStickerAssets must reject if GC is already running',
+  );
+
+  // Release barrier and wait for first GC to complete
+  releaseBarrier();
+  await backgroundGcPromise;
+  await firstGcPromise;
+  assert.equal(
+    getGarbageCollectionStatus().running,
+    false,
+    'GC state must return to idle after completion',
+  );
+}
+
+// Test 12 (follow-up): Background GC and manual /gc run normally when idle
+{
+  assert.equal(getGarbageCollectionStatus().running, false);
+  const result = await garbageCollectStickerAssets();
+  assert.equal(typeof result.versionsRemoved, 'number');
+  assert.equal(typeof result.assetsRemoved, 'number');
+  assert.equal(getGarbageCollectionStatus().running, false);
+}
+// Test 13: Publication safety vs GC
+{
+  const pubSafetyPackName = 'GcPubSafetyPack';
+  const pubAssetsDir = generateStickerAssetsDirPath(pubSafetyPackName);
+  await fsp.mkdir(pubAssetsDir, {recursive: true});
+
+  let uncommittedAssetFilename = '';
+  let releasePublication!: () => void;
+  const pubBarrier = new Promise<void>(resolve => {
+    releasePublication = resolve;
+  });
+
+  // Start an active publication holding the storage mutation lock
+  const publicationPromise = withStickerStorageMutation(
+    pubSafetyPackName,
+    async () => {
+      // Write new asset to disk before version index is published
+      const rawPath = path.join(
+        generateStickerPackDirPath(pubSafetyPackName),
+        'new-uncommitted.webp',
+      );
+      await fsp.writeFile(rawPath, 'brand-new-publication-asset-data');
+      uncommittedAssetFilename = await storeStickerAsset(
+        pubSafetyPackName,
+        rawPath,
+      );
+      await fsp.unlink(rawPath).catch(() => undefined);
+
+      // Wait on barrier before publishing index
+      await pubBarrier;
+
+      // Commit version 1 index and manifest
+      await writeStickerVersionIndexAtomically(pubSafetyPackName, {
+        version: 1,
+        signature: 'pub-v1',
+        stickers: {'sticker.webp': uncommittedAssetFilename},
+        previews: {'sticker.webp': uncommittedAssetFilename},
+      });
+      await writeStickerPackManifestAtomically(
+        generateStickerPackFilePath(pubSafetyPackName),
+        {
+          id: pubSafetyPackName,
+          title: 'Pub Safety Pack',
+          animated: false,
+          stickers: [
+            {
+              id: `${pubSafetyPackName}:sticker`,
+              filename: 'sticker.webp',
+              emojis: ['🔒'],
+              isAnimated: false,
+              media: {
+                type: 'static',
+                canonicalPath: 'sticker.webp',
+                previewPath: 'sticker.webp',
+              },
+            },
+          ],
+          dynamic: {
+            version: 1,
+            url: `https://example.com/stickerpack/telegram/${pubSafetyPackName}`,
+          },
+        } as unknown as Parameters<
+          typeof writeStickerPackManifestAtomically
+        >[1],
+      );
+    },
+  );
+
+  // Concurrently run /gc
+  const gcCtx = createMockContext({userId: allowedUserId});
+  const gcPromise = handleGcCommand(gcCtx);
+
+  // Verify GC started and is waiting on storage mutation lock
+  let attempts = 0;
+  while (!getGarbageCollectionStatus().running && attempts < 50) {
+    await new Promise(r => setTimeout(r, 10));
+    attempts++;
+  }
+  assert.equal(
+    getGarbageCollectionStatus().running,
+    true,
+    'GC must be running and queued behind publication lock',
+  );
+
+  let gcSettled = false;
+  void gcPromise.then(() => {
+    gcSettled = true;
+  });
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(
+    gcSettled,
+    false,
+    'GC must not complete while publication holds the lock',
+  );
+
+  // Release publication lock
+  releasePublication();
+  await publicationPromise;
+  await gcPromise;
+  assert.equal(
+    gcSettled,
+    true,
+    'GC must complete after publication lock release',
+  );
+  // The newly published asset MUST survive and be verified
+  const newAssetPath = path.join(pubAssetsDir, uncommittedAssetFilename);
+  await fsp.access(newAssetPath, fs.constants.R_OK);
+}
+// Test 14: /status shows GC idle and running states
+{
+  const idleCtx = createMockContext({userId: allowedUserId});
+  await handleStatusCommand(idleCtx);
+  assert.ok(
+    idleCtx.replies[0]?.includes('Garbage collection: idle'),
+    '/status must show "Garbage collection: idle" when idle',
+  );
+}
+
+// Test 15: State cleanup in finally after true outer exception
+{
+  assert.equal(getGarbageCollectionStatus().running, false);
+
+  const originalReaddir = fsp.readdir;
+  try {
+    fsp.readdir = (async (targetPath: fs.PathLike, options?: unknown) => {
+      if (String(targetPath) === DATA_DIR) {
+        throw new Error('Simulated fatal storage failure');
+      }
+      return await (originalReaddir as Function)(targetPath, options);
+    }) as typeof fsp.readdir;
+
+    await assert.rejects(
+      runGarbageCollection({mode: 'apply'}),
+      /Simulated fatal storage failure/,
+      'runGarbageCollection must propagate unhandled outer exceptions',
+    );
+  } finally {
+    fsp.readdir = originalReaddir;
+  }
+
+  assert.equal(
+    getGarbageCollectionStatus().running,
+    false,
+    'GC state must always be cleaned up in finally after unhandled exception',
+  );
+
+  // Verify next GC can start normally
+  const nextCtx = createMockContext({userId: allowedUserId});
+  const handled = await handleGcCommand(nextCtx);
+  assert.equal(handled, true, 'Subsequent /gc must succeed after cleanup');
+}
+
+// Test 16: Regression test — failed stale index deletion stops orphan asset deletion
+{
+  const failedIndexPack = 'GcFailedIndexDeletePack';
+  const failedIndexPackDir = generateStickerPackDirPath(failedIndexPack);
+  const failedIndexAssetsDir = generateStickerAssetsDirPath(failedIndexPack);
+  const failedIndexVersionsDir =
+    generateStickerVersionsDirPath(failedIndexPack);
+  await fsp.mkdir(failedIndexAssetsDir, {recursive: true});
+  await fsp.mkdir(failedIndexVersionsDir, {recursive: true});
+
+  // Asset unique to version 1 (would be orphan if v1 is deleted)
+  const rawV1 = path.join(failedIndexPackDir, 'raw-v1.webp');
+  await fsp.writeFile(rawV1, 'content-only-in-version-1-blob');
+  const assetV1 = await storeStickerAsset(failedIndexPack, rawV1);
+  await fsp.unlink(rawV1).catch(() => undefined);
+
+  // Asset for versions 2..7 (retained)
+  const rawV2 = path.join(failedIndexPackDir, 'raw-v2.webp');
+  await fsp.writeFile(rawV2, 'content-in-retained-versions-blob');
+  const assetV2 = await storeStickerAsset(failedIndexPack, rawV2);
+  await fsp.unlink(rawV2).catch(() => undefined);
+
+  // Write version indexes 1..7: v1 points to assetV1, v2..v7 point to assetV2
+  await writeStickerVersionIndexAtomically(failedIndexPack, {
+    version: 1,
+    signature: 'sig-v1',
+    stickers: {'sticker.webp': assetV1},
+    previews: {'sticker.webp': assetV1},
+  });
+  for (let v = 2; v <= 7; v++) {
+    await writeStickerVersionIndexAtomically(failedIndexPack, {
+      version: v,
+      signature: `sig-v${v}`,
+      stickers: {'sticker.webp': assetV2},
+      previews: {'sticker.webp': assetV2},
+    });
+  }
+
+  // Write manifest for version 7
+  await writeStickerPackManifestAtomically(
+    generateStickerPackFilePath(failedIndexPack),
+    {
+      id: failedIndexPack,
+      title: 'Failed Index Delete Pack',
+      animated: false,
+      stickers: [
+        {
+          id: `${failedIndexPack}:sticker`,
+          filename: 'sticker.webp',
+          emojis: ['🛡️'],
+          isAnimated: false,
+          media: {
+            type: 'static',
+            canonicalPath: 'sticker.webp',
+            previewPath: 'sticker.webp',
+          },
+        },
+      ],
+      dynamic: {
+        version: 7,
+        url: `https://example.com/stickerpack/telegram/${failedIndexPack}`,
+      },
+    } as unknown as Parameters<typeof writeStickerPackManifestAtomically>[1],
+  );
+
+  const v1IndexPath = generateStickerVersionIndexPath(failedIndexPack, 1);
+  const originalRm = fsp.rm;
+
+  try {
+    // Simulate deletion failure specifically for 1.json
+    fsp.rm = (async (targetPath: fs.PathLike, options?: unknown) => {
+      if (path.resolve(String(targetPath)) === path.resolve(v1IndexPath)) {
+        throw new Error('Simulated EPERM on stale version index deletion');
+      }
+      return await (originalRm as Function)(targetPath, options);
+    }) as typeof fsp.rm;
+
+    const ctx = createMockContext({userId: allowedUserId});
+    const handled = await handleGcCommand(ctx);
+    assert.equal(handled, true, '/gc must handle command with errors reported');
+    assert.ok(
+      ctx.replies[0]?.includes('Errors:'),
+      'Report must include Errors count when index deletion fails',
+    );
+
+    // Stale version index 1 was NOT deleted (failed)
+    await fsp.access(v1IndexPath, fs.constants.R_OK);
+
+    // CRITICAL: Asset V1 MUST NOT BE DELETED because its index was not removed!
+    const assetV1Path = path.join(failedIndexAssetsDir, assetV1);
+    await fsp.access(assetV1Path, fs.constants.R_OK);
+  } finally {
+    fsp.rm = originalRm;
+  }
+}
+
+// Test 17: Corrupt pack analysis errors are reported in /gc, /gc_dry, and /gc_stats
+{
+  const corruptPackName = 'GcCorruptAnalysisPack';
+  const corruptAssetsDir = generateStickerAssetsDirPath(corruptPackName);
+  await fsp.mkdir(corruptAssetsDir, {recursive: true});
+
+  // Write a corrupt manifest JSON
+  await fsp.writeFile(
+    generateStickerPackFilePath(corruptPackName),
+    'invalid json content',
+  );
+
+  const ctxGc = createMockContext({userId: allowedUserId});
+  await handleGcCommand(ctxGc);
+  assert.ok(
+    ctxGc.replies[0]?.includes('Errors:'),
+    '/gc must report Errors when corrupt packs are skipped during analysis',
+  );
+
+  const ctxDry = createMockContext({userId: allowedUserId});
+  await handleGcDryCommand(ctxDry);
+  assert.ok(
+    ctxDry.replies[0]?.includes('Errors:'),
+    '/gc_dry must report Errors when corrupt packs are skipped during analysis',
+  );
+
+  const ctxStats = createMockContext({userId: allowedUserId});
+  await handleGcStatsCommand(ctxStats);
+  assert.ok(
+    ctxStats.replies[0]?.includes('Errors:'),
+    '/gc_stats must report Errors when corrupt packs are skipped during analysis',
+  );
+}
+
+// Test 18: Regression test — /gc_stats and /gc_dry are strict read-only and do not create DATA_DIR
+{
+  const backupDataDir = `${DATA_DIR}.gc-readonly-backup-${Date.now()}`;
+  await fsp.rename(DATA_DIR, backupDataDir);
+  try {
+    // Verify DATA_DIR does not exist
+    await assert.rejects(fsp.access(DATA_DIR, fs.constants.R_OK));
+
+    // 1. /gc_stats must not create DATA_DIR
+    const statsCtx = createMockContext({userId: allowedUserId});
+    const statsHandled = await handleGcStatsCommand(statsCtx);
+    assert.equal(statsHandled, true);
+    assert.ok(statsCtx.replies[0]?.includes('Sticker packs: 0'));
+    await assert.rejects(
+      fsp.access(DATA_DIR, fs.constants.R_OK),
+      '/gc_stats must not create DATA_DIR',
+    );
+
+    // 2. /gc_dry must not create DATA_DIR
+    const dryCtx = createMockContext({userId: allowedUserId});
+    const dryHandled = await handleGcDryCommand(dryCtx);
+    assert.equal(dryHandled, true);
+    assert.ok(dryCtx.replies[0]?.includes('Would remove version indexes: 0'));
+    await assert.rejects(
+      fsp.access(DATA_DIR, fs.constants.R_OK),
+      '/gc_dry must not create DATA_DIR',
+    );
+  } finally {
+    await fsp
+      .rm(DATA_DIR, {recursive: true, force: true})
+      .catch(() => undefined);
+    await fsp.rename(backupDataDir, DATA_DIR);
   }
 }
 console.log('Verified: All new Telegram bot commands passed all tests');

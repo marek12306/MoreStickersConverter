@@ -27,10 +27,14 @@ import {
   validateLocalStickerPackManifest,
 } from './telegramStickers.js';
 import {
+  formatByteSize,
+  formatDurationSeconds,
+  getGarbageCollectionStatus,
   resolveStickerAssetPath,
+  runGarbageCollection,
+  STICKER_PACK_VERSION_RETENTION,
   verifyStoredStickerAsset,
 } from './stickerAssetStorage.js';
-
 export interface ReplyContext {
   reply: (text: string) => Promise<unknown>;
 }
@@ -818,6 +822,22 @@ export async function handleStatusCommand(
     }
     refreshAllInfo = lines.join('\n');
   }
+  const gc = getGarbageCollectionStatus();
+  let gcInfo = 'Garbage collection: idle';
+  if (gc.running) {
+    const lines = [
+      'Garbage collection: running',
+      `Mode: ${gc.mode ?? 'apply'}`,
+    ];
+    if (gc.startedAt) {
+      const elapsedSeconds = Math.max(
+        0,
+        Math.floor((Date.now() - gc.startedAt) / 1000),
+      );
+      lines.push(`Elapsed: ${formatUptime(elapsedSeconds)}`);
+    }
+    gcInfo = lines.join('\n');
+  }
 
   const response =
     'MoreStickersConverter status\n\n' +
@@ -827,7 +847,141 @@ export async function handleStatusCommand(
     `Download concurrency: ${concurrency}\n` +
     `Data directory: ${dataDirOk ? 'OK' : 'Inaccessible'}\n` +
     `External URL: ${externalUrlConfigured ? 'configured' : 'missing'}\n\n` +
-    refreshAllInfo;
+    refreshAllInfo +
+    '\n\n' +
+    gcInfo;
   await ctx.reply(response);
   return true;
+}
+
+export async function handleGcCommand(ctx: CommandContext): Promise<boolean> {
+  if (!isAllowedTelegramUser(ctx.from?.id)) {
+    return false;
+  }
+
+  const gcStatus = getGarbageCollectionStatus();
+  if (gcStatus.running) {
+    await ctx.reply('Garbage collection is already running.');
+    return false;
+  }
+
+  try {
+    const result = await runGarbageCollection({mode: 'apply'});
+    let report =
+      'Garbage collection finished.\n\n' +
+      `Removed version indexes: ${result.versionsRemoved}\n` +
+      `Removed orphaned assets: ${result.assetsRemoved}\n` +
+      `Freed: ${formatByteSize(result.bytesFreed)}\n\n` +
+      `Remaining CAS assets: ${result.remainingAssets}\n` +
+      `Duration: ${formatDurationSeconds(result.durationMs)}`;
+    if (result.errors && result.errors > 0) {
+      report += `\nErrors: ${result.errors}`;
+    }
+    await ctx.reply(report);
+    return true;
+  } catch (err: unknown) {
+    if (
+      err &&
+      typeof err === 'object' &&
+      'name' in err &&
+      err.name === 'GarbageCollectionRunningError'
+    ) {
+      await ctx.reply('Garbage collection is already running.');
+      return false;
+    }
+    console.error('GC command failed:', err);
+    await ctx.reply('Error: Garbage collection failed.');
+    return false;
+  }
+}
+
+export async function handleGcDryCommand(
+  ctx: CommandContext,
+): Promise<boolean> {
+  if (!isAllowedTelegramUser(ctx.from?.id)) {
+    return false;
+  }
+
+  const gcStatus = getGarbageCollectionStatus();
+  if (gcStatus.running) {
+    await ctx.reply('Garbage collection is already running.');
+    return false;
+  }
+
+  try {
+    const result = await runGarbageCollection({mode: 'dry-run'});
+    let report =
+      'Garbage collection dry run.\n\n' +
+      `Would remove version indexes: ${result.prunableVersionIndexes}\n` +
+      `Would remove orphaned assets: ${result.orphanedAssets}\n` +
+      `Would free: ${formatByteSize(result.reclaimableBytes)}\n\n` +
+      'No files were deleted.';
+    if (result.errors && result.errors > 0) {
+      report += `\nErrors: ${result.errors}`;
+    }
+    await ctx.reply(report);
+    return true;
+  } catch (err: unknown) {
+    if (
+      err &&
+      typeof err === 'object' &&
+      'name' in err &&
+      err.name === 'GarbageCollectionRunningError'
+    ) {
+      await ctx.reply('Garbage collection is already running.');
+      return false;
+    }
+    console.error('GC dry run failed:', err);
+    await ctx.reply('Error: Garbage collection dry run failed.');
+    return false;
+  }
+}
+
+export async function handleGcStatsCommand(
+  ctx: CommandContext,
+): Promise<boolean> {
+  if (!isAllowedTelegramUser(ctx.from?.id)) {
+    return false;
+  }
+
+  const gcStatus = getGarbageCollectionStatus();
+  if (gcStatus.running) {
+    await ctx.reply('Garbage collection is currently running.');
+    return false;
+  }
+
+  try {
+    const result = await runGarbageCollection({mode: 'stats'});
+    let report =
+      'Storage GC statistics\n\n' +
+      `Sticker packs: ${result.stickerPackCount}\n` +
+      `Version indexes: ${result.totalVersionIndexes}\n\n` +
+      `CAS assets: ${result.totalAssets}\n` +
+      `CAS size: ${formatByteSize(result.totalAssetBytes)}\n\n` +
+      `Referenced assets: ${result.referencedAssets}\n` +
+      `Referenced size: ${formatByteSize(result.referencedAssetBytes)}\n\n` +
+      `Orphaned assets: ${result.orphanedAssets}\n` +
+      `Orphaned size: ${formatByteSize(result.orphanedAssetBytes)}\n\n` +
+      `Prunable version indexes: ${result.prunableVersionIndexes}\n` +
+      `Estimated reclaimable: ${formatByteSize(result.reclaimableBytes)}\n\n` +
+      `Retention: last ${STICKER_PACK_VERSION_RETENTION} versions`;
+    if (result.errors && result.errors > 0) {
+      report += `\nErrors: ${result.errors}`;
+    }
+    await ctx.reply(report);
+    return true;
+  } catch (err: unknown) {
+    if (
+      err &&
+      typeof err === 'object' &&
+      'name' in err &&
+      err.name === 'GarbageCollectionRunningError'
+    ) {
+      await ctx.reply('Garbage collection is currently running.');
+      return false;
+    }
+    console.error('GC stats failed:', err);
+    await ctx.reply('Error: Storage GC statistics failed.');
+    return false;
+  }
 }

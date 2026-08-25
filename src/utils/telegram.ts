@@ -2,6 +2,9 @@ import {Telegraf} from 'telegraf';
 import {message} from 'telegraf/filters';
 import {
   handleCheckCommand,
+  handleGcCommand,
+  handleGcDryCommand,
+  handleGcStatsCommand,
   handleInfoCommand,
   handlePackCommand,
   handleRefreshAllCancelCommand,
@@ -58,6 +61,16 @@ bot.command('stats', async ctx => {
 
 bot.command('status', async ctx => {
   await handleStatusCommand(ctx);
+});
+
+bot.command('gc', async ctx => {
+  await handleGcCommand(ctx);
+});
+bot.command('gc_dry', async ctx => {
+  await handleGcDryCommand(ctx);
+});
+bot.command('gc_stats', async ctx => {
+  await handleGcStatsCommand(ctx);
 });
 
 bot.command('public', async ctx => {

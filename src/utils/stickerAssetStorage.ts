@@ -598,60 +598,341 @@ export async function resolveLegacyStickerAssetPath(
   return undefined;
 }
 
-async function garbageCollectStickerPack(stickerSetName: string): Promise<{
+export function formatByteSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 B';
+  }
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let size = bytes;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  if (unitIndex === 0) {
+    return `${Math.round(size)} B`;
+  }
+  const decimals = size >= 100 ? 1 : size >= 10 ? 1 : 2;
+  return `${Number(size.toFixed(decimals))} ${units[unitIndex]}`;
+}
+
+export function formatDurationSeconds(ms: number): string {
+  const seconds = ms / 1000;
+  if (seconds < 0.1) {
+    return `${ms} ms`;
+  }
+  return `${seconds.toFixed(1)} s`;
+}
+
+export type GarbageCollectionMode = 'apply' | 'dry-run' | 'stats';
+
+export interface GarbageCollectionState {
+  running: boolean;
+  mode?: GarbageCollectionMode;
+  startedAt?: number;
+}
+
+export interface PackGcPlan {
+  stickerSetName: string;
+  totalVersionCount: number;
+  staleVersions: number[];
+  staleVersionIndexBytes: number;
+  totalAssetCount: number;
+  totalAssetBytes: number;
+  referencedAssetCount: number;
+  referencedAssetBytes: number;
+  orphanedAssetFilenames: string[];
+  orphanedAssetBytes: number;
+  analysisErrors: number;
+}
+
+export interface StorageGcSummary {
+  stickerPackCount: number;
+  totalVersionIndexes: number;
+  prunableVersionIndexes: number;
+  prunableVersionIndexBytes: number;
+  totalAssets: number;
+  totalAssetBytes: number;
+  referencedAssets: number;
+  referencedAssetBytes: number;
+  orphanedAssets: number;
+  orphanedAssetBytes: number;
+  reclaimableBytes: number;
   versionsRemoved: number;
   assetsRemoved: number;
-}> {
-  const plan = await buildValidatedStickerRetentionPlan(stickerSetName);
-  const orphaned = plan.assetEntries.filter(
-    entry =>
-      entry.isFile() &&
-      isSafeAssetFilename(entry.name) &&
-      !plan.referencedAssets.has(entry.name),
-  );
+  bytesFreed: number;
+  remainingAssets: number;
+  durationMs: number;
+  errors?: number;
+}
 
-  await removeStickerVersionIndexes(stickerSetName, plan.staleVersions);
-  await Promise.all(
-    orphaned.map(entry =>
-      fsp.rm(
-        path.join(generateStickerAssetsDirPath(stickerSetName), entry.name),
-        {force: true},
-      ),
-    ),
-  );
+let garbageCollectionState: GarbageCollectionState | undefined;
+
+export function getGarbageCollectionStatus(): GarbageCollectionState {
+  if (!garbageCollectionState) {
+    return {
+      running: false,
+    };
+  }
+  return {...garbageCollectionState};
+}
+
+async function analyzeStickerPackForGc(
+  stickerSetName: string,
+): Promise<PackGcPlan> {
+  const versions = await listStickerPackVersions(stickerSetName);
+  const totalVersionCount = versions.length;
+
+  let analysisErrors = 0;
+  let plan: StickerRetentionPlan | undefined;
+  try {
+    plan = await buildValidatedStickerRetentionPlan(stickerSetName);
+  } catch (err) {
+    analysisErrors++;
+    console.warn(`Sticker pack "${stickerSetName}" GC analysis skipped:`, err);
+  }
+
+  const staleVersions = plan ? plan.staleVersions : [];
+  const referencedAssetSet = plan ? plan.referencedAssets : undefined;
+
+  let staleVersionIndexBytes = 0;
+  for (const version of staleVersions) {
+    try {
+      const indexPath = generateStickerVersionIndexPath(
+        stickerSetName,
+        version,
+      );
+      const stat = await fsp.stat(indexPath);
+      staleVersionIndexBytes += stat.size;
+    } catch {
+      // ignore stat errors on stale version index
+    }
+  }
+
+  const assetsDir = generateStickerAssetsDirPath(stickerSetName);
+  let dirents: fs.Dirent[] = [];
+  try {
+    dirents = await fsp.readdir(assetsDir, {withFileTypes: true});
+  } catch (err: unknown) {
+    if (getErrorCode(err) !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  let totalAssetCount = 0;
+  let totalAssetBytes = 0;
+  let referencedAssetCount = 0;
+  let referencedAssetBytes = 0;
+  const orphanedAssetFilenames: string[] = [];
+  let orphanedAssetBytes = 0;
+
+  for (const dirent of dirents) {
+    if (!dirent.isFile() || !isSafeAssetFilename(dirent.name)) {
+      continue;
+    }
+    let fileSize = 0;
+    try {
+      const assetPath = path.join(assetsDir, dirent.name);
+      const stat = await fsp.stat(assetPath);
+      fileSize = stat.size;
+    } catch {
+      continue;
+    }
+
+    totalAssetCount++;
+    totalAssetBytes += fileSize;
+
+    if (
+      referencedAssetSet === undefined ||
+      referencedAssetSet.has(dirent.name)
+    ) {
+      referencedAssetCount++;
+      referencedAssetBytes += fileSize;
+    } else {
+      orphanedAssetFilenames.push(dirent.name);
+      orphanedAssetBytes += fileSize;
+    }
+  }
+
   return {
-    versionsRemoved: plan.staleVersions.length,
-    assetsRemoved: orphaned.length,
+    stickerSetName,
+    totalVersionCount,
+    staleVersions,
+    staleVersionIndexBytes,
+    totalAssetCount,
+    totalAssetBytes,
+    referencedAssetCount,
+    referencedAssetBytes,
+    orphanedAssetFilenames,
+    orphanedAssetBytes,
+    analysisErrors,
   };
 }
 
-export async function garbageCollectStickerAssets(): Promise<void> {
-  console.log('Sticker asset GC started');
-  await fsp.mkdir(DATA_DIR, {recursive: true});
-  const entries = await fsp.readdir(DATA_DIR, {withFileTypes: true});
-  let versionsRemoved = 0;
-  let assetsRemoved = 0;
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
-      continue;
-    }
-    try {
-      const result = await withStickerStorageMutation(entry.name, async () =>
-        garbageCollectStickerPack(entry.name),
-      );
-      versionsRemoved += result.versionsRemoved;
-      assetsRemoved += result.assetsRemoved;
-    } catch (err) {
-      console.warn(`Sticker asset GC skipped pack "${entry.name}":`, err);
-    }
+export async function runGarbageCollection(
+  options: {mode?: GarbageCollectionMode} = {},
+): Promise<StorageGcSummary> {
+  const mode = options.mode ?? 'apply';
+  if (garbageCollectionState?.running) {
+    const error = new Error('Garbage collection is already running');
+    error.name = 'GarbageCollectionRunningError';
+    throw error;
   }
-  console.log(
-    `Sticker asset GC completed: ${versionsRemoved} versions removed, ${assetsRemoved} orphaned assets removed`,
-  );
+
+  const startTime = Date.now();
+  garbageCollectionState = {
+    running: true,
+    mode,
+    startedAt: startTime,
+  };
+
+  try {
+    if (mode === 'apply') {
+      await fsp.mkdir(DATA_DIR, {recursive: true});
+    }
+    let entries: fs.Dirent[];
+    try {
+      entries = await fsp.readdir(DATA_DIR, {withFileTypes: true});
+    } catch (err: unknown) {
+      if (getErrorCode(err) === 'ENOENT' && mode !== 'apply') {
+        entries = [];
+      } else {
+        throw err;
+      }
+    }
+    let stickerPackCount = 0;
+    let totalVersionIndexes = 0;
+    let prunableVersionIndexes = 0;
+    let prunableVersionIndexBytes = 0;
+    let totalAssets = 0;
+    let totalAssetBytes = 0;
+    let referencedAssets = 0;
+    let referencedAssetBytes = 0;
+    let orphanedAssets = 0;
+    let orphanedAssetBytes = 0;
+    let versionsRemoved = 0;
+    let assetsRemoved = 0;
+    let bytesFreed = 0;
+    let totalErrors = 0;
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      stickerPackCount++;
+      const packName = entry.name;
+      try {
+        await withStickerStorageMutation(packName, async () => {
+          const plan = await analyzeStickerPackForGc(packName);
+
+          totalVersionIndexes += plan.totalVersionCount;
+          prunableVersionIndexes += plan.staleVersions.length;
+          prunableVersionIndexBytes += plan.staleVersionIndexBytes;
+          totalAssets += plan.totalAssetCount;
+          totalAssetBytes += plan.totalAssetBytes;
+          referencedAssets += plan.referencedAssetCount;
+          referencedAssetBytes += plan.referencedAssetBytes;
+          orphanedAssets += plan.orphanedAssetFilenames.length;
+          orphanedAssetBytes += plan.orphanedAssetBytes;
+          totalErrors += plan.analysisErrors;
+
+          if (mode === 'apply') {
+            let staleIndexDeletionFailed = false;
+            for (const version of plan.staleVersions) {
+              const indexPath = generateStickerVersionIndexPath(
+                packName,
+                version,
+              );
+              try {
+                const stat = await fsp.stat(indexPath).catch(() => undefined);
+                await fsp.rm(indexPath, {force: true});
+                versionsRemoved++;
+                if (stat) {
+                  bytesFreed += stat.size;
+                }
+              } catch (err) {
+                staleIndexDeletionFailed = true;
+                totalErrors++;
+                console.warn(
+                  `Failed to remove stale version index ${version} for "${packName}":`,
+                  err,
+                );
+              }
+            }
+
+            if (!staleIndexDeletionFailed) {
+              const assetsDir = generateStickerAssetsDirPath(packName);
+              for (const assetFilename of plan.orphanedAssetFilenames) {
+                const assetPath = path.join(assetsDir, assetFilename);
+                try {
+                  const stat = await fsp.stat(assetPath).catch(() => undefined);
+                  await fsp.rm(assetPath, {force: true});
+                  assetsRemoved++;
+                  if (stat) {
+                    bytesFreed += stat.size;
+                  }
+                } catch (err) {
+                  totalErrors++;
+                  console.warn(
+                    `Failed to remove orphaned asset "${assetFilename}" for "${packName}":`,
+                    err,
+                  );
+                }
+              }
+            } else if (plan.orphanedAssetFilenames.length > 0) {
+              console.warn(
+                `Skipping orphan asset deletion for pack "${packName}" because stale version index cleanup failed`,
+              );
+            }
+          }
+        });
+      } catch (err) {
+        totalErrors++;
+        console.warn(`Sticker asset GC skipped pack "${packName}":`, err);
+      }
+    }
+
+    const durationMs = Math.max(0, Date.now() - startTime);
+    const reclaimableBytes = prunableVersionIndexBytes + orphanedAssetBytes;
+    const remainingAssets =
+      mode === 'apply' ? totalAssets - assetsRemoved : totalAssets;
+
+    if (mode === 'apply') {
+      console.log(
+        `Sticker asset GC completed: ${versionsRemoved} versions removed, ${assetsRemoved} orphaned assets removed, ${bytesFreed} bytes freed (${durationMs} ms)`,
+      );
+    }
+
+    return {
+      stickerPackCount,
+      totalVersionIndexes,
+      prunableVersionIndexes,
+      prunableVersionIndexBytes,
+      totalAssets,
+      totalAssetBytes,
+      referencedAssets,
+      referencedAssetBytes,
+      orphanedAssets,
+      orphanedAssetBytes,
+      reclaimableBytes,
+      versionsRemoved,
+      assetsRemoved,
+      bytesFreed,
+      remainingAssets,
+      durationMs,
+      ...(totalErrors > 0 ? {errors: totalErrors} : {}),
+    };
+  } finally {
+    garbageCollectionState = undefined;
+  }
+}
+
+export async function garbageCollectStickerAssets(): Promise<StorageGcSummary> {
+  return await runGarbageCollection({mode: 'apply'});
 }
 
 export function scheduleStickerAssetGarbageCollection(
-  collect: () => Promise<void> = garbageCollectStickerAssets,
+  collect: () => Promise<unknown> = garbageCollectStickerAssets,
 ): NodeJS.Timeout {
   const timer = setInterval(() => {
     void collect().catch(err => {
