@@ -15,7 +15,7 @@ export interface PublicStickerPackSummary {
   animatedPreview?: string;
 }
 
-const STICKER_PACK_FILE_SUFFIX = '.telegram.stickerpack';
+export const STICKER_PACK_FILE_SUFFIX = '.telegram.stickerpack';
 
 function getErrorCode(err: unknown): string | undefined {
   if (
@@ -27,6 +27,38 @@ function getErrorCode(err: unknown): string | undefined {
     return (err as {code: string}).code;
   }
   return undefined;
+}
+export async function listLocalStickerPackNames(): Promise<string[]> {
+  let dirents;
+  try {
+    dirents = await fsp.readdir(DATA_DIR, {withFileTypes: true});
+  } catch (err: unknown) {
+    if (getErrorCode(err) === 'ENOENT') {
+      return [];
+    }
+    throw err;
+  }
+
+  const packNames = new Set<string>();
+  for (const dirent of dirents) {
+    if (!dirent.isFile() && !dirent.isSymbolicLink()) {
+      continue;
+    }
+
+    const filename = dirent.name;
+    if (!filename.endsWith(STICKER_PACK_FILE_SUFFIX)) {
+      continue;
+    }
+
+    const packName = filename.slice(0, -STICKER_PACK_FILE_SUFFIX.length);
+    if (!isValidStickerPackName(packName)) {
+      continue;
+    }
+
+    packNames.add(packName);
+  }
+
+  return Array.from(packNames).sort((a, b) => a.localeCompare(b));
 }
 
 export async function getPublicStickerPacks(): Promise<

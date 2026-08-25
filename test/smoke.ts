@@ -111,11 +111,16 @@ const {
   handleCheckCommand,
   handleInfoCommand,
   handlePackCommand,
+  handleRefreshAllCommand,
   handleRefreshCommand,
   handleStatsCommand,
   handleStatusCommand,
   importOrGetStickerPack,
+  refreshStickerPack,
 } = await import('../src/utils/stickerPackCommands.js');
+const {listLocalStickerPackNames} = await import(
+  '../src/utils/stickerPackCatalog.js'
+);
 const {app} = await import('../src/utils/fastify.js');
 
 console.log('--- Starting Smoke Tests in Nix Environment ---');
@@ -2702,10 +2707,7 @@ for (const legacyFilename of upstreamAnimatedStickers.map(
     `Installed upstream URL ${legacyFilename} must work after startup migration`,
   );
   assert.equal(legacyResponse.headers['content-type'], 'image/avif');
-  assert.equal(
-    legacyResponse.headers['cache-control'],
-    'public, max-age=300',
-  );
+  assert.equal(legacyResponse.headers['cache-control'], 'public, max-age=300');
   const stickerId = path.basename(legacyFilename, path.extname(legacyFilename));
   const migratedAssetPath = await resolveStickerAssetPath(
     upstreamAnimatedPackName,
@@ -7857,7 +7859,464 @@ try {
 } finally {
   globalThis.fetch = savedFetchForDrain;
 }
+console.log('Testing /refresh_all command...');
 
+// 1. Helper function listLocalStickerPackNames
+const allPacksBefore = await listLocalStickerPackNames();
+assert.ok(Array.isArray(allPacksBefore));
+
+// Verify listLocalStickerPackNames ignores temporary files and invalid names
+const fakeTmpPackFile = path.join(
+  DATA_DIR,
+  'IgnoredTmpPack.telegram.stickerpack.12345.tmp',
+);
+await fsp.writeFile(fakeTmpPackFile, 'temp-file');
+const fakeSubdir = path.join(DATA_DIR, 'IgnoredSubdir.telegram.stickerpack');
+await fsp.mkdir(fakeSubdir, {recursive: true});
+
+try {
+  const packsWithTmp = await listLocalStickerPackNames();
+  assert.ok(
+    !packsWithTmp.includes('IgnoredTmpPack'),
+    'listLocalStickerPackNames must ignore .tmp files',
+  );
+  assert.ok(
+    !packsWithTmp.includes('IgnoredSubdir'),
+    'listLocalStickerPackNames must ignore directory entries',
+  );
+} finally {
+  await fsp.rm(fakeTmpPackFile, {force: true}).catch(() => undefined);
+  await fsp
+    .rm(fakeSubdir, {recursive: true, force: true})
+    .catch(() => undefined);
+}
+
+// 2. Unauthorized user / missing telegram
+const ctxRefreshAllUnauthorized = createMockContext({
+  userId: 'unauthorized_id',
+  telegram: mockTelegram,
+});
+assert.equal(
+  await handleRefreshAllCommand(ctxRefreshAllUnauthorized),
+  false,
+  'Unauthorized user must be rejected',
+);
+assert.equal(
+  ctxRefreshAllUnauthorized.replies.length,
+  0,
+  'Unauthorized user must receive no replies',
+);
+
+const ctxRefreshAllNoTg = createMockContext({
+  userId: allowedUserId,
+  telegram: undefined,
+});
+assert.equal(
+  await handleRefreshAllCommand(ctxRefreshAllNoTg),
+  false,
+  'Missing telegram client must fail',
+);
+assert.ok(
+  ctxRefreshAllNoTg.replies[0]?.includes(
+    'Error: Telegram client is unavailable.',
+  ),
+  'Missing telegram client must report error',
+);
+
+// 3. GIF -> WebM -> AVIF migration via refreshStickerPack
+const gifMigrationPackName = 'LegacyGifMigrationRefreshAllPack';
+const gifMigrationPackDir = generateStickerPackDirPath(gifMigrationPackName);
+const gifMigrationManifestPath =
+  generateStickerPackFilePath(gifMigrationPackName);
+const gifMigrationPreviewDir =
+  generateStickerPreviewDirPath(gifMigrationPackName);
+
+await fsp.mkdir(gifMigrationPackDir, {recursive: true});
+await fsp.mkdir(gifMigrationPreviewDir, {recursive: true});
+
+// Store legacy GIF in CAS and write version 1 index
+const legacyGifStoredAsset = await storeStickerAsset(
+  gifMigrationPackName,
+  testGifPath,
+);
+const legacyPreviewStoredAsset = await storeStickerAsset(
+  gifMigrationPackName,
+  path.join(tempDir, 'real_gif_preview.webp'),
+);
+await writeStickerVersionIndexAtomically(gifMigrationPackName, {
+  version: 1,
+  signature: 'legacy-gif-sig',
+  stickers: {'anim_sticker.gif': legacyGifStoredAsset},
+  previews: {'anim_sticker.webp': legacyPreviewStoredAsset},
+});
+
+// Write legacy manifest pointing to .gif
+await fsp.writeFile(
+  gifMigrationManifestPath,
+  JSON.stringify({
+    id: `MoreStickers:Telegram:Pack:${gifMigrationPackName}`,
+    title: 'Legacy GIF RefreshAll Pack',
+    logo: {
+      id: `MoreStickers:Telegram:Sticker:${gifMigrationPackName}:anim_sticker`,
+      image: `https://example.com/sticker/telegram/${gifMigrationPackName}/1/anim_sticker.gif`,
+      previewImage: `https://example.com/preview/telegram/${gifMigrationPackName}/1/anim_sticker.webp`,
+      title: '🎬',
+      isAnimated: true,
+      stickerPackId: `MoreStickers:Telegram:Pack:${gifMigrationPackName}`,
+    },
+    stickers: [
+      {
+        id: `MoreStickers:Telegram:Sticker:${gifMigrationPackName}:anim_sticker`,
+        image: `https://example.com/sticker/telegram/${gifMigrationPackName}/1/anim_sticker.gif`,
+        previewImage: `https://example.com/preview/telegram/${gifMigrationPackName}/1/anim_sticker.webp`,
+        title: '🎬',
+        filename: 'anim_sticker.gif',
+        isAnimated: true,
+        readyToUpload: true,
+        stickerPackId: `MoreStickers:Telegram:Pack:${gifMigrationPackName}`,
+      },
+    ],
+    dynamic: {
+      version: 1,
+      refreshUrl: `https://example.com/stickerpack/telegram/${gifMigrationPackName}`,
+    },
+  }),
+);
+
+// Set up mock telegram returning real WebM for LegacyGifMigrationRefreshAllPack
+const realWebmBytes = await fsp.readFile(testWebmPath);
+let tgDownloadCalledForMigration = false;
+const mockMigrationTg = {
+  getStickerSet: async (name: string) => {
+    if (name !== gifMigrationPackName) {
+      throw new Error(`Unexpected pack: ${name}`);
+    }
+    return {
+      name,
+      title: 'Legacy GIF RefreshAll Pack',
+      stickers: [
+        {
+          file_id: 'file-anim-1',
+          file_unique_id: 'anim_sticker',
+          emoji: '🎬',
+          is_animated: false,
+          is_video: true,
+          width: 512,
+          height: 512,
+          type: 'regular',
+        },
+      ],
+    };
+  },
+  getFile: async () => ({
+    file_id: 'file-anim-1',
+    file_path: 'stickers/anim_sticker.webm',
+  }),
+  getFileLink: async () => new URL('https://example.com/anim_sticker.webm'),
+} as unknown as Telegram;
+
+const savedFetchForMigration = globalThis.fetch;
+globalThis.fetch = (async () => {
+  tgDownloadCalledForMigration = true;
+  return new Response(realWebmBytes, {
+    status: 200,
+    headers: {'Content-Type': 'video/webm'},
+  });
+}) as unknown as typeof fetch;
+
+try {
+  const refreshResult = await refreshStickerPack(
+    mockMigrationTg,
+    gifMigrationPackName,
+  );
+  assert.equal(refreshResult.success, true, 'refreshStickerPack must succeed');
+  assert.equal(refreshResult.version, 2, 'Version must bump from 1 to 2');
+  assert.equal(
+    tgDownloadCalledForMigration,
+    true,
+    'Telegram WebM must be fetched from Telegram',
+  );
+
+  const updatedManifest = validateLocalStickerPackManifest(
+    JSON.parse(await fsp.readFile(gifMigrationManifestPath, 'utf8')),
+  );
+  assert.ok(updatedManifest);
+  assert.equal(updatedManifest.dynamic?.version, 2);
+  assert.equal(
+    updatedManifest.stickers[0].filename,
+    'anim_sticker.avif',
+    'Animated sticker filename must be .avif',
+  );
+  assert.ok(
+    updatedManifest.stickers[0].image.endsWith('/2/anim_sticker.avif'),
+    'Sticker image URL must point to .avif',
+  );
+  assert.ok(
+    updatedManifest.stickers[0].previewImage?.endsWith('/2/anim_sticker.webp'),
+    'Preview image URL must point to .webp',
+  );
+
+  const version1Index = await readStickerVersionIndex(gifMigrationPackName, 1);
+  const version2Index = await readStickerVersionIndex(gifMigrationPackName, 2);
+  assert.ok(version1Index);
+  assert.ok(version2Index);
+  assert.equal(
+    version1Index.stickers['anim_sticker.gif'],
+    legacyGifStoredAsset,
+    'Historical version 1 index must retain .gif',
+  );
+  assert.match(
+    version2Index.stickers['anim_sticker.avif'] ?? '',
+    /^[a-f0-9]{64}\.avif$/,
+    'Version 2 index must map .avif to CAS hash',
+  );
+  assert.match(
+    version2Index.previews['anim_sticker.webp'] ?? '',
+    /^[a-f0-9]{64}\.webp$/,
+    'Version 2 index must map preview to CAS hash',
+  );
+
+  // Idempotent second refresh: must not bump version again
+  const secondRefreshResult = await refreshStickerPack(
+    mockMigrationTg,
+    gifMigrationPackName,
+  );
+  assert.equal(secondRefreshResult.success, true);
+  assert.equal(
+    secondRefreshResult.version,
+    2,
+    'Second identical refresh must remain at version 2',
+  );
+} finally {
+  globalThis.fetch = savedFetchForMigration;
+}
+
+// 4. Multi-pack error isolation and sequence verification (concurrency = 1)
+const multiPackA = 'MultiRefreshPackA';
+const multiPackB = 'MultiRefreshPackB';
+const multiPackC = 'MultiRefreshPackC';
+
+for (const p of [multiPackA, multiPackB, multiPackC]) {
+  const pDir = generateStickerPackDirPath(p);
+  const pPath = generateStickerPackFilePath(p);
+  await fsp.mkdir(pDir, {recursive: true});
+  await fsp.writeFile(
+    pPath,
+    JSON.stringify({
+      id: `MoreStickers:Telegram:Pack:${p}`,
+      title: `Title ${p}`,
+      stickers: [],
+      dynamic: {
+        version: 1,
+        refreshUrl: `https://example.com/stickerpack/telegram/${p}`,
+      },
+    }),
+  );
+}
+
+let activeRefreshes = 0;
+let maxActiveRefreshes = 0;
+const processedPacks: string[] = [];
+
+const mockMultiTg = {
+  getStickerSet: async (name: string) => {
+    activeRefreshes++;
+    maxActiveRefreshes = Math.max(maxActiveRefreshes, activeRefreshes);
+    processedPacks.push(name);
+    await new Promise(r => setTimeout(r, 15)); // simulate async I/O
+    activeRefreshes--;
+
+    if (name === multiPackB) {
+      throw new Error('Telegram STICKERSET_INVALID');
+    }
+
+    return {
+      name,
+      title: `Refreshed ${name}`,
+      stickers: [
+        {
+          file_id: `file-${name}-1`,
+          file_unique_id: `uniq-${name}-1`,
+          emoji: '⭐',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    };
+  },
+  getFile: async () => ({
+    file_path: 'documents/file.webp',
+  }),
+  getFileLink: async () => new URL('https://example.com/file.webp'),
+} as unknown as Telegram;
+
+const savedFetchForMulti = globalThis.fetch;
+globalThis.fetch = (async () => {
+  return new Response(sampleWebpBuffer, {
+    status: 200,
+    headers: {'Content-Type': 'image/webp'},
+  });
+}) as unknown as typeof fetch;
+
+try {
+  const ctxMulti = createMockContext({
+    userId: allowedUserId,
+    telegram: mockMultiTg,
+  });
+
+  const allPacksList = await listLocalStickerPackNames();
+  const multiResult = await handleRefreshAllCommand(ctxMulti);
+
+  assert.equal(
+    maxActiveRefreshes,
+    1,
+    'Pack-level refresh concurrency must be strictly 1 (sequential)',
+  );
+  assert.equal(
+    multiResult,
+    false,
+    'handleRefreshAllCommand must return false when any pack fails',
+  );
+
+  assert.ok(
+    ctxMulti.replies.some(r => r.startsWith('Refreshing ')),
+    'Must send initial refreshing notification',
+  );
+
+  const summaryReply = ctxMulti.replies.find(r =>
+    r.includes('Refresh all finished.'),
+  );
+  assert.ok(summaryReply, 'Summary reply must be sent');
+  assert.ok(
+    summaryReply.includes(`Total: ${allPacksList.length}`),
+    'Summary must contain total pack count',
+  );
+  assert.ok(
+    summaryReply.includes('Failed:'),
+    'Summary must report failed count',
+  );
+  assert.ok(
+    summaryReply.includes(`- ${multiPackB}:`),
+    'Summary must list the failing pack name',
+  );
+
+  // Verify Pack A and Pack C were refreshed despite Pack B failing
+  const manifestA = validateLocalStickerPackManifest(
+    JSON.parse(
+      await fsp.readFile(generateStickerPackFilePath(multiPackA), 'utf8'),
+    ),
+  );
+  const manifestC = validateLocalStickerPackManifest(
+    JSON.parse(
+      await fsp.readFile(generateStickerPackFilePath(multiPackC), 'utf8'),
+    ),
+  );
+  assert.ok(manifestA, 'Pack A must be refreshed');
+  assert.equal(manifestA.title, `Refreshed ${multiPackA}`);
+  assert.ok(manifestC, 'Pack C must be refreshed');
+  assert.equal(manifestC.title, `Refreshed ${multiPackC}`);
+
+  // Verify Pack B was not deleted
+  assert.ok(
+    fs.existsSync(generateStickerPackFilePath(multiPackB)),
+    'Failing Pack B manifest must not be deleted',
+  );
+} finally {
+  globalThis.fetch = savedFetchForMulti;
+}
+
+// 5. Global guard against concurrent /refresh_all invocations
+let firstStickerSetStartedResolve: () => void;
+const firstStickerSetStarted = new Promise<void>(resolve => {
+  firstStickerSetStartedResolve = resolve;
+});
+let releaseFirstStickerSetResolve: () => void;
+const releaseFirstStickerSet = new Promise<void>(resolve => {
+  releaseFirstStickerSetResolve = resolve;
+});
+
+const mockGuardTg = {
+  getStickerSet: async (name: string) => {
+    firstStickerSetStartedResolve();
+    await releaseFirstStickerSet;
+    return {
+      name,
+      title: `Guard ${name}`,
+      stickers: [
+        {
+          file_id: `file-${name}`,
+          file_unique_id: `uniq-${name}`,
+          emoji: '🛡️',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    };
+  },
+  getFile: async () => ({
+    file_path: 'documents/file.webp',
+  }),
+  getFileLink: async () => new URL('https://example.com/file.webp'),
+} as unknown as Telegram;
+const savedFetchForGuard = globalThis.fetch;
+globalThis.fetch = (async () => {
+  return new Response(sampleWebpBuffer, {
+    status: 200,
+    headers: {'Content-Type': 'image/webp'},
+  });
+}) as unknown as typeof fetch;
+
+try {
+  const ctxGuard1 = createMockContext({
+    userId: allowedUserId,
+    telegram: mockGuardTg,
+  });
+  const ctxGuard2 = createMockContext({
+    userId: allowedUserId,
+    telegram: mockGuardTg,
+  });
+
+  const run1Promise = handleRefreshAllCommand(ctxGuard1);
+  await firstStickerSetStarted;
+
+  const run2Handled = await handleRefreshAllCommand(ctxGuard2);
+  assert.equal(
+    run2Handled,
+    false,
+    'Concurrent /refresh_all must be rejected immediately',
+  );
+  assert.ok(
+    ctxGuard2.replies.some(r => r.includes('Refresh all is already running.')),
+    'Concurrent /refresh_all must notify that it is already running',
+  );
+
+  releaseFirstStickerSetResolve!();
+  await run1Promise;
+
+  assert.ok(
+    ctxGuard1.replies.some(r => r.includes('Refresh all finished.')),
+    'First /refresh_all must finish successfully after unblocking',
+  );
+
+  // Third invocation after first run settles must be accepted and run normally
+  const ctxGuard3 = createMockContext({
+    userId: allowedUserId,
+    telegram: mockGuardTg,
+  });
+  const run3Handled = await handleRefreshAllCommand(ctxGuard3);
+  assert.equal(typeof run3Handled, 'boolean');
+  assert.equal(
+    ctxGuard3.replies.some(r => r.includes('Refresh all is already running.')),
+    false,
+    'Subsequent /refresh_all after run 1 settles must not be rejected by guard',
+  );
+  assert.ok(
+    ctxGuard3.replies.some(r => r.includes('Refresh all finished.')),
+    'Subsequent /refresh_all must complete normally',
+  );
+} finally {
+  globalThis.fetch = savedFetchForGuard;
+}
 console.log('Verified: All new Telegram bot commands passed all tests');
 await fsp.rm(tempDir, {recursive: true, force: true});
 console.log('--- All Smoke Tests Passed Successfully! ---');

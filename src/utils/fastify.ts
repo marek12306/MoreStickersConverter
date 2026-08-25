@@ -167,9 +167,7 @@ async function serveStickerAsset(
         ? 'image/gif'
         : 'image/webp';
   const cacheControl =
-    rawVersion === undefined
-      ? 'public, max-age=300'
-      : 'public, max-age=604800';
+    rawVersion === undefined ? 'public, max-age=300' : 'public, max-age=604800';
   try {
     await reply
       .type(contentType)

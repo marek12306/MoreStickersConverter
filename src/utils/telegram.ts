@@ -4,6 +4,7 @@ import {
   handleCheckCommand,
   handleInfoCommand,
   handlePackCommand,
+  handleRefreshAllCommand,
   handleRefreshCommand,
   handleStatsCommand,
   handleStatusCommand,
@@ -34,6 +35,9 @@ bot.command('pack', async ctx => {
 
 bot.command('refresh', async ctx => {
   await handleRefreshCommand(ctx);
+});
+bot.command('refresh_all', async ctx => {
+  await handleRefreshAllCommand(ctx);
 });
 
 bot.command('check', async ctx => {

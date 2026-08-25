@@ -3,6 +3,7 @@ import fsp from 'fs/promises';
 import path from 'path';
 import {Telegram} from 'telegraf';
 import {getStickerPackMetadata} from './stickerPackMetadata.js';
+import {listLocalStickerPackNames} from './stickerPackCatalog.js';
 import {
   CommandContext,
   formatCommandUsage,
@@ -137,48 +138,50 @@ export async function handlePackCommand(ctx: CommandContext): Promise<boolean> {
   );
 }
 
-export async function handleRefreshCommand(
-  ctx: CommandContext,
-): Promise<boolean> {
-  if (!isAllowedTelegramUser(ctx.from?.id)) {
-    return false;
-  }
+export interface RefreshStickerPackResult {
+  success: boolean;
+  packName: string;
+  version?: number | string;
+  url?: string;
+  error?: string;
+}
 
-  const resolveResult = resolveStickerPackNameFromCommand(ctx);
-  if (!resolveResult.success) {
-    await ctx.reply(formatCommandUsage('refresh'));
-    return false;
-  }
-
-  if (!ctx.telegram) {
-    await ctx.reply('Error: Telegram client is unavailable.');
-    return false;
-  }
-
-  const packName = resolveResult.packName;
+export async function refreshStickerPack(
+  telegram: Telegram,
+  packName: string,
+): Promise<RefreshStickerPackResult> {
   return await enqueueStickerPackOperation(packName, async () => {
     let stickerSet;
     try {
-      stickerSet = await ctx.telegram!.getStickerSet(packName);
+      stickerSet = await telegram.getStickerSet(packName);
     } catch {
-      await ctx.reply(`Error: Telegram sticker pack "${packName}" not found.`);
-      return false;
+      return {
+        success: false,
+        packName,
+        error: `Telegram sticker pack "${packName}" not found.`,
+      };
     }
 
     const mcStickerPackPath = generateStickerPackFilePath(stickerSet.name);
     try {
-      await downloadStickerPack(ctx.telegram!, stickerSet);
+      await downloadStickerPack(telegram, stickerSet);
     } catch (err) {
       console.error(`Failed to refresh sticker pack "${packName}":`, err);
-      await ctx.reply(`Error: Failed to refresh sticker pack "${packName}".`);
-      return false;
+      return {
+        success: false,
+        packName,
+        error: `Failed to refresh sticker pack "${packName}".`,
+      };
     }
 
     try {
       await fsp.access(mcStickerPackPath, fs.constants.R_OK);
     } catch {
-      await ctx.reply(`Error: Failed to refresh sticker pack "${packName}".`);
-      return false;
+      return {
+        success: false,
+        packName,
+        error: `Failed to refresh sticker pack "${packName}".`,
+      };
     }
 
     let updatedVersion: number | string = 1;
@@ -199,11 +202,173 @@ export async function handleRefreshCommand(
     }
 
     const packUrl = generateStickerPackExternalUrl(stickerSet.name);
-    await ctx.reply(
-      `Pack "${packName}" refreshed successfully.\nVersion: ${updatedVersion}\n${packUrl}`,
-    );
-    return true;
+    return {
+      success: true,
+      packName,
+      version: updatedVersion,
+      url: packUrl,
+    };
   });
+}
+
+export async function handleRefreshCommand(
+  ctx: CommandContext,
+): Promise<boolean> {
+  if (!isAllowedTelegramUser(ctx.from?.id)) {
+    return false;
+  }
+
+  const resolveResult = resolveStickerPackNameFromCommand(ctx);
+  if (!resolveResult.success) {
+    await ctx.reply(formatCommandUsage('refresh'));
+    return false;
+  }
+
+  if (!ctx.telegram) {
+    await ctx.reply('Error: Telegram client is unavailable.');
+    return false;
+  }
+
+  const packName = resolveResult.packName;
+  const result = await refreshStickerPack(ctx.telegram, packName);
+  if (!result.success) {
+    await ctx.reply(
+      `Error: ${result.error ?? `Failed to refresh sticker pack "${packName}".`}`,
+    );
+    return false;
+  }
+
+  await ctx.reply(
+    `Pack "${packName}" refreshed successfully.\nVersion: ${result.version}\n${result.url}`,
+  );
+  return true;
+}
+
+const MAX_REPORTED_FAILED_PACKS = 25;
+const MAX_FAILED_PACK_ERROR_LENGTH = 120;
+const SAFE_REPORT_MAX_LENGTH = 3900;
+let isRefreshAllRunning = false;
+function sanitizeFailedPackError(
+  rawError: string | undefined,
+  defaultMessage: string,
+): string {
+  const text = (rawError ?? defaultMessage).replace(/\r?\n+/g, ' ').trim();
+  if (text.length <= MAX_FAILED_PACK_ERROR_LENGTH) {
+    return text;
+  }
+  return `${text.slice(0, MAX_FAILED_PACK_ERROR_LENGTH - 3)}...`;
+}
+export async function handleRefreshAllCommand(
+  ctx: CommandContext,
+): Promise<boolean> {
+  if (!isAllowedTelegramUser(ctx.from?.id)) {
+    return false;
+  }
+
+  if (!ctx.telegram) {
+    await ctx.reply('Error: Telegram client is unavailable.');
+    return false;
+  }
+
+  if (isRefreshAllRunning) {
+    await ctx.reply('Refresh all is already running.');
+    return false;
+  }
+
+  isRefreshAllRunning = true;
+  try {
+    let packNames: string[];
+    try {
+      packNames = await listLocalStickerPackNames();
+    } catch (err) {
+      console.error(
+        'Failed to list local sticker packs for /refresh_all:',
+        err,
+      );
+      await ctx.reply('Error: Unable to read local sticker packs.');
+      return false;
+    }
+
+    if (packNames.length === 0) {
+      await ctx.reply('No local sticker packs to refresh.');
+      return true;
+    }
+
+    const count = packNames.length;
+    await ctx.reply(
+      `Refreshing ${count} sticker pack${count === 1 ? '' : 's'}...`,
+    );
+
+    let successful = 0;
+    const failedPacks: Array<{name: string; error: string}> = [];
+
+    for (const packName of packNames) {
+      try {
+        const result = await refreshStickerPack(ctx.telegram, packName);
+        if (result.success) {
+          successful++;
+        } else {
+          const cleanError = sanitizeFailedPackError(
+            result.error,
+            `Failed to refresh sticker pack "${packName}".`,
+          );
+          failedPacks.push({name: packName, error: cleanError});
+        }
+      } catch (err) {
+        console.error(`Unexpected failure refreshing pack "${packName}":`, err);
+        const rawMessage =
+          err instanceof Error
+            ? err.message
+            : `Failed to refresh sticker pack "${packName}".`;
+        failedPacks.push({
+          name: packName,
+          error: sanitizeFailedPackError(
+            rawMessage,
+            `Failed to refresh sticker pack "${packName}".`,
+          ),
+        });
+      }
+    }
+
+    const lines = [
+      'Refresh all finished.\n',
+      `Total: ${count}`,
+      `Successful: ${successful}`,
+      `Failed: ${failedPacks.length}`,
+    ];
+
+    if (failedPacks.length > 0) {
+      lines.push('\nFailed packs:');
+      let includedCount = 0;
+      for (const failed of failedPacks) {
+        if (includedCount >= MAX_REPORTED_FAILED_PACKS) {
+          break;
+        }
+        const line = `- ${failed.name}: ${failed.error}`;
+        const remainingCount = failedPacks.length - (includedCount + 1);
+        const suffix =
+          remainingCount > 0 ? `\n...and ${remainingCount} more.` : '';
+        const currentTotalLength =
+          lines.reduce((sum, l) => sum + l.length + 1, 0) +
+          line.length +
+          suffix.length;
+        if (currentTotalLength > SAFE_REPORT_MAX_LENGTH) {
+          break;
+        }
+        lines.push(line);
+        includedCount++;
+      }
+      if (includedCount < failedPacks.length) {
+        const remaining = failedPacks.length - includedCount;
+        lines.push(`\n...and ${remaining} more.`);
+      }
+    }
+
+    await ctx.reply(lines.join('\n'));
+    return failedPacks.length === 0;
+  } finally {
+    isRefreshAllRunning = false;
+  }
 }
 
 export async function handleCheckCommand(
