@@ -297,12 +297,12 @@ export async function listStickerPackVersions(
     .sort((a, b) => a - b);
 }
 
-interface CurrentStickerStorageManifest {
+export interface CurrentStickerStorageManifest {
   version: number;
   stickers: Array<{filename: string; previewFilename: string}>;
 }
 
-async function readCurrentStickerStorageManifest(
+export async function readCurrentStickerStorageManifest(
   stickerSetName: string,
 ): Promise<CurrentStickerStorageManifest | undefined> {
   let raw: string;
@@ -363,12 +363,12 @@ async function readCurrentStickerStorageManifest(
   }
 }
 
-interface StickerVersionRetention {
+export interface StickerVersionRetention {
   publishedVersions: number[];
   pendingVersion?: number;
 }
 
-function getStickerVersionRetention(
+export function getStickerVersionRetention(
   versions: number[],
   currentVersion = 0,
 ): StickerVersionRetention {
@@ -632,6 +632,19 @@ export interface GarbageCollectionState {
   startedAt?: number;
 }
 
+export interface LastGarbageCollectionSummary {
+  mode: GarbageCollectionMode;
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+  errors: number;
+  versionsRemoved?: number;
+  assetsRemoved?: number;
+  bytesFreed?: number;
+  remainingAssets?: number;
+  outcome: 'success' | 'completed-with-errors' | 'failed';
+}
+
 export interface PackGcPlan {
   stickerSetName: string;
   totalVersionCount: number;
@@ -667,6 +680,7 @@ export interface StorageGcSummary {
 }
 
 let garbageCollectionState: GarbageCollectionState | undefined;
+let lastGarbageCollection: LastGarbageCollectionSummary | undefined;
 
 export function getGarbageCollectionStatus(): GarbageCollectionState {
   if (!garbageCollectionState) {
@@ -675,6 +689,19 @@ export function getGarbageCollectionStatus(): GarbageCollectionState {
     };
   }
   return {...garbageCollectionState};
+}
+
+export function getLastGarbageCollection():
+  | LastGarbageCollectionSummary
+  | undefined {
+  if (!lastGarbageCollection) {
+    return undefined;
+  }
+  return {...lastGarbageCollection};
+}
+
+export function resetLastGarbageCollectionForTests(): void {
+  lastGarbageCollection = undefined;
 }
 
 async function analyzeStickerPackForGc(
@@ -903,7 +930,7 @@ export async function runGarbageCollection(
       );
     }
 
-    return {
+    const summary: StorageGcSummary = {
       stickerPackCount,
       totalVersionIndexes,
       prunableVersionIndexes,
@@ -922,6 +949,31 @@ export async function runGarbageCollection(
       durationMs,
       ...(totalErrors > 0 ? {errors: totalErrors} : {}),
     };
+
+    lastGarbageCollection = {
+      mode,
+      startedAt: startTime,
+      finishedAt: Date.now(),
+      durationMs,
+      errors: totalErrors,
+      versionsRemoved,
+      assetsRemoved,
+      bytesFreed,
+      remainingAssets,
+      outcome: totalErrors > 0 ? 'completed-with-errors' : 'success',
+    };
+
+    return summary;
+  } catch (err) {
+    lastGarbageCollection = {
+      mode,
+      startedAt: startTime,
+      finishedAt: Date.now(),
+      durationMs: Math.max(0, Date.now() - startTime),
+      errors: 1,
+      outcome: 'failed',
+    };
+    throw err;
   } finally {
     garbageCollectionState = undefined;
   }

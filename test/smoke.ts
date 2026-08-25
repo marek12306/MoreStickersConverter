@@ -96,9 +96,11 @@ const {
   generateStickerVersionIndexPath,
   generateStickerVersionsDirPath,
   getGarbageCollectionStatus,
+  getLastGarbageCollection,
   listStickerPackVersions,
   pruneOldStickerVersions,
   readStickerVersionIndex,
+  resetLastGarbageCollectionForTests,
   resolveStickerAssetPath,
   runGarbageCollection,
   scheduleStickerAssetGarbageCollection,
@@ -129,6 +131,7 @@ const {formatCommandUsage, formatUptime} = await import(
   '../src/utils/telegramCommandUtils.js'
 );
 const {
+  getLastRefreshAll,
   getRefreshAllStatus,
   handleCheckCommand,
   handleGcCommand,
@@ -143,6 +146,7 @@ const {
   handleStatusCommand,
   importOrGetStickerPack,
   refreshStickerPack,
+  resetLastRefreshAllForTests,
 } = await import('../src/utils/stickerPackCommands.js');
 const {listLocalStickerPackNames} = await import(
   '../src/utils/stickerPackCatalog.js'
@@ -150,6 +154,26 @@ const {listLocalStickerPackNames} = await import(
 const {app, createEtag, ifNoneMatchMatches} = await import(
   '../src/utils/fastify.js'
 );
+const {
+  calculateStorageSizeBytes,
+  countLegacyGifPacks,
+  formatStatusResponse,
+  formatTimeAgo,
+  getActiveDownloads,
+  getActiveEncodes,
+  getConverterStatusSnapshot,
+  getQueueLength,
+  getStorageDiagnostics,
+  getToolDiagnostics,
+  probeFfmpeg,
+  probeLottieConverter,
+  registerDownloadQueue,
+  resetStorageDiagnosticsCacheForTests,
+  resetToolDiagnosticsCacheForTests,
+  resetWorkCountersForTests,
+  withActiveDownload,
+  withActiveEncode,
+} = await import('../src/utils/statusDiagnostics.js');
 
 console.log('--- Starting Smoke Tests in Nix Environment ---');
 
@@ -10490,6 +10514,601 @@ await writeStickerPackManifestAtomically(
     await fsp.rename(backupDataDir, DATA_DIR);
   }
 }
+
+console.log(
+  'Testing P2: /status command diagnostics, tool probes, counters, storage scan, and lifecycles...',
+);
+
+// Test Section 1: formatTimeAgo helper
+{
+  const now = Date.now();
+  assert.equal(formatTimeAgo(undefined), 'never');
+  assert.equal(formatTimeAgo(0), 'never');
+  assert.equal(formatTimeAgo(now - 10_000, now), '10s ago');
+  assert.equal(formatTimeAgo(now - 180_000, now), '3m ago');
+  assert.equal(formatTimeAgo(now - 7_200_000, now), '2h ago');
+  assert.equal(formatTimeAgo(now - 7_320_000, now), '2h 2m ago');
+  assert.equal(formatTimeAgo(now - 90_000_000, now), '1d 1h ago');
+}
+
+// Test Section 2: Tool Diagnostics (FFmpeg & lottieconverter probes and caching)
+{
+  resetToolDiagnosticsCacheForTests();
+  // 1. Real FFmpeg probe
+  const ffmpegRes = await probeFfmpeg();
+  assert.ok(typeof ffmpegRes.available === 'boolean');
+  if (ffmpegRes.available) {
+    assert.ok(
+      typeof ffmpegRes.version === 'string' && ffmpegRes.version.length > 0,
+    );
+  }
+
+  // 2. Real lottieconverter probe
+  const lottieRes = await probeLottieConverter();
+  assert.ok(typeof lottieRes === 'boolean');
+
+  // 3. Tool diagnostics cache TTL
+  const toolDiag1 = await getToolDiagnostics();
+  assert.equal(toolDiag1.nodeVersion, process.version);
+  const toolDiag2 = await getToolDiagnostics();
+  assert.equal(
+    toolDiag1.checkedAt,
+    toolDiag2.checkedAt,
+    'getToolDiagnostics must return cached result within TTL',
+  );
+
+  // 4. Mock FFmpeg unavailable
+  resetToolDiagnosticsCacheForTests();
+  const mockToolDiagFfmpegUnavailable = await getToolDiagnostics(true, {
+    probeFfmpeg: async () => ({available: false, version: undefined}),
+    probeLottieConverter: async () => true,
+  });
+  assert.equal(mockToolDiagFfmpegUnavailable.ffmpegAvailable, false);
+  assert.equal(mockToolDiagFfmpegUnavailable.ffmpegVersion, undefined);
+  assert.equal(mockToolDiagFfmpegUnavailable.lottieConverterAvailable, true);
+
+  // 5. Mock lottieconverter unavailable
+  resetToolDiagnosticsCacheForTests();
+  const mockToolDiagLottieUnavailable = await getToolDiagnostics(true, {
+    probeFfmpeg: async () => ({available: true, version: '8.1.2'}),
+    probeLottieConverter: async () => false,
+  });
+  assert.equal(mockToolDiagLottieUnavailable.ffmpegAvailable, true);
+  assert.equal(mockToolDiagLottieUnavailable.ffmpegVersion, '8.1.2');
+  assert.equal(mockToolDiagLottieUnavailable.lottieConverterAvailable, false);
+
+  resetToolDiagnosticsCacheForTests();
+}
+
+// Test Section 3: Work Counters (Active downloads, active encodes, queue length, retries, error handling)
+{
+  resetWorkCountersForTests();
+  assert.equal(getActiveDownloads(), 0);
+  assert.equal(getActiveEncodes(), 0);
+  assert.equal(getQueueLength(), 0);
+
+  // 1. Active download counter (success)
+  let inDownload = false;
+  await withActiveDownload(async () => {
+    inDownload = true;
+    assert.equal(getActiveDownloads(), 1);
+  });
+  assert.equal(inDownload, true);
+  assert.equal(getActiveDownloads(), 0);
+
+  // 2. Active download counter (failure)
+  await assert.rejects(async () => {
+    await withActiveDownload(async () => {
+      assert.equal(getActiveDownloads(), 1);
+      throw new Error('download failed');
+    });
+  }, /download failed/);
+  assert.equal(getActiveDownloads(), 0);
+
+  // 3. Active encode counter (success)
+  let inEncode = false;
+  await withActiveEncode(async () => {
+    inEncode = true;
+    assert.equal(getActiveEncodes(), 1);
+  });
+  assert.equal(inEncode, true);
+  assert.equal(getActiveEncodes(), 0);
+
+  // 4. Active encode counter (failure)
+  await assert.rejects(async () => {
+    await withActiveEncode(async () => {
+      assert.equal(getActiveEncodes(), 1);
+      throw new Error('encode failed');
+    });
+  }, /encode failed/);
+  assert.equal(getActiveEncodes(), 0);
+
+  // 5. Logical encode retries / nesting (AsyncLocalStorage prevents double-increment)
+  await withActiveEncode(async () => {
+    assert.equal(getActiveEncodes(), 1);
+    await withActiveEncode(async () => {
+      assert.equal(
+        getActiveEncodes(),
+        1,
+        'Nested encode retry must not double-increment counter',
+      );
+    });
+    assert.equal(getActiveEncodes(), 1);
+  });
+  assert.equal(getActiveEncodes(), 0);
+
+  // 6. Queue length tracking & cleanup
+  const dummyQueue1 = [1, 2, 3, 4, 5];
+  const dummyQueue2 = ['a', 'b'];
+  const unreg1 = registerDownloadQueue(dummyQueue1);
+  assert.equal(getQueueLength(), 5);
+  const unreg2 = registerDownloadQueue(dummyQueue2);
+  assert.equal(getQueueLength(), 7);
+
+  // Shift items (simulating worker picking up items)
+  dummyQueue1.shift();
+  dummyQueue1.shift();
+  assert.equal(getQueueLength(), 5);
+
+  unreg1();
+  assert.equal(getQueueLength(), 2);
+  unreg2();
+  assert.equal(getQueueLength(), 0);
+
+  resetWorkCountersForTests();
+}
+
+// Test Section 4: Storage Diagnostics (calculateStorageSizeBytes, countLegacyGifPacks, caching, absent dir, fail-soft)
+{
+  const diagTestDir = await fsp.mkdtemp(
+    path.join(tempDir, 'status-storage-test-'),
+  );
+  resetStorageDiagnosticsCacheForTests();
+
+  // 1. Storage size calculation on known files
+  const file1 = path.join(diagTestDir, 'file1.bin');
+  const file2 = path.join(diagTestDir, 'sub', 'file2.bin');
+  await fsp.mkdir(path.dirname(file2), {recursive: true});
+  await fsp.writeFile(file1, Buffer.alloc(1000));
+  await fsp.writeFile(file2, Buffer.alloc(2500));
+
+  const totalBytes = await calculateStorageSizeBytes(diagTestDir);
+  assert.equal(totalBytes, 3500);
+
+  // 2. Legacy GIF pack count:
+  // Pack A: retained index with .gif
+  const packADir = path.join(diagTestDir, 'PackA');
+  await fsp.mkdir(path.join(packADir, 'versions'), {recursive: true});
+  await fsp.mkdir(path.join(packADir, 'assets'), {recursive: true});
+  const packAManifest = {
+    id: 'MoreStickers:Telegram:Pack:PackA',
+    title: 'Pack A',
+    name: 'PackA',
+    dynamic: {version: 1},
+    stickers: [
+      {
+        id: 'MoreStickers:Telegram:Sticker:PackA:1',
+        filename: '1.gif',
+        previewFilename: '1.webp',
+      },
+    ],
+  };
+  await fsp.writeFile(
+    path.join(diagTestDir, 'PackA.telegram.stickerpack'),
+    JSON.stringify(packAManifest),
+  );
+  const packAIndex1 = {
+    version: 1,
+    signature: 'sig1',
+    stickers: {
+      '1.gif':
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.gif',
+    },
+    previews: {
+      '1.webp':
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.webp',
+    },
+  };
+  await fsp.writeFile(
+    path.join(packADir, 'versions', '1.json'),
+    JSON.stringify(packAIndex1),
+  );
+
+  // Pack B: retained index with .avif only
+  const packBDir = path.join(diagTestDir, 'PackB');
+  await fsp.mkdir(path.join(packBDir, 'versions'), {recursive: true});
+  const packBManifest = {
+    id: 'MoreStickers:Telegram:Pack:PackB',
+    title: 'Pack B',
+    name: 'PackB',
+    dynamic: {version: 1},
+    stickers: [
+      {
+        id: 'MoreStickers:Telegram:Sticker:PackB:1',
+        filename: '1.avif',
+        previewFilename: '1.webp',
+      },
+    ],
+  };
+  await fsp.writeFile(
+    path.join(diagTestDir, 'PackB.telegram.stickerpack'),
+    JSON.stringify(packBManifest),
+  );
+  const packBIndex1 = {
+    version: 1,
+    signature: 'sigB1',
+    stickers: {
+      '1.avif':
+        '1111456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.avif',
+    },
+    previews: {
+      '1.webp':
+        '22220123456789abcdef0123456789abcdef0123456789abcdef0123456789.webp',
+    },
+  };
+  await fsp.writeFile(
+    path.join(packBDir, 'versions', '1.json'),
+    JSON.stringify(packBIndex1),
+  );
+
+  // Pack C: v1 GIF (retained), v2 AVIF (current retained)
+  const packCDir = path.join(diagTestDir, 'PackC');
+  await fsp.mkdir(path.join(packCDir, 'versions'), {recursive: true});
+  const packCManifest = {
+    id: 'MoreStickers:Telegram:Pack:PackC',
+    title: 'Pack C',
+    name: 'PackC',
+    dynamic: {version: 2},
+    stickers: [
+      {
+        id: 'MoreStickers:Telegram:Sticker:PackC:1',
+        filename: '1.avif',
+        previewFilename: '1.webp',
+      },
+    ],
+  };
+  await fsp.writeFile(
+    path.join(diagTestDir, 'PackC.telegram.stickerpack'),
+    JSON.stringify(packCManifest),
+  );
+  const packCIndex1 = {
+    version: 1,
+    signature: 'sigC1',
+    stickers: {
+      '1.gif':
+        '3333456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.gif',
+    },
+    previews: {
+      '1.webp':
+        '44440123456789abcdef0123456789abcdef0123456789abcdef0123456789.webp',
+    },
+  };
+  const packCIndex2 = {
+    version: 2,
+    signature: 'sigC2',
+    stickers: {
+      '1.avif':
+        '5555456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.avif',
+    },
+    previews: {
+      '1.webp':
+        '66660123456789abcdef0123456789abcdef0123456789abcdef0123456789.webp',
+    },
+  };
+  await fsp.writeFile(
+    path.join(packCDir, 'versions', '1.json'),
+    JSON.stringify(packCIndex1),
+  );
+  await fsp.writeFile(
+    path.join(packCDir, 'versions', '2.json'),
+    JSON.stringify(packCIndex2),
+  );
+
+  const legacyPacksRes = await countLegacyGifPacks(diagTestDir);
+  assert.equal(
+    legacyPacksRes.count,
+    2,
+    'PackA and PackC have legacy GIF; PackB has AVIF only',
+  );
+  assert.equal(legacyPacksRes.warnings, 0);
+
+  // 3. Stale version (outside retention last 5) with GIF is NOT counted
+  const packDDir = path.join(diagTestDir, 'PackD');
+  await fsp.mkdir(path.join(packDDir, 'versions'), {recursive: true});
+  const packDManifest = {
+    id: 'MoreStickers:Telegram:Pack:PackD',
+    title: 'Pack D',
+    name: 'PackD',
+    dynamic: {version: 6},
+    stickers: [
+      {
+        id: 'MoreStickers:Telegram:Sticker:PackD:1',
+        filename: '1.avif',
+        previewFilename: '1.webp',
+      },
+    ],
+  };
+  await fsp.writeFile(
+    path.join(diagTestDir, 'PackD.telegram.stickerpack'),
+    JSON.stringify(packDManifest),
+  );
+  // Version 1 (stale, outside retention last 5 of version 6, retained: 2,3,4,5,6)
+  await fsp.writeFile(
+    path.join(packDDir, 'versions', '1.json'),
+    JSON.stringify({
+      version: 1,
+      signature: 'sigD1',
+      stickers: {
+        '1.gif':
+          '0000456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.gif',
+      },
+      previews: {
+        '1.webp':
+          '00000123456789abcdef0123456789abcdef0123456789abcdef0123456789.webp',
+      },
+    }),
+  );
+  for (let v = 2; v <= 6; v++) {
+    await fsp.writeFile(
+      path.join(packDDir, 'versions', `${v}.json`),
+      JSON.stringify({
+        version: v,
+        signature: `sigD${v}`,
+        stickers: {
+          '1.avif':
+            '1111456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.avif',
+        },
+        previews: {
+          '1.webp':
+            '22220123456789abcdef0123456789abcdef0123456789abcdef0123456789.webp',
+        },
+      }),
+    );
+  }
+  const legacyPacksResD = await countLegacyGifPacks(diagTestDir);
+  assert.equal(
+    legacyPacksResD.count,
+    2,
+    'PackD must not be counted because its GIF is in stale version 1 outside retention',
+  );
+
+  // 4. Corrupted index file handled fail-soft without crashing
+  const packEDir = path.join(diagTestDir, 'PackE');
+  await fsp.mkdir(path.join(packEDir, 'versions'), {recursive: true});
+  await fsp.writeFile(
+    path.join(packEDir, 'versions', '1.json'),
+    'corrupted json content',
+  );
+  const legacyPacksResE = await countLegacyGifPacks(diagTestDir);
+  assert.ok(
+    legacyPacksResE.warnings >= 1,
+    'Corrupted index must record a warning',
+  );
+  assert.equal(
+    legacyPacksResE.count,
+    2,
+    'Scan must continue successfully despite corrupted index',
+  );
+
+  // 5. getStorageDiagnostics caching and warning policy (Policy A: warnings => legacyGifPackCount: undefined)
+  resetStorageDiagnosticsCacheForTests();
+  const sDiag1 = await getStorageDiagnostics(false, diagTestDir);
+  assert.ok(sDiag1.sizeBytes !== undefined && sDiag1.sizeBytes > 0);
+  assert.equal(
+    sDiag1.legacyGifPackCount,
+    undefined,
+    'Corrupted index with warnings must yield legacyGifPackCount: undefined in getStorageDiagnostics',
+  );
+  assert.ok(
+    sDiag1.warnings !== undefined && sDiag1.warnings >= 1,
+    'Storage diagnostics must record warnings count',
+  );
+  const sDiag2 = await getStorageDiagnostics(false, diagTestDir);
+  assert.equal(
+    sDiag1.checkedAt,
+    sDiag2.checkedAt,
+    'getStorageDiagnostics must use cache within TTL',
+  );
+
+  // 6. calculateStorageSizeBytes non-ENOENT error propagation
+  // If an unreadable directory or file error occurs (not ENOENT), calculateStorageSizeBytes must throw,
+  // causing getStorageDiagnostics to set sizeBytes: undefined (fail-soft -> unavailable)
+  const unreadableTestDir = await fsp.mkdtemp(
+    path.join(tempDir, 'status-unreadable-test-'),
+  );
+  const dummyFile = path.join(unreadableTestDir, 'dummy.bin');
+  await fsp.writeFile(dummyFile, Buffer.alloc(100));
+  // Mock fsp.stat temporarily to throw EACCES on dummyFile to simulate unreadable file
+  const originalStat = fsp.stat;
+  try {
+    (fsp as unknown as {stat: typeof fsp.stat}).stat = (async (
+      p: fs.PathLike,
+      opts?: fs.StatOptions,
+    ) => {
+      if (String(p).includes('dummy.bin')) {
+        const err = new Error('Permission denied') as Error & {code: string};
+        err.code = 'EACCES';
+        throw err;
+      }
+      return await originalStat(p, opts as undefined);
+    }) as typeof fsp.stat;
+
+    await assert.rejects(
+      async () => {
+        await calculateStorageSizeBytes(unreadableTestDir);
+      },
+      (err: unknown) => {
+        return (
+          err instanceof Error &&
+          'code' in err &&
+          (err as {code: string}).code === 'EACCES'
+        );
+      },
+      'calculateStorageSizeBytes must rethrow non-ENOENT errors like EACCES',
+    );
+
+    const unreadableDiag = await getStorageDiagnostics(true, unreadableTestDir);
+    assert.equal(
+      unreadableDiag.sizeBytes,
+      undefined,
+      'Storage size must be undefined when non-ENOENT error occurs during scan',
+    );
+  } finally {
+    (fsp as unknown as {stat: typeof fsp.stat}).stat = originalStat;
+    await fsp.rm(unreadableTestDir, {recursive: true, force: true});
+  }
+
+  // 7. Absent DATA_DIR: returns 0 B, 0 packs, does NOT create directory
+  const nonExistentDir = path.join(
+    tempDir,
+    `non-existent-data-dir-${Date.now()}`,
+  );
+  const sDiagAbsent = await getStorageDiagnostics(true, nonExistentDir);
+  assert.equal(sDiagAbsent.sizeBytes, 0);
+  assert.equal(sDiagAbsent.legacyGifPackCount, 0);
+  assert.equal(
+    fs.existsSync(nonExistentDir),
+    false,
+    'getStorageDiagnostics must not create nonExistentDir',
+  );
+
+  await fsp.rm(diagTestDir, {recursive: true, force: true});
+}
+
+// Test Section 5: /status formatting, snapshots, and lifecycle integration
+{
+  resetLastRefreshAllForTests();
+  resetLastGarbageCollectionForTests();
+  resetToolDiagnosticsCacheForTests();
+  resetStorageDiagnosticsCacheForTests();
+
+  // 1. Initial idle status with no previous runs
+  const snapshot1 = await getConverterStatusSnapshot({forceRefresh: true});
+  const formatted1 = formatStatusResponse(snapshot1, formatUptime);
+  assert.ok(formatted1.includes('MoreStickersConverter status'));
+  assert.ok(formatted1.includes('Node.js: ' + process.version));
+  assert.ok(formatted1.includes('FFmpeg:'));
+  assert.ok(formatted1.includes('lottieconverter:'));
+  assert.ok(formatted1.includes('Active downloads: 0'));
+  assert.ok(formatted1.includes('Active encodes: 0'));
+  assert.ok(formatted1.includes('Queue length: 0'));
+  assert.ok(formatted1.includes('Storage size:'));
+  assert.ok(formatted1.includes('Legacy GIF packs:'));
+  assert.ok(formatted1.includes('Refresh all: idle'));
+  assert.ok(formatted1.includes('Last run: never'));
+  assert.ok(formatted1.includes('Garbage collection: idle'));
+  // 2. Last GC integration (manual and background)
+  const gcResult = await runGarbageCollection({mode: 'apply'});
+  const lastGc = getLastGarbageCollection();
+  assert.ok(lastGc !== undefined);
+  assert.equal(lastGc.mode, 'apply');
+  assert.equal(
+    lastGc.outcome,
+    gcResult.errors && gcResult.errors > 0
+      ? 'completed-with-errors'
+      : 'success',
+  );
+  assert.equal(lastGc.errors, gcResult.errors ?? 0);
+  assert.equal(lastGc.bytesFreed, gcResult.bytesFreed);
+
+  const snapshotWithGc = await getConverterStatusSnapshot({forceRefresh: true});
+  const formattedWithGc = formatStatusResponse(snapshotWithGc, formatUptime);
+  assert.ok(formattedWithGc.includes('Mode: apply'));
+  assert.ok(
+    formattedWithGc.includes(
+      `Result: ${lastGc.outcome} with ${lastGc.errors} error`,
+    ),
+  );
+  // 3. Last /refresh_all lifecycle tracking
+  assert.equal(getLastRefreshAll(), undefined);
+  const ctxEmptyRefresh = createMockContext({
+    userId: allowedUserId,
+    telegram: mockTelegram as unknown as Telegram,
+  });
+  await handleRefreshAllCommand(ctxEmptyRefresh);
+  const lastRefresh = getLastRefreshAll();
+  assert.ok(lastRefresh !== undefined);
+  assert.equal(lastRefresh.outcome, 'completed');
+  const localPacksCount = (await listLocalStickerPackNames()).length;
+  assert.equal(lastRefresh.total, localPacksCount);
+  assert.equal(lastRefresh.refreshed + lastRefresh.failed, localPacksCount);
+  assert.equal(lastRefresh.skipped, 0);
+  // 3. Partial diagnostics failure resilience
+  const degradedSnapshot = {
+    runtime: {
+      status: 'DEGRADED' as const,
+      uptimeSeconds: 120,
+      nodeVersion: process.version,
+      ffmpegVersion: undefined,
+      ffmpegAvailable: false,
+      lottieConverterAvailable: false,
+      concurrency: 5,
+      dataDirOk: false,
+      externalUrlConfigured: true,
+    },
+    work: {
+      activeDownloads: 2,
+      activeEncodes: 1,
+      queueLength: 4,
+    },
+    storage: {
+      sizeBytes: undefined,
+      legacyGifPackCount: undefined,
+      warnings: 2,
+    },
+    refreshAll: {
+      current: {
+        running: false,
+        cancelRequested: false,
+        total: 0,
+        processed: 0,
+        successful: 0,
+        failed: 0,
+      },
+      last: {
+        startedAt: Date.now() - 60_000,
+        finishedAt: Date.now() - 30_000,
+        durationMs: 30_000,
+        total: 10,
+        refreshed: 8,
+        failed: 2,
+        skipped: 0,
+        outcome: 'completed' as const,
+      },
+    },
+    garbageCollection: {
+      current: {
+        running: false,
+      },
+      last: {
+        mode: 'apply' as const,
+        startedAt: Date.now() - 120_000,
+        finishedAt: Date.now() - 110_000,
+        durationMs: 10_000,
+        errors: 0,
+        bytesFreed: 1024 * 1024,
+        outcome: 'success' as const,
+      },
+    },
+  };
+  const degradedFormatted = formatStatusResponse(
+    degradedSnapshot,
+    formatUptime,
+  );
+  assert.ok(degradedFormatted.includes('Status: DEGRADED'));
+  assert.ok(degradedFormatted.includes('FFmpeg: unavailable'));
+  assert.ok(degradedFormatted.includes('lottieconverter: unavailable'));
+  assert.ok(degradedFormatted.includes('Active downloads: 2'));
+  assert.ok(degradedFormatted.includes('Active encodes: 1'));
+  assert.ok(degradedFormatted.includes('Queue length: 4'));
+  assert.ok(degradedFormatted.includes('Storage size: unavailable'));
+  assert.ok(degradedFormatted.includes('Legacy GIF packs: unavailable'));
+  assert.ok(degradedFormatted.includes('Result: 8 refreshed, 2 failed'));
+  assert.ok(degradedFormatted.includes('Freed: 1 MiB'));
+}
+console.log(
+  'Verified: P2 /status diagnostics, probes, work counters, and storage tests pass',
+);
 console.log('Verified: All new Telegram bot commands passed all tests');
 await fsp.rm(tempDir, {recursive: true, force: true});
 console.log('--- All Smoke Tests Passed Successfully! ---');

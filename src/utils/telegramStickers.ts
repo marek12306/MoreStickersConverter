@@ -30,7 +30,10 @@ import {
   verifyStoredStickerAsset,
   writeStickerVersionIndexAtomically,
 } from './stickerAssetStorage.js';
-
+import {
+  registerDownloadQueue,
+  withActiveDownload,
+} from './statusDiagnostics.js';
 export function parseDownloadConcurrency(rawValue: string | undefined): number {
   if (rawValue === undefined || rawValue === '') {
     return 5;
@@ -471,12 +474,6 @@ async function downloadSingleSticker(
   const mediaInfo = getStickerMediaInfo(sticker, sourceFileType);
   const stickerPackDirPath = generateStickerPackDirPath(stickerSet.name);
 
-  const fileLink = await telegram.getFileLink(stickerFile.file_id);
-  const response = await fetchStickerWithRetry(
-    fileLink,
-    sticker.file_unique_id,
-  );
-
   if (mediaInfo.isAnimated) {
     const sourceExtension = mediaInfo.isVideoSticker ? 'webm' : 'tgs';
     const tempSourcePath = path.join(
@@ -494,21 +491,28 @@ async function downloadSingleSticker(
     );
 
     try {
-      if (mediaInfo.isTgsSticker) {
-        await pipeline(
-          Readable.fromWeb(response.body!),
-          createByteLimitTransform(
-            TELEGRAM_TGS_MAX_BYTES,
-            `TGS sticker ${sticker.file_unique_id}`,
-          ),
-          fs.createWriteStream(tempSourcePath),
+      await withActiveDownload(async () => {
+        const fileLink = await telegram.getFileLink(stickerFile.file_id);
+        const response = await fetchStickerWithRetry(
+          fileLink,
+          sticker.file_unique_id,
         );
-      } else {
-        await pipeline(
-          Readable.fromWeb(response.body!),
-          fs.createWriteStream(tempSourcePath),
-        );
-      }
+        if (mediaInfo.isTgsSticker) {
+          await pipeline(
+            Readable.fromWeb(response.body!),
+            createByteLimitTransform(
+              TELEGRAM_TGS_MAX_BYTES,
+              `TGS sticker ${sticker.file_unique_id}`,
+            ),
+            fs.createWriteStream(tempSourcePath),
+          );
+        } else {
+          await pipeline(
+            Readable.fromWeb(response.body!),
+            fs.createWriteStream(tempSourcePath),
+          );
+        }
+      });
       let previousRawMoved = false;
       try {
         await fsp.rename(rawSourcePath, rawSourceBackupPath);
@@ -550,10 +554,17 @@ async function downloadSingleSticker(
   );
 
   try {
-    await pipeline(
-      Readable.fromWeb(response.body!),
-      fs.createWriteStream(tempDownloadPath),
-    );
+    await withActiveDownload(async () => {
+      const fileLink = await telegram.getFileLink(stickerFile.file_id);
+      const response = await fetchStickerWithRetry(
+        fileLink,
+        sticker.file_unique_id,
+      );
+      await pipeline(
+        Readable.fromWeb(response.body!),
+        fs.createWriteStream(tempDownloadPath),
+      );
+    });
     await fsp.rename(tempDownloadPath, stickerFilePath);
     const previewPath = generateStickerPreviewFilePath(
       stickerSet.name,
@@ -642,13 +653,17 @@ async function downloadStickerPack(telegram: Telegram, stickerSet: StickerSet) {
   const previewDir = generateStickerPreviewDirPath(stickerSet.name);
   await fsp.mkdir(previewDir, {recursive: true});
   const queue = stickerSet.stickers.slice();
+  const unregisterQueue = registerDownloadQueue(queue);
   const state: DownloadState = {};
 
-  const downloadPromises = Array.from({length: CONCURRENCY}, () =>
-    downloadWorker(queue, telegram, stickerSet, state),
-  );
-  await Promise.all(downloadPromises);
-
+  try {
+    const downloadPromises = Array.from({length: CONCURRENCY}, () =>
+      downloadWorker(queue, telegram, stickerSet, state),
+    );
+    await Promise.all(downloadPromises);
+  } finally {
+    unregisterQueue();
+  }
   if (state.error !== undefined) {
     await restoreRawSourcesAfterFailure(stickerSet.name, state.error);
   }

@@ -15,7 +15,7 @@ import {
 } from './avifConversion.js';
 import {encodeAnimatedAvif, validateAnimatedAvif} from './avifEncoder.js';
 import {runMediaProcess} from './mediaProcess.js';
-
+import {withActiveEncode} from './statusDiagnostics.js';
 const TGS_MAX_COMPRESSED_BYTES = 64 * 1024;
 const TGS_MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024;
 const TGS_MAX_RENDERED_FRAMES = TGS_MAX_FPS * AVIF_MAX_DURATION_SECONDS;
@@ -241,14 +241,16 @@ export async function convertTgsToAvifWithEncoder(
   encoder: AvifEncoder,
   profiles?: readonly AvifEncodingProfile[],
 ): Promise<ConversionResult> {
-  return await convertToAvifWithEncoder(
-    inputPath,
-    outputPath,
-    encoder,
-    'TGS',
-    profiles ??
-      buildAvifEncodingProfiles(buildFpsCandidates(AVIF_DEFAULT_FPS, 'tgs')),
-  );
+  return await withActiveEncode(async () => {
+    return await convertToAvifWithEncoder(
+      inputPath,
+      outputPath,
+      encoder,
+      'TGS',
+      profiles ??
+        buildAvifEncodingProfiles(buildFpsCandidates(AVIF_DEFAULT_FPS, 'tgs')),
+    );
+  });
 }
 
 export async function convertTgsToAvif(
@@ -256,68 +258,70 @@ export async function convertTgsToAvif(
   outputPath: string,
   encoder?: AvifEncoder,
 ): Promise<ConversionResult> {
-  const {tempPath: preparedInputPath, sourceFps} =
-    await prepareTgsForLottieConverter(inputPath);
-  const fpsCandidates = buildFpsCandidates(sourceFps, 'tgs');
-  const effectiveMaxFps = fpsCandidates[0];
-  const profiles = buildAvifEncodingProfiles(fpsCandidates);
+  return await withActiveEncode(async () => {
+    const {tempPath: preparedInputPath, sourceFps} =
+      await prepareTgsForLottieConverter(inputPath);
+    const fpsCandidates = buildFpsCandidates(sourceFps, 'tgs');
+    const effectiveMaxFps = fpsCandidates[0];
+    const profiles = buildAvifEncodingProfiles(fpsCandidates);
 
-  const frameDir = path.join(
-    path.dirname(inputPath),
-    `.lottie-frames-${randomUUID()}`,
-  );
-  let result: ConversionResult;
+    const frameDir = path.join(
+      path.dirname(inputPath),
+      `.lottie-frames-${randomUUID()}`,
+    );
+    let result: ConversionResult;
 
-  try {
-    if (encoder) {
-      result = await convertTgsToAvifWithEncoder(
-        preparedInputPath,
-        outputPath,
-        encoder,
-        profiles,
-      );
-    } else {
-      const sequencePattern = await renderTgsPngSequence(
-        preparedInputPath,
-        frameDir,
-        effectiveMaxFps,
-      );
-      const sequenceEncoder: AvifEncoder = async (
-        pattern,
-        candidatePath,
-        profile,
-      ) => {
-        await encodeAnimatedAvif(
-          {
-            args: buildTgsFfmpegInputArgs(pattern, effectiveMaxFps),
-            description: `TGS PNG sequence "${pattern}"`,
-          },
+    try {
+      if (encoder) {
+        result = await convertTgsToAvifWithEncoder(
+          preparedInputPath,
+          outputPath,
+          encoder,
+          profiles,
+        );
+      } else {
+        const sequencePattern = await renderTgsPngSequence(
+          preparedInputPath,
+          frameDir,
+          effectiveMaxFps,
+        );
+        const sequenceEncoder: AvifEncoder = async (
+          pattern,
           candidatePath,
           profile,
+        ) => {
+          await encodeAnimatedAvif(
+            {
+              args: buildTgsFfmpegInputArgs(pattern, effectiveMaxFps),
+              description: `TGS PNG sequence "${pattern}"`,
+            },
+            candidatePath,
+            profile,
+          );
+        };
+        result = await convertToAvifWithEncoder(
+          sequencePattern,
+          outputPath,
+          sequenceEncoder,
+          'TGS',
+          profiles,
+          async (candidatePath, profile) =>
+            validateAnimatedAvif(candidatePath, profile, false).then(
+              () => undefined,
+            ),
         );
-      };
-      result = await convertToAvifWithEncoder(
-        sequencePattern,
-        outputPath,
-        sequenceEncoder,
-        'TGS',
-        profiles,
-        async (candidatePath, profile) =>
-          validateAnimatedAvif(candidatePath, profile, false).then(
-            () => undefined,
-          ),
-      );
-      await validateAnimatedAvif(result.outputPath, result.profile);
+        await validateAnimatedAvif(result.outputPath, result.profile);
+      }
+    } catch (err) {
+      await fsp
+        .rm(frameDir, {recursive: true, force: true})
+        .catch(() => undefined);
+      await removePreparedTgs(preparedInputPath).catch(() => undefined);
+      throw err;
     }
-  } catch (err) {
-    await fsp
-      .rm(frameDir, {recursive: true, force: true})
-      .catch(() => undefined);
-    await removePreparedTgs(preparedInputPath).catch(() => undefined);
-    throw err;
-  }
 
-  await fsp.rm(frameDir, {recursive: true, force: true});
-  await removePreparedTgs(preparedInputPath);
-  return result;
+    await fsp.rm(frameDir, {recursive: true, force: true});
+    await removePreparedTgs(preparedInputPath);
+    return result;
+  });
 }

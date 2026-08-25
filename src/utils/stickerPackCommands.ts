@@ -35,6 +35,10 @@ import {
   STICKER_PACK_VERSION_RETENTION,
   verifyStoredStickerAsset,
 } from './stickerAssetStorage.js';
+import {
+  formatStatusResponse,
+  getConverterStatusSnapshot,
+} from './statusDiagnostics.js';
 export interface ReplyContext {
   reply: (text: string) => Promise<unknown>;
 }
@@ -263,7 +267,19 @@ export interface RefreshAllState {
   startedAt?: number;
 }
 
+export interface LastRefreshAllSummary {
+  startedAt: number;
+  finishedAt: number;
+  durationMs: number;
+  total: number;
+  refreshed: number;
+  failed: number;
+  skipped: number;
+  outcome: 'completed' | 'cancelled' | 'failed';
+}
+
 let refreshAllState: RefreshAllState | undefined;
+let lastRefreshAll: LastRefreshAllSummary | undefined;
 
 export function getRefreshAllStatus(): RefreshAllState {
   if (!refreshAllState) {
@@ -277,6 +293,17 @@ export function getRefreshAllStatus(): RefreshAllState {
     };
   }
   return {...refreshAllState};
+}
+
+export function getLastRefreshAll(): LastRefreshAllSummary | undefined {
+  if (!lastRefreshAll) {
+    return undefined;
+  }
+  return {...lastRefreshAll};
+}
+
+export function resetLastRefreshAllForTests(): void {
+  lastRefreshAll = undefined;
 }
 
 export type RequestRefreshAllCancellationResult =
@@ -345,6 +372,7 @@ export async function handleRefreshAllCommand(
     return false;
   }
 
+  const startTime = Date.now();
   refreshAllState = {
     running: true,
     cancelRequested: false,
@@ -352,7 +380,7 @@ export async function handleRefreshAllCommand(
     processed: 0,
     successful: 0,
     failed: 0,
-    startedAt: Date.now(),
+    startedAt: startTime,
   };
 
   try {
@@ -364,15 +392,34 @@ export async function handleRefreshAllCommand(
         'Failed to list local sticker packs for /refresh_all:',
         err,
       );
+      lastRefreshAll = {
+        startedAt: startTime,
+        finishedAt: Date.now(),
+        durationMs: Date.now() - startTime,
+        total: 0,
+        refreshed: 0,
+        failed: 1,
+        skipped: 0,
+        outcome: 'failed',
+      };
       await ctx.reply('Error: Unable to read local sticker packs.');
       return false;
     }
 
     if (packNames.length === 0) {
+      lastRefreshAll = {
+        startedAt: startTime,
+        finishedAt: Date.now(),
+        durationMs: Date.now() - startTime,
+        total: 0,
+        refreshed: 0,
+        failed: 0,
+        skipped: 0,
+        outcome: 'completed',
+      };
       await ctx.reply('No local sticker packs to refresh.');
       return true;
     }
-
     const count = packNames.length;
     refreshAllState.total = count;
 
@@ -421,9 +468,20 @@ export async function handleRefreshAllCommand(
         refreshAllState.currentPack = undefined;
       }
     }
-
     const processed = successful + failedPacks.length;
     const isCancelled = processed < count && refreshAllState.cancelRequested;
+    const outcome = isCancelled ? 'cancelled' : 'completed';
+
+    lastRefreshAll = {
+      startedAt: startTime,
+      finishedAt: Date.now(),
+      durationMs: Date.now() - startTime,
+      total: count,
+      refreshed: successful,
+      failed: failedPacks.length,
+      skipped: isCancelled ? count - processed : 0,
+      outcome,
+    };
 
     const lines = isCancelled
       ? [
@@ -439,7 +497,6 @@ export async function handleRefreshAllCommand(
           `Successful: ${successful}`,
           `Failed: ${failedPacks.length}`,
         ];
-
     if (failedPacks.length > 0) {
       lines.push('\nFailed packs:');
       let includedCount = 0;
@@ -469,6 +526,18 @@ export async function handleRefreshAllCommand(
 
     await ctx.reply(lines.join('\n'));
     return !isCancelled && failedPacks.length === 0;
+  } catch (err) {
+    lastRefreshAll = {
+      startedAt: startTime,
+      finishedAt: Date.now(),
+      durationMs: Date.now() - startTime,
+      total: refreshAllState?.total ?? 0,
+      refreshed: refreshAllState?.successful ?? 0,
+      failed: refreshAllState?.failed ?? 1,
+      skipped: 0,
+      outcome: 'failed',
+    };
+    throw err;
   } finally {
     refreshAllState = undefined;
   }
@@ -785,71 +854,9 @@ export async function handleStatusCommand(
     return false;
   }
 
-  let dataDirOk = false;
-  try {
-    await fsp.access(DATA_DIR, fs.constants.R_OK | fs.constants.W_OK);
-    dataDirOk = true;
-  } catch {
-    dataDirOk = false;
-  }
-
-  const externalUrlConfigured = Boolean(process.env.EXTERNAL_URL);
-  const status = dataDirOk && externalUrlConfigured ? 'OK' : 'DEGRADED';
-  const uptime = formatUptime(process.uptime());
   const concurrency = parseDownloadConcurrency(process.env.CONCURRENCY);
-
-  const refreshAll = getRefreshAllStatus();
-  let refreshAllInfo = 'Refresh all: idle';
-  if (refreshAll.running) {
-    const lines = [
-      'Refresh all: running',
-      `Progress: ${refreshAll.currentPack ? refreshAll.processed + 1 : refreshAll.processed}/${refreshAll.total}`,
-    ];
-    if (refreshAll.currentPack) {
-      lines.push(`Current: ${refreshAll.currentPack}`);
-    }
-    lines.push(`Successful: ${refreshAll.successful}`);
-    lines.push(`Failed: ${refreshAll.failed}`);
-    lines.push(
-      `Cancel requested: ${refreshAll.cancelRequested ? 'yes' : 'no'}`,
-    );
-    if (refreshAll.startedAt) {
-      const elapsedSeconds = Math.max(
-        0,
-        Math.floor((Date.now() - refreshAll.startedAt) / 1000),
-      );
-      lines.push(`Elapsed: ${formatUptime(elapsedSeconds)}`);
-    }
-    refreshAllInfo = lines.join('\n');
-  }
-  const gc = getGarbageCollectionStatus();
-  let gcInfo = 'Garbage collection: idle';
-  if (gc.running) {
-    const lines = [
-      'Garbage collection: running',
-      `Mode: ${gc.mode ?? 'apply'}`,
-    ];
-    if (gc.startedAt) {
-      const elapsedSeconds = Math.max(
-        0,
-        Math.floor((Date.now() - gc.startedAt) / 1000),
-      );
-      lines.push(`Elapsed: ${formatUptime(elapsedSeconds)}`);
-    }
-    gcInfo = lines.join('\n');
-  }
-
-  const response =
-    'MoreStickersConverter status\n\n' +
-    `Status: ${status}\n` +
-    `Uptime: ${uptime}\n` +
-    `Node.js: ${process.version}\n` +
-    `Download concurrency: ${concurrency}\n` +
-    `Data directory: ${dataDirOk ? 'OK' : 'Inaccessible'}\n` +
-    `External URL: ${externalUrlConfigured ? 'configured' : 'missing'}\n\n` +
-    refreshAllInfo +
-    '\n\n' +
-    gcInfo;
+  const snapshot = await getConverterStatusSnapshot({concurrency});
+  const response = formatStatusResponse(snapshot, formatUptime);
   await ctx.reply(response);
   return true;
 }

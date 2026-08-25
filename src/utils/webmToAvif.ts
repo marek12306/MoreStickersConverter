@@ -18,7 +18,7 @@ import {
   validateAnimatedAvif,
 } from './avifEncoder.js';
 import {runMediaProcess} from './mediaProcess.js';
-
+import {withActiveEncode} from './statusDiagnostics.js';
 export type {AvifEncoder, AvifEncodingProfile, ConversionResult};
 export {
   AVIF_ENCODING_PROFILES,
@@ -91,24 +91,26 @@ export async function convertWebmToAvifWithEncoder(
   encoder: AvifEncoder = executeWebmFfmpeg,
   profiles?: readonly AvifEncodingProfile[],
 ): Promise<ConversionResult> {
-  const effectiveProfiles =
-    profiles ??
-    buildAvifEncodingProfiles(
-      buildFpsCandidates(await probeWebmSourceFps(inputPath), 'webm'),
+  return await withActiveEncode(async () => {
+    const effectiveProfiles =
+      profiles ??
+      buildAvifEncodingProfiles(
+        buildFpsCandidates(await probeWebmSourceFps(inputPath), 'webm'),
+      );
+    return await convertToAvifWithEncoder(
+      inputPath,
+      outputPath,
+      encoder,
+      'WebM',
+      effectiveProfiles,
+      encoder === executeWebmFfmpeg
+        ? async (candidatePath, profile) =>
+            validateAnimatedAvif(candidatePath, profile, false).then(
+              () => undefined,
+            )
+        : undefined,
     );
-  return await convertToAvifWithEncoder(
-    inputPath,
-    outputPath,
-    encoder,
-    'WebM',
-    effectiveProfiles,
-    encoder === executeWebmFfmpeg
-      ? async (candidatePath, profile) =>
-          validateAnimatedAvif(candidatePath, profile, false).then(
-            () => undefined,
-          )
-      : undefined,
-  );
+  });
 }
 
 export async function convertWebmToAvif(
