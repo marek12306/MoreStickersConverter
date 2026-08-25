@@ -66,7 +66,10 @@ Authorized users can manage and inspect sticker packs using the following bot co
 /public <pack-name>     Add a pack to the public catalog
 /unlisted <pack-name>   Remove a pack from the public catalog
 /stats                  Show local library statistics
-/status                 Show converter status
+/status                 Show converter and garbage collection status
+/gc                     Run storage garbage collection
+/gc_dry                 Preview garbage collection without deleting files
+/gc_stats               Show storage garbage collection statistics
 ```
 
 Pack-specific commands (`/pack`, `/refresh`, `/check`, `/info`, `/public`, `/unlisted`) can be used either with an explicit pack name (e.g. `/info MyPack`) or by replying to a sticker from that pack.
@@ -82,6 +85,86 @@ An administrative command that reads all locally known sticker packs from local 
 * Individual `/refresh` commands are not globally blocked by `/refresh_all`, as per-pack queues safely isolate operations on the same pack.
 * It is the recommended way to migrate all historical GIF packs to the current AVIF pipeline by re-downloading sources from Telegram.
 
+#### `/gc`
+Manually triggers real storage garbage collection using the exact same core engine and retention policy as the background GC (it does not replace or disable the periodic background GC):
+* Applies the retention policy: keeps the **last 5 version indexes** per pack.
+* Prunes stale version indexes eligible for cleanup.
+* Deletes orphaned / unreferenced CAS assets.
+* Preserves all assets referenced by any retained version index for that pack (a CAS blob shared by multiple retained versions is kept as long as at least one retained version references it).
+* Synchronized with sticker pack publication through the per-pack storage mutation lock.
+* Concurrent GC operations within the same process are rejected with `Garbage collection is already running.`.
+
+Example output:
+```text
+Garbage collection finished.
+
+Removed version indexes: 18
+Removed orphaned assets: 42
+Freed: 186.4 MiB
+
+Remaining CAS assets: 1247
+Duration: 1.8 s
+```
+
+#### `/gc_dry`
+Performs a **strict read-only dry run** of storage garbage collection:
+* Analyzes the exact same storage and applies the exact same retention policy as `/gc`.
+* Reports how many version indexes and orphaned assets would be removed, and estimated space to be freed (`Would free: ...`).
+* Modifies no files, manifests, or version indexes.
+* Strictly read-only: does not create `DATA_DIR` if the directory does not exist.
+* Recommended way to preview planned cleanup before running `/gc`.
+
+Example output:
+```text
+Garbage collection dry run.
+
+Would remove version indexes: 18
+Would remove orphaned assets: 42
+Would free: 186.4 MiB
+
+No files were deleted.
+```
+
+#### `/gc_stats`
+Returns a **read-only statistical snapshot** of storage and GC metrics without modifying any files:
+* Reports total sticker packs, total version indexes, total CAS assets count and byte size, referenced assets count and size, orphaned assets count and size, prunable version indexes, estimated reclaimable space, and active retention policy (`last 5 versions`).
+* Does not create `DATA_DIR` if missing.
+
+Example output:
+```text
+Storage GC statistics
+
+Sticker packs: 124
+Version indexes: 531
+
+CAS assets: 4821
+CAS size: 3.74 GiB
+
+Referenced assets: 4630
+Referenced size: 3.51 GiB
+
+Orphaned assets: 191
+Orphaned size: 231.4 MiB
+
+Prunable version indexes: 27
+Estimated reclaimable: 238.2 MiB
+
+Retention: last 5 versions
+```
+
+#### Garbage collection safety and concurrency
+* **Conservative fail-safe design**: All three GC modes report `Errors: N` if any sticker pack or version index cannot be safely analyzed or cleaned. When storage state cannot be safely validated (such as a corrupted manifest or an unreadable index), potentially required data is retained rather than deleted. If removing a stale version index fails, orphaned asset deletion for that pack is skipped to prevent leaving valid indexes without their corresponding blobs.
+* **Process-local concurrency**: GC guards and per-pack storage mutation locks are **process-local**. They prevent race conditions between GC and concurrent pack downloads or publications within the same Node.js process, but do not provide distributed locking across multiple container replicas sharing the same `DATA_DIR`.
+* **`/status` reporting**: The `/status` command displays the current state of garbage collection:
+  * Idle: `Garbage collection: idle`
+  * Running:
+    ```text
+    Garbage collection: running
+    Mode: apply
+    Elapsed: 12s
+    ```
+    (where `Mode` reflects `apply`, `dry-run`, or `stats`).
+
 ### Telegram access control
 
 Bot access can be limited with:
@@ -90,7 +173,7 @@ Bot access can be limited with:
 ALLOWED_TELEGRAM_USER_IDS
 ```
 
-Only listed Telegram users can import packs, trigger refreshes (`/refresh`, `/refresh_all`), or manage visibility (`/public`, `/unlisted`).
+Only listed Telegram users can import packs, trigger refreshes (`/refresh`, `/refresh_all`), run garbage collection (`/gc`, `/gc_dry`, `/gc_stats`), or manage visibility (`/public`, `/unlisted`).
 
 Example:
 
@@ -157,6 +240,7 @@ The fork includes a comprehensive smoke test suite covering:
 * Startup migration for raw upstream WebM/TGS and static WebP packs without previews,
 * `/refresh` and `/refresh_all` (sequential execution, concurrent guard, error isolation, summary reporting),
 * Dynamic version lifecycle, pack-title version bump, and content-addressed storage (CAS) retention / GC (last 5 versions),
+* Storage garbage collection and administrative commands (`/gc`, `/gc_dry`, `/gc_stats`, dry-run / stats read-only safety, error reporting, publication lock synchronization),
 * HTTP endpoints, CORS headers, and cache policies (`max-age=300` for legacy, `max-age=604800` for versioned),
 * Public catalog and `/public` / `/unlisted` visibility commands,
 * Telegram authorization allowlist,
