@@ -108,9 +108,11 @@ const {formatCommandUsage, formatUptime} = await import(
   '../src/utils/telegramCommandUtils.js'
 );
 const {
+  getRefreshAllStatus,
   handleCheckCommand,
   handleInfoCommand,
   handlePackCommand,
+  handleRefreshAllCancelCommand,
   handleRefreshAllCommand,
   handleRefreshCommand,
   handleStatsCommand,
@@ -8017,6 +8019,10 @@ assert.ok(statusResp.includes(`Node.js: ${process.version}`));
 assert.ok(statusResp.includes('Download concurrency: 2'));
 assert.ok(statusResp.includes('Data directory: OK'));
 assert.ok(statusResp.includes('External URL: configured'));
+assert.ok(
+  statusResp.includes('Refresh all: idle'),
+  'Status response must indicate Refresh all: idle when not running',
+);
 assert.equal(
   statusResp.includes(process.env.BOT_TOKEN!),
   false,
@@ -8950,6 +8956,557 @@ try {
   );
 } finally {
   globalThis.fetch = savedFetchForGuard;
+}
+
+// 6. Comprehensive tests for /refresh_all progress, status, cooperative cancellation, and lifecycle
+console.log(
+  'Testing /refresh_all progress, status, and cooperative cancellation...',
+);
+
+// Test 1: Status idle contract
+{
+  const idleStatus = getRefreshAllStatus();
+  assert.equal(idleStatus.running, false, 'idle status running must be false');
+  assert.equal(
+    idleStatus.cancelRequested,
+    false,
+    'idle status cancelRequested must be false',
+  );
+  assert.equal(idleStatus.total, 0, 'idle status total must be 0');
+  assert.equal(idleStatus.processed, 0, 'idle status processed must be 0');
+  assert.equal(idleStatus.successful, 0, 'idle status successful must be 0');
+  assert.equal(idleStatus.failed, 0, 'idle status failed must be 0');
+  assert.equal(
+    idleStatus.currentPack,
+    undefined,
+    'idle status currentPack must be undefined',
+  );
+
+  const ctxIdle = createMockContext({userId: allowedUserId});
+  const handledIdle = await handleStatusCommand(ctxIdle);
+  assert.equal(handledIdle, true);
+  assert.ok(
+    ctxIdle.replies[0]?.includes('Refresh all: idle'),
+    '/status must report "Refresh all: idle" when no batch is active',
+  );
+}
+
+// Test 2, 3, 12: Progress during execution, failed pack increases progress count, /status formatting
+{
+  const progPackA = 'ProgressTestPackA';
+  const progPackB = 'ProgressTestPackB';
+  const progPackC = 'ProgressTestPackC';
+
+  for (const p of [progPackA, progPackB, progPackC]) {
+    const pDir = generateStickerPackDirPath(p);
+    const pPath = generateStickerPackFilePath(p);
+    await fsp.mkdir(pDir, {recursive: true});
+    await fsp.writeFile(
+      pPath,
+      JSON.stringify({
+        id: `MoreStickers:Telegram:Pack:${p}`,
+        title: `Title ${p}`,
+        stickers: [],
+        dynamic: {
+          version: 1,
+          refreshUrl: `https://example.com/stickerpack/telegram/${p}`,
+        },
+      }),
+    );
+  }
+
+  let packBStartedResolve!: () => void;
+  const packBStarted = new Promise<void>(resolve => {
+    packBStartedResolve = resolve;
+  });
+  let releasePackBResolve!: () => void;
+  const releasePackB = new Promise<void>(resolve => {
+    releasePackBResolve = resolve;
+  });
+
+  const processedInOrder: string[] = [];
+
+  const mockProgressTg = {
+    getStickerSet: async (name: string) => {
+      processedInOrder.push(name);
+      if (name === progPackB) {
+        packBStartedResolve();
+        await releasePackB;
+        throw new Error('Simulated Telegram failure on PackB');
+      }
+      return {
+        name,
+        title: `Refreshed ${name}`,
+        stickers: [
+          {
+            file_id: `file-${name}-prog`,
+            file_unique_id: `uniq-${name}-prog`,
+            emoji: '📊',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    },
+    getFile: async () => ({
+      file_path: 'documents/file.webp',
+    }),
+    getFileLink: async () => new URL('https://example.com/file.webp'),
+  } as unknown as Telegram;
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    const ctxProgressBatch = createMockContext({
+      userId: allowedUserId,
+      telegram: mockProgressTg,
+    });
+
+    const batchPromise = handleRefreshAllCommand(ctxProgressBatch);
+
+    // Wait until Pack B starts (after all packs before B have been processed)
+    await packBStarted;
+
+    // Test 2: Verify active snapshot while Pack B is in progress
+    const activeSnapshot = getRefreshAllStatus();
+    assert.equal(
+      activeSnapshot.running,
+      true,
+      'Active snapshot must have running=true',
+    );
+    assert.ok(
+      activeSnapshot.total >= 3,
+      'Active snapshot total must be at least 3',
+    );
+    assert.equal(
+      activeSnapshot.currentPack,
+      progPackB,
+      'Active snapshot currentPack must be ProgressTestPackB',
+    );
+    assert.equal(
+      activeSnapshot.cancelRequested,
+      false,
+      'Active snapshot cancelRequested must be false',
+    );
+    assert.equal(
+      typeof activeSnapshot.startedAt,
+      'number',
+      'startedAt must be timestamp number',
+    );
+
+    // Test 12: Verify /status command output while running
+    const ctxStatusRunning = createMockContext({userId: allowedUserId});
+    await handleStatusCommand(ctxStatusRunning);
+    const statusRunningText = ctxStatusRunning.replies[0] ?? '';
+    assert.ok(
+      statusRunningText.includes('Refresh all: running'),
+      '/status must contain "Refresh all: running"',
+    );
+    assert.ok(
+      statusRunningText.includes(`Current: ${progPackB}`),
+      '/status must contain "Current: ProgressTestPackB"',
+    );
+    assert.ok(
+      statusRunningText.includes(
+        `Progress: ${activeSnapshot.processed + 1}/${activeSnapshot.total}`,
+      ),
+      '/status must contain current progress indicator',
+    );
+    assert.ok(
+      statusRunningText.includes('Cancel requested: no'),
+      '/status must show "Cancel requested: no"',
+    );
+    assert.ok(
+      statusRunningText.includes('Elapsed:'),
+      '/status must show elapsed duration',
+    );
+
+    // Release Pack B (which throws an error)
+    releasePackBResolve();
+    const batchResult = await batchPromise;
+
+    // Test 3: Pack B failed, but Pack C was still processed
+    assert.equal(
+      batchResult,
+      false,
+      'Batch must return false because Pack B failed',
+    );
+    assert.ok(
+      processedInOrder.includes(progPackC),
+      'Pack C must be processed even though Pack B failed',
+    );
+
+    // Verify final report contains both successful and failed counts
+    const finalReport = ctxProgressBatch.replies.find(r =>
+      r.includes('Refresh all finished.'),
+    );
+    assert.ok(finalReport, 'Final report must be delivered');
+    assert.ok(
+      finalReport.includes(`- ${progPackB}:`),
+      'Final report must list failed Pack B',
+    );
+
+    // State must be reset after batch finishes
+    const afterBatchStatus = getRefreshAllStatus();
+    assert.equal(
+      afterBatchStatus.running,
+      false,
+      'Status must return to running=false after batch',
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+}
+
+// Test 4, 5, 7, 8: Cooperative cancellation, double cancel, concurrent guard while cancelling
+{
+  const cancelPackA = 'CancelFlowPackA';
+  const cancelPackB = 'CancelFlowPackB';
+  const cancelPackC = 'CancelFlowPackC';
+  const cancelPackD = 'CancelFlowPackD';
+
+  for (const p of [cancelPackA, cancelPackB, cancelPackC, cancelPackD]) {
+    const pDir = generateStickerPackDirPath(p);
+    const pPath = generateStickerPackFilePath(p);
+    await fsp.mkdir(pDir, {recursive: true});
+    await fsp.writeFile(
+      pPath,
+      JSON.stringify({
+        id: `MoreStickers:Telegram:Pack:${p}`,
+        title: `Title ${p}`,
+        stickers: [],
+        dynamic: {
+          version: 1,
+          refreshUrl: `https://example.com/stickerpack/telegram/${p}`,
+        },
+      }),
+    );
+  }
+
+  let cancelPackBStartedResolve!: () => void;
+  const cancelPackBStarted = new Promise<void>(resolve => {
+    cancelPackBStartedResolve = resolve;
+  });
+  let releaseCancelPackBResolve!: () => void;
+  const releaseCancelPackB = new Promise<void>(resolve => {
+    releaseCancelPackBResolve = resolve;
+  });
+
+  const startedPacks: string[] = [];
+  const finishedPacks: string[] = [];
+
+  const mockCancelTg = {
+    getStickerSet: async (name: string) => {
+      startedPacks.push(name);
+      if (name === cancelPackB) {
+        cancelPackBStartedResolve();
+        await releaseCancelPackB;
+      }
+      finishedPacks.push(name);
+      return {
+        name,
+        title: `Refreshed ${name}`,
+        stickers: [
+          {
+            file_id: `file-${name}-cancel`,
+            file_unique_id: `uniq-${name}-cancel`,
+            emoji: '🛑',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    },
+    getFile: async () => ({
+      file_path: 'documents/file.webp',
+    }),
+    getFileLink: async () => new URL('https://example.com/file.webp'),
+  } as unknown as Telegram;
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    const ctxCancelBatch = createMockContext({
+      userId: allowedUserId,
+      telegram: mockCancelTg,
+    });
+
+    const batchPromise = handleRefreshAllCommand(ctxCancelBatch);
+    await cancelPackBStarted;
+
+    // While Pack B is active:
+    assert.equal(
+      getRefreshAllStatus().currentPack,
+      cancelPackB,
+      'Current pack must be CancelFlowPackB',
+    );
+
+    // Test 4 & 5: Trigger cancellation
+    const ctxCancelCmd1 = createMockContext({userId: allowedUserId});
+    const cancelCmd1Handled =
+      await handleRefreshAllCancelCommand(ctxCancelCmd1);
+    assert.equal(cancelCmd1Handled, true);
+    assert.ok(
+      ctxCancelCmd1.replies[0]?.includes(
+        'Refresh all cancellation requested.\nThe current pack will finish before the operation stops.',
+      ),
+      'First cancel must reply with cooperative cancellation confirmation',
+    );
+    assert.equal(
+      getRefreshAllStatus().cancelRequested,
+      true,
+      'cancelRequested must be true in state',
+    );
+
+    // Test 7: Double cancel must be idempotent
+    const ctxCancelCmd2 = createMockContext({userId: allowedUserId});
+    const cancelCmd2Handled =
+      await handleRefreshAllCancelCommand(ctxCancelCmd2);
+    assert.equal(cancelCmd2Handled, true);
+    assert.ok(
+      ctxCancelCmd2.replies[0]?.includes(
+        'Refresh all cancellation has already been requested.',
+      ),
+      'Second cancel must inform that cancellation is already pending',
+    );
+
+    // Test 8: Second /refresh_all invocation while cancelling is rejected
+    const ctxConcurrentWhileCancelling = createMockContext({
+      userId: allowedUserId,
+      telegram: mockCancelTg,
+    });
+    const concurrentHandled = await handleRefreshAllCommand(
+      ctxConcurrentWhileCancelling,
+    );
+    assert.equal(
+      concurrentHandled,
+      false,
+      'Second /refresh_all during cancellation must be rejected',
+    );
+    assert.ok(
+      ctxConcurrentWhileCancelling.replies.some(r =>
+        r.includes('Refresh all is already running.'),
+      ),
+      'Must notify that refresh all is already running',
+    );
+
+    // Test 12: /status when cancelRequested is true
+    const ctxStatusCancelling = createMockContext({userId: allowedUserId});
+    await handleStatusCommand(ctxStatusCancelling);
+    const statusCancellingText = ctxStatusCancelling.replies[0] ?? '';
+    assert.ok(
+      statusCancellingText.includes('Cancel requested: yes'),
+      '/status must show "Cancel requested: yes"',
+    );
+
+    // Release Pack B
+    releaseCancelPackBResolve();
+    const batchResult = await batchPromise;
+    assert.equal(batchResult, false, 'Cancelled batch must return false');
+
+    // Test 5: Verify Pack B completed and no subsequent packs started after cancellation
+    assert.ok(
+      finishedPacks.includes(cancelPackB),
+      'Pack B must finish completely despite cancellation',
+    );
+    const indexOfBInStarted = startedPacks.indexOf(cancelPackB);
+    assert.ok(indexOfBInStarted !== -1);
+    const packsStartedAfterB = startedPacks.slice(indexOfBInStarted + 1);
+    assert.equal(
+      packsStartedAfterB.length,
+      0,
+      'No packs must start after the cancelled pack finishes',
+    );
+    assert.ok(
+      !startedPacks.includes(cancelPackC),
+      'Pack C must never be started',
+    );
+    assert.ok(
+      !startedPacks.includes(cancelPackD),
+      'Pack D must never be started',
+    );
+
+    // Test 4: Final cancelled report format
+    const cancelledReport = ctxCancelBatch.replies.find(r =>
+      r.includes('Refresh all cancelled.'),
+    );
+    assert.ok(cancelledReport, 'Cancelled report must be sent');
+    assert.ok(
+      cancelledReport.includes('Processed:'),
+      'Cancelled report must include Processed count',
+    );
+    assert.ok(
+      cancelledReport.includes('Successful:'),
+      'Cancelled report must include Successful count',
+    );
+    assert.ok(
+      cancelledReport.includes('Failed:'),
+      'Cancelled report must include Failed count',
+    );
+    assert.ok(
+      cancelledReport.includes('Skipped:'),
+      'Cancelled report must include Skipped count',
+    );
+
+    // Test 9: Cleanup after cancellation
+    assert.equal(
+      getRefreshAllStatus().running,
+      false,
+      'State must be cleared after cancelled batch',
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+}
+
+// Test 6: Cancel when idle and authorization checks
+{
+  const ctxCancelIdle = createMockContext({userId: allowedUserId});
+  const cancelIdleHandled = await handleRefreshAllCancelCommand(ctxCancelIdle);
+  assert.equal(cancelIdleHandled, true);
+  assert.ok(
+    ctxCancelIdle.replies[0]?.includes(
+      'No refresh all operation is currently running.',
+    ),
+    'Cancel when idle must report no operation is running',
+  );
+  assert.equal(getRefreshAllStatus().running, false);
+
+  // Unauthorized cancel
+  const ctxCancelUnauthorized = createMockContext({
+    userId: 'unauthorized_999',
+  });
+  const cancelUnauthHandled = await handleRefreshAllCancelCommand(
+    ctxCancelUnauthorized,
+  );
+  assert.equal(
+    cancelUnauthHandled,
+    false,
+    'Unauthorized user must be rejected',
+  );
+  assert.equal(
+    ctxCancelUnauthorized.replies.length,
+    0,
+    'Unauthorized cancel must produce 0 replies',
+  );
+}
+
+// Test 10: State cleanup after truly unhandled exception escaping handleRefreshAllCommand
+{
+  assert.equal(getRefreshAllStatus().running, false);
+  const ctxThrowingReply = {
+    from: {id: allowedUserId},
+    telegram: mockTelegram,
+    reply: async (text: string) => {
+      if (text.startsWith('Refreshing ')) {
+        throw new Error(
+          'Telegram network connection dropped during initial notification',
+        );
+      }
+      return {};
+    },
+  };
+
+  await assert.rejects(
+    async () => {
+      await handleRefreshAllCommand(ctxThrowingReply);
+    },
+    /Telegram network connection dropped during initial notification/,
+    'handleRefreshAllCommand must propagate unhandled exception from reply',
+  );
+
+  assert.equal(
+    getRefreshAllStatus().running,
+    false,
+    'State must be cleaned up in finally block after truly unhandled exception',
+  );
+
+  const ctxStatus = createMockContext({userId: allowedUserId});
+  await handleStatusCommand(ctxStatus);
+  assert.ok(
+    ctxStatus.replies[0]?.includes('Refresh all: idle'),
+    '/status must report idle after unhandled exception',
+  );
+}
+
+// Test 11: Empty library handling
+{
+  assert.equal(getRefreshAllStatus().running, false);
+
+  const backupDir = path.join(tempDir, '__empty_lib_backup__');
+  await fsp.mkdir(backupDir, {recursive: true});
+
+  // Temporarily move all .telegram.stickerpack files out of DATA_DIR
+  const dirents = await fsp.readdir(DATA_DIR);
+  const packFiles = dirents.filter(name =>
+    name.endsWith('.telegram.stickerpack'),
+  );
+  for (const file of packFiles) {
+    await fsp.rename(path.join(DATA_DIR, file), path.join(backupDir, file));
+  }
+
+  try {
+    const packsBefore = await listLocalStickerPackNames();
+    assert.equal(
+      packsBefore.length,
+      0,
+      'Library must have 0 sticker packs for this test',
+    );
+
+    const ctxEmpty = createMockContext({
+      userId: allowedUserId,
+      telegram: mockTelegram,
+    });
+
+    const handled = await handleRefreshAllCommand(ctxEmpty);
+    assert.equal(
+      handled,
+      true,
+      'handleRefreshAllCommand must return true on empty library',
+    );
+    assert.equal(
+      ctxEmpty.replies.length,
+      1,
+      'Must send exactly one reply on empty library',
+    );
+    assert.equal(
+      ctxEmpty.replies[0],
+      'No local sticker packs to refresh.',
+      'Must notify that there are no local sticker packs',
+    );
+
+    const statusAfterEmpty = getRefreshAllStatus();
+    assert.equal(
+      statusAfterEmpty.running,
+      false,
+      'State must be idle after empty library refresh',
+    );
+
+    const ctxStatus = createMockContext({userId: allowedUserId});
+    await handleStatusCommand(ctxStatus);
+    assert.ok(
+      ctxStatus.replies[0]?.includes('Refresh all: idle'),
+      '/status must report idle after empty library run',
+    );
+  } finally {
+    // Restore pack files
+    for (const file of packFiles) {
+      await fsp.rename(path.join(backupDir, file), path.join(DATA_DIR, file));
+    }
+    await fsp.rm(backupDir, {recursive: true, force: true});
+  }
 }
 console.log('Verified: All new Telegram bot commands passed all tests');
 await fsp.rm(tempDir, {recursive: true, force: true});

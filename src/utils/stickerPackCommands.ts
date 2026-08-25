@@ -247,7 +247,72 @@ export async function handleRefreshCommand(
 const MAX_REPORTED_FAILED_PACKS = 25;
 const MAX_FAILED_PACK_ERROR_LENGTH = 120;
 const SAFE_REPORT_MAX_LENGTH = 3900;
-let isRefreshAllRunning = false;
+
+export interface RefreshAllState {
+  running: boolean;
+  cancelRequested: boolean;
+  total: number;
+  processed: number;
+  successful: number;
+  failed: number;
+  currentPack?: string;
+  startedAt?: number;
+}
+
+let refreshAllState: RefreshAllState | undefined;
+
+export function getRefreshAllStatus(): RefreshAllState {
+  if (!refreshAllState) {
+    return {
+      running: false,
+      cancelRequested: false,
+      total: 0,
+      processed: 0,
+      successful: 0,
+      failed: 0,
+    };
+  }
+  return {...refreshAllState};
+}
+
+export type RequestRefreshAllCancellationResult =
+  | 'not_running'
+  | 'requested'
+  | 'already_requested';
+
+export function requestRefreshAllCancellation(): RequestRefreshAllCancellationResult {
+  if (!refreshAllState || !refreshAllState.running) {
+    return 'not_running';
+  }
+  if (refreshAllState.cancelRequested) {
+    return 'already_requested';
+  }
+  refreshAllState.cancelRequested = true;
+  return 'requested';
+}
+
+export async function handleRefreshAllCancelCommand(
+  ctx: CommandContext,
+): Promise<boolean> {
+  if (!isAllowedTelegramUser(ctx.from?.id)) {
+    return false;
+  }
+
+  const result = requestRefreshAllCancellation();
+  if (result === 'not_running') {
+    await ctx.reply('No refresh all operation is currently running.');
+    return true;
+  }
+  if (result === 'already_requested') {
+    await ctx.reply('Refresh all cancellation has already been requested.');
+    return true;
+  }
+  await ctx.reply(
+    'Refresh all cancellation requested.\nThe current pack will finish before the operation stops.',
+  );
+  return true;
+}
+
 function sanitizeFailedPackError(
   rawError: string | undefined,
   defaultMessage: string,
@@ -258,6 +323,7 @@ function sanitizeFailedPackError(
   }
   return `${text.slice(0, MAX_FAILED_PACK_ERROR_LENGTH - 3)}...`;
 }
+
 export async function handleRefreshAllCommand(
   ctx: CommandContext,
 ): Promise<boolean> {
@@ -270,12 +336,21 @@ export async function handleRefreshAllCommand(
     return false;
   }
 
-  if (isRefreshAllRunning) {
+  if (refreshAllState?.running) {
     await ctx.reply('Refresh all is already running.');
     return false;
   }
 
-  isRefreshAllRunning = true;
+  refreshAllState = {
+    running: true,
+    cancelRequested: false,
+    total: 0,
+    processed: 0,
+    successful: 0,
+    failed: 0,
+    startedAt: Date.now(),
+  };
+
   try {
     let packNames: string[];
     try {
@@ -295,6 +370,8 @@ export async function handleRefreshAllCommand(
     }
 
     const count = packNames.length;
+    refreshAllState.total = count;
+
     await ctx.reply(
       `Refreshing ${count} sticker pack${count === 1 ? '' : 's'}...`,
     );
@@ -303,16 +380,23 @@ export async function handleRefreshAllCommand(
     const failedPacks: Array<{name: string; error: string}> = [];
 
     for (const packName of packNames) {
+      if (refreshAllState.cancelRequested) {
+        break;
+      }
+
+      refreshAllState.currentPack = packName;
       try {
         const result = await refreshStickerPack(ctx.telegram, packName);
         if (result.success) {
           successful++;
+          refreshAllState.successful = successful;
         } else {
           const cleanError = sanitizeFailedPackError(
             result.error,
             `Failed to refresh sticker pack "${packName}".`,
           );
           failedPacks.push({name: packName, error: cleanError});
+          refreshAllState.failed = failedPacks.length;
         }
       } catch (err) {
         console.error(`Unexpected failure refreshing pack "${packName}":`, err);
@@ -327,15 +411,30 @@ export async function handleRefreshAllCommand(
             `Failed to refresh sticker pack "${packName}".`,
           ),
         });
+        refreshAllState.failed = failedPacks.length;
+      } finally {
+        refreshAllState.processed = successful + failedPacks.length;
+        refreshAllState.currentPack = undefined;
       }
     }
 
-    const lines = [
-      'Refresh all finished.\n',
-      `Total: ${count}`,
-      `Successful: ${successful}`,
-      `Failed: ${failedPacks.length}`,
-    ];
+    const processed = successful + failedPacks.length;
+    const isCancelled = processed < count && refreshAllState.cancelRequested;
+
+    const lines = isCancelled
+      ? [
+          'Refresh all cancelled.\n',
+          `Processed: ${processed}/${count}`,
+          `Successful: ${successful}`,
+          `Failed: ${failedPacks.length}`,
+          `Skipped: ${count - processed}`,
+        ]
+      : [
+          'Refresh all finished.\n',
+          `Total: ${count}`,
+          `Successful: ${successful}`,
+          `Failed: ${failedPacks.length}`,
+        ];
 
     if (failedPacks.length > 0) {
       lines.push('\nFailed packs:');
@@ -365,9 +464,9 @@ export async function handleRefreshAllCommand(
     }
 
     await ctx.reply(lines.join('\n'));
-    return failedPacks.length === 0;
+    return !isCancelled && failedPacks.length === 0;
   } finally {
-    isRefreshAllRunning = false;
+    refreshAllState = undefined;
   }
 }
 
@@ -695,6 +794,31 @@ export async function handleStatusCommand(
   const uptime = formatUptime(process.uptime());
   const concurrency = parseDownloadConcurrency(process.env.CONCURRENCY);
 
+  const refreshAll = getRefreshAllStatus();
+  let refreshAllInfo = 'Refresh all: idle';
+  if (refreshAll.running) {
+    const lines = [
+      'Refresh all: running',
+      `Progress: ${refreshAll.currentPack ? refreshAll.processed + 1 : refreshAll.processed}/${refreshAll.total}`,
+    ];
+    if (refreshAll.currentPack) {
+      lines.push(`Current: ${refreshAll.currentPack}`);
+    }
+    lines.push(`Successful: ${refreshAll.successful}`);
+    lines.push(`Failed: ${refreshAll.failed}`);
+    lines.push(
+      `Cancel requested: ${refreshAll.cancelRequested ? 'yes' : 'no'}`,
+    );
+    if (refreshAll.startedAt) {
+      const elapsedSeconds = Math.max(
+        0,
+        Math.floor((Date.now() - refreshAll.startedAt) / 1000),
+      );
+      lines.push(`Elapsed: ${formatUptime(elapsedSeconds)}`);
+    }
+    refreshAllInfo = lines.join('\n');
+  }
+
   const response =
     'MoreStickersConverter status\n\n' +
     `Status: ${status}\n` +
@@ -702,8 +826,8 @@ export async function handleStatusCommand(
     `Node.js: ${process.version}\n` +
     `Download concurrency: ${concurrency}\n` +
     `Data directory: ${dataDirOk ? 'OK' : 'Inaccessible'}\n` +
-    `External URL: ${externalUrlConfigured ? 'configured' : 'missing'}`;
-
+    `External URL: ${externalUrlConfigured ? 'configured' : 'missing'}\n\n` +
+    refreshAllInfo;
   await ctx.reply(response);
   return true;
 }
