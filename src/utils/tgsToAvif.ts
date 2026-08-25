@@ -4,10 +4,13 @@ import path from 'node:path';
 import {gunzipSync, gzipSync} from 'node:zlib';
 import {
   AVIF_DEFAULT_FPS,
-  AVIF_ENCODING_PROFILES,
   AVIF_MAX_DURATION_SECONDS,
+  TGS_MAX_FPS,
+  buildAvifEncodingProfiles,
+  buildFpsCandidates,
   convertToAvifWithEncoder,
   type AvifEncoder,
+  type AvifEncodingProfile,
   type ConversionResult,
 } from './avifConversion.js';
 import {encodeAnimatedAvif, validateAnimatedAvif} from './avifEncoder.js';
@@ -15,8 +18,30 @@ import {runMediaProcess} from './mediaProcess.js';
 
 const TGS_MAX_COMPRESSED_BYTES = 64 * 1024;
 const TGS_MAX_DECOMPRESSED_BYTES = 2 * 1024 * 1024;
-const TGS_MAX_RENDERED_FRAMES = AVIF_DEFAULT_FPS * AVIF_MAX_DURATION_SECONDS;
+const TGS_MAX_RENDERED_FRAMES = TGS_MAX_FPS * AVIF_MAX_DURATION_SECONDS;
 const TGS_MAX_RENDERED_FRAME_BYTES = 32 * 1024 * 1024;
+
+export function extractTgsSourceFps(rawJson: unknown): number | undefined {
+  if (
+    typeof rawJson !== 'object' ||
+    rawJson === null ||
+    Array.isArray(rawJson)
+  ) {
+    return undefined;
+  }
+  const data = rawJson as Record<string, unknown>;
+  if (typeof data.fr === 'number' && Number.isFinite(data.fr)) {
+    if (data.fr > 0 && data.fr < 1) {
+      throw new Error(
+        `Unsupported source frame rate (${data.fr} FPS): animated AVIF conversion requires >= 1 FPS to satisfy the 3-second duration limit`,
+      );
+    }
+    if (data.fr >= 1) {
+      return data.fr;
+    }
+  }
+  return undefined;
+}
 
 export function normalizeLottieJsonForConverter(
   rawJson: unknown,
@@ -33,13 +58,7 @@ export function normalizeLottieJsonForConverter(
   }
   const data = rawJson as Record<string, unknown>;
 
-  if (
-    typeof data.fr !== 'number' ||
-    !Number.isFinite(data.fr) ||
-    data.fr <= 0
-  ) {
-    throw new Error(`Invalid TGS frame rate (fr=${data.fr}) in "${inputPath}"`);
-  }
+  const sourceFps = extractTgsSourceFps(data) ?? AVIF_DEFAULT_FPS;
   if (typeof data.ip !== 'number' || !Number.isFinite(data.ip)) {
     throw new Error(`Invalid TGS in-point (ip=${data.ip}) in "${inputPath}"`);
   }
@@ -62,13 +81,16 @@ export function normalizeLottieJsonForConverter(
   }
   const cappedExclusiveOp = Math.min(
     op,
-    ip + data.fr * AVIF_MAX_DURATION_SECONDS,
+    ip + sourceFps * AVIF_MAX_DURATION_SECONDS,
   );
   // lottieconverter/rlottie treats op as inclusive; TGS/Lottie defines it as
   // exclusive. Subtracting one prevents an extra rendered frame.
-  return JSON.stringify({...data, op: cappedExclusiveOp - 1});
+  return JSON.stringify({
+    ...data,
+    fr: sourceFps,
+    op: cappedExclusiveOp - 1,
+  });
 }
-
 async function removePreparedTgs(file: string): Promise<void> {
   try {
     await fsp.unlink(file);
@@ -78,9 +100,14 @@ async function removePreparedTgs(file: string): Promise<void> {
   }
 }
 
+export interface PreparedTgs {
+  tempPath: string;
+  sourceFps: number;
+}
+
 export async function prepareTgsForLottieConverter(
   inputPath: string,
-): Promise<string> {
+): Promise<PreparedTgs> {
   const compressedSize = (await fsp.stat(inputPath)).size;
   if (compressedSize > TGS_MAX_COMPRESSED_BYTES) {
     throw new Error(
@@ -110,6 +137,7 @@ export async function prepareTgsForLottieConverter(
     );
   }
 
+  const sourceFps = extractTgsSourceFps(parsed) ?? AVIF_DEFAULT_FPS;
   const normalizedJson = normalizeLottieJsonForConverter(parsed, inputPath);
   const parsedPath = path.parse(inputPath);
   const tempPath = path.join(
@@ -117,9 +145,8 @@ export async function prepareTgsForLottieConverter(
     `${parsedPath.name}.lottieconverter-${randomUUID()}${parsedPath.ext || '.tgs'}`,
   );
   await fsp.writeFile(tempPath, gzipSync(Buffer.from(normalizedJson, 'utf8')));
-  return tempPath;
+  return {tempPath, sourceFps};
 }
-
 function getPngSequence(
   frameDir: string,
   entries: string[],
@@ -161,6 +188,7 @@ function getPngSequence(
 async function renderTgsPngSequence(
   preparedInputPath: string,
   frameDir: string,
+  renderedFps = AVIF_DEFAULT_FPS,
 ): Promise<string> {
   await fsp.mkdir(frameDir, {recursive: true});
   const framePrefix = path.join(frameDir, 'frame-');
@@ -171,7 +199,7 @@ async function renderTgsPngSequence(
       framePrefix,
       'pngs',
       '160x160',
-      String(AVIF_DEFAULT_FPS),
+      String(Math.floor(renderedFps)),
     ],
     `TGS PNG sequence render for "${preparedInputPath}"`,
   );
@@ -191,10 +219,13 @@ async function renderTgsPngSequence(
   return sequence.pattern;
 }
 
-export function buildTgsFfmpegInputArgs(pattern: string): string[] {
+export function buildTgsFfmpegInputArgs(
+  pattern: string,
+  framerate = AVIF_DEFAULT_FPS,
+): string[] {
   return [
     '-framerate',
-    String(AVIF_DEFAULT_FPS),
+    String(framerate),
     '-start_number',
     '0',
     '-threads',
@@ -208,13 +239,15 @@ export async function convertTgsToAvifWithEncoder(
   inputPath: string,
   outputPath: string,
   encoder: AvifEncoder,
+  profiles?: readonly AvifEncodingProfile[],
 ): Promise<ConversionResult> {
   return await convertToAvifWithEncoder(
     inputPath,
     outputPath,
     encoder,
     'TGS',
-    AVIF_ENCODING_PROFILES,
+    profiles ??
+      buildAvifEncodingProfiles(buildFpsCandidates(AVIF_DEFAULT_FPS, 'tgs')),
   );
 }
 
@@ -223,7 +256,12 @@ export async function convertTgsToAvif(
   outputPath: string,
   encoder?: AvifEncoder,
 ): Promise<ConversionResult> {
-  const preparedInputPath = await prepareTgsForLottieConverter(inputPath);
+  const {tempPath: preparedInputPath, sourceFps} =
+    await prepareTgsForLottieConverter(inputPath);
+  const fpsCandidates = buildFpsCandidates(sourceFps, 'tgs');
+  const effectiveMaxFps = fpsCandidates[0];
+  const profiles = buildAvifEncodingProfiles(fpsCandidates);
+
   const frameDir = path.join(
     path.dirname(inputPath),
     `.lottie-frames-${randomUUID()}`,
@@ -236,11 +274,13 @@ export async function convertTgsToAvif(
         preparedInputPath,
         outputPath,
         encoder,
+        profiles,
       );
     } else {
       const sequencePattern = await renderTgsPngSequence(
         preparedInputPath,
         frameDir,
+        effectiveMaxFps,
       );
       const sequenceEncoder: AvifEncoder = async (
         pattern,
@@ -249,7 +289,7 @@ export async function convertTgsToAvif(
       ) => {
         await encodeAnimatedAvif(
           {
-            args: buildTgsFfmpegInputArgs(pattern),
+            args: buildTgsFfmpegInputArgs(pattern, effectiveMaxFps),
             description: `TGS PNG sequence "${pattern}"`,
           },
           candidatePath,
@@ -261,7 +301,7 @@ export async function convertTgsToAvif(
         outputPath,
         sequenceEncoder,
         'TGS',
-        AVIF_ENCODING_PROFILES,
+        profiles,
         async (candidatePath, profile) =>
           validateAnimatedAvif(candidatePath, profile, false).then(
             () => undefined,

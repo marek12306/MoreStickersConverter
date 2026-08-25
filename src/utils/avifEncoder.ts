@@ -4,10 +4,12 @@ import path from 'node:path';
 import {
   AVIF_HARD_LIMIT_BYTES,
   AVIF_MAX_DURATION_SECONDS,
+  parseFrameRate,
   type AvifEncodingProfile,
 } from './avifConversion.js';
 import {runMediaProcess} from './mediaProcess.js';
 
+export const AVIF_FPS_TOLERANCE = 0.01;
 export type AvifFilterBranch = 'color' | 'alpha';
 
 export interface AvifInput {
@@ -55,17 +57,8 @@ function parsePositiveNumber(value: string | number | undefined): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
-function parseFrameRate(value: string | undefined): number {
-  if (!value) return 0;
-  const [numerator, denominator] = value.split('/').map(Number);
-  if (
-    !Number.isFinite(numerator) ||
-    !Number.isFinite(denominator) ||
-    denominator === 0
-  ) {
-    return 0;
-  }
-  return numerator / denominator;
+function getFrameRateFromValue(value: string | undefined): number {
+  return parseFrameRate(value) ?? 0;
 }
 
 function getFrameCount(stream: ProbeStream): number {
@@ -74,7 +67,8 @@ function getFrameCount(stream: ProbeStream): number {
 
 function getFrameRate(stream: ProbeStream): number {
   return (
-    parseFrameRate(stream.avg_frame_rate) || parseFrameRate(stream.r_frame_rate)
+    getFrameRateFromValue(stream.avg_frame_rate) ||
+    getFrameRateFromValue(stream.r_frame_rate)
   );
 }
 
@@ -389,17 +383,19 @@ export async function validateAnimatedAvif(
     );
   }
   if (
-    Math.abs(fps - profile.fps) > 0.01 ||
-    Math.abs(alphaFps - profile.fps) > 0.01
+    Math.abs(fps - profile.fps) > AVIF_FPS_TOLERANCE ||
+    Math.abs(alphaFps - profile.fps) > AVIF_FPS_TOLERANCE
   ) {
     throw new Error(
       `Animated AVIF "${outputPath}" has unexpected color/alpha FPS ${fps}/${alphaFps}; expected ${profile.fps}`,
     );
   }
+  const maxFrameCount = Math.ceil(AVIF_MAX_DURATION_SECONDS * profile.fps);
+  const maxRepresentableDuration = maxFrameCount / profile.fps;
   if (
     durationSeconds <= 0 ||
-    durationSeconds > AVIF_MAX_DURATION_SECONDS + 0.001 ||
-    frameCount > Math.ceil(AVIF_MAX_DURATION_SECONDS * profile.fps)
+    durationSeconds > maxRepresentableDuration + 0.001 ||
+    frameCount > maxFrameCount
   ) {
     throw new Error(
       `Animated AVIF "${outputPath}" duration ${durationSeconds}s or frame count ${frameCount} exceeds ${AVIF_MAX_DURATION_SECONDS}s`,

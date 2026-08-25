@@ -19,6 +19,21 @@ process.env.PORT = '3000';
 import type {AvifEncoder} from '../src/utils/webmToAvif.js';
 import type {Telegram} from 'telegraf';
 const {
+  AVIF_DEFAULT_FPS,
+  AVIF_ENCODING_PROFILES,
+  AVIF_HARD_LIMIT_BYTES,
+  AVIF_MAX_DURATION_SECONDS,
+  TGS_FPS_FALLBACKS,
+  TGS_MAX_FPS,
+  WEBM_FPS_FALLBACKS,
+  WEBM_MAX_FPS,
+  buildAvifEncodingProfiles,
+  buildFpsCandidates,
+  convertToAvifWithEncoder,
+  parseFrameRate,
+} = await import('../src/utils/avifConversion.js');
+const {AVIF_FPS_TOLERANCE} = await import('../src/utils/avifEncoder.js');
+const {
   buildAlphaFfmpegArgs,
   buildAvifFilter,
   buildAvifMuxArgs,
@@ -26,14 +41,14 @@ const {
   buildWebmFfmpegInputArgs,
   convertWebmToAvif,
   convertWebmToAvifWithEncoder,
+  probeWebmSourceFps,
   validateAnimatedAvif,
-  AVIF_ENCODING_PROFILES,
-  AVIF_HARD_LIMIT_BYTES,
 } = await import('../src/utils/webmToAvif.js');
 const {
   buildTgsFfmpegInputArgs,
   convertTgsToAvif,
   convertTgsToAvifWithEncoder,
+  extractTgsSourceFps,
   normalizeLottieJsonForConverter,
   prepareTgsForLottieConverter,
 } = await import('../src/utils/tgsToAvif.js');
@@ -1286,8 +1301,9 @@ assert.ok(
   `Output AVIF size (${conversionResult.sizeBytes}) exceeds ${AVIF_HARD_LIMIT_BYTES}`,
 );
 assert.equal(conversionResult.profileIndex, 0);
-assert.deepEqual(conversionResult.profile, firstWebmProfile);
-
+assert.equal(conversionResult.profile.fps, 30);
+assert.equal(conversionResult.profile.crf, 24);
+assert.equal(conversionResult.profile.maxDimension, 160);
 const avifProbe = await validateAnimatedAvif(
   testAvifPath,
   conversionResult.profile,
@@ -1305,7 +1321,8 @@ assert.equal(avifProbe.colorPixelFormat, 'yuv420p10le');
 assert.equal(avifProbe.alphaPixelFormat, 'gray10le');
 assert.ok(avifProbe.width <= 160 && avifProbe.height <= 160);
 assert.ok(avifProbe.durationSeconds <= 3);
-assert.equal(avifProbe.fps, 24);
+assert.equal(avifProbe.fps, 30);
+assert.equal(avifProbe.frameCount, 60);
 const fakeAvifContainerPath = path.join(tempDir, 'fake-container.avif');
 const fakeAvifContainerResult = spawnSync('ffmpeg', [
   '-v',
@@ -1566,13 +1583,13 @@ if (lottieConverterUnavailable) {
   assert.ok(fs.existsSync(outputTgsAvifPath), 'TGS output AVIF must exist');
   assert.ok(tgsResult.sizeBytes <= AVIF_HARD_LIMIT_BYTES);
   assert.equal(tgsResult.profileIndex, 0);
-  assert.equal(tgsResult.profile.fps, 24);
+  assert.equal(tgsResult.profile.fps, 60);
   const tgsProbe = await validateAnimatedAvif(
     outputTgsAvifPath,
     tgsResult.profile,
   );
-  assert.equal(tgsProbe.frameCount, 24);
-  assert.ok(Math.abs(tgsProbe.durationSeconds - 1) <= 0.02);
+  assert.equal(tgsProbe.frameCount, 60);
+  assert.equal(tgsProbe.fps, 60);
   assert.ok(tgsProbe.width <= 160 && tgsProbe.height <= 160);
   console.log('TGS conversion result:', {
     sizeBytes: tgsResult.sizeBytes,
@@ -4961,30 +4978,17 @@ assert.throws(
   () => normalizeLottieJsonForConverter([], 'array-root.tgs'),
   /Invalid TGS content in "array-root\.tgs"/,
 );
-assert.throws(
-  () => normalizeLottieJsonForConverter({fr: 0, ip: 0, op: 60}, 'bad-fr.tgs'),
-  /Invalid TGS frame rate .* in "bad-fr\.tgs"/,
-);
-assert.throws(
-  () => normalizeLottieJsonForConverter({fr: -10, ip: 0, op: 60}, 'neg-fr.tgs'),
-  /Invalid TGS frame rate .* in "neg-fr\.tgs"/,
-);
-assert.throws(
-  () =>
+// Test 14: invalid or missing TGS fr falls back gracefully to 24 FPS
+for (const badFr of [0, -10, '60', 'invalid', null, undefined]) {
+  const parsedNorm = JSON.parse(
     normalizeLottieJsonForConverter(
-      {fr: '60', ip: 0, op: 60},
-      'str-num-fr.tgs',
+      {fr: badFr, ip: 0, op: 60},
+      `bad-fr-${String(badFr)}.tgs`,
     ),
-  /Invalid TGS frame rate .* in "str-num-fr\.tgs"/,
-);
-assert.throws(
-  () =>
-    normalizeLottieJsonForConverter(
-      {fr: 'invalid', ip: 0, op: 60},
-      'str-fr.tgs',
-    ),
-  /Invalid TGS frame rate .* in "str-fr\.tgs"/,
-);
+  );
+  assert.equal(parsedNorm.fr, 24);
+  assert.equal(extractTgsSourceFps({fr: badFr}), undefined);
+}
 assert.throws(
   () =>
     normalizeLottieJsonForConverter(
@@ -5056,13 +5060,17 @@ await fsp.writeFile(
   normValidTgs,
   gzipSync(Buffer.from(JSON.stringify({fr: 60, ip: 0, op: 60, v: '5.7.4'}))),
 );
-const preparedValidPath = await prepareTgsForLottieConverter(normValidTgs);
-assert.ok(fs.existsSync(preparedValidPath), 'Prepared TGS file must exist');
+const preparedValid = await prepareTgsForLottieConverter(normValidTgs);
+assert.equal(preparedValid.sourceFps, 60);
 assert.ok(
-  preparedValidPath.includes('.lottieconverter-'),
+  fs.existsSync(preparedValid.tempPath),
+  'Prepared TGS file must exist',
+);
+assert.ok(
+  preparedValid.tempPath.includes('.lottieconverter-'),
   'Prepared TGS path must include .lottieconverter- marker',
 );
-await fsp.unlink(preparedValidPath);
+await fsp.unlink(preparedValid.tempPath);
 
 const normCorruptTgs = path.join(normTestDir, 'corrupt.tgs');
 await fsp.writeFile(normCorruptTgs, Buffer.from('not gzip data'));
@@ -5095,6 +5103,16 @@ await fsp.writeFile(
 await assert.rejects(
   prepareTgsForLottieConverter(oversizedExpandedTgs),
   /Failed to decompress TGS gzip payload/,
+);
+
+const sub1FpsTgs = path.join(normTestDir, 'sub1-fps.tgs');
+await fsp.writeFile(
+  sub1FpsTgs,
+  gzipSync(Buffer.from(JSON.stringify({fr: 0.5, ip: 0, op: 10}))),
+);
+await assert.rejects(
+  prepareTgsForLottieConverter(sub1FpsTgs),
+  /Unsupported source frame rate.*0\.5 FPS/,
 );
 
 // Test 1: convertTgsToAvif cleans up normalized temporary file on encoder failure
@@ -5240,6 +5258,239 @@ console.log(
   'Verified: TGS normalization logic, duration handling, and edge cases pass',
 );
 
+console.log('Testing P0 — Source-dependent FPS ladder and rational parsing...');
+
+// Verify constants
+assert.equal(AVIF_DEFAULT_FPS, 24);
+assert.equal(TGS_MAX_FPS, 60);
+assert.equal(WEBM_MAX_FPS, 30);
+assert.deepEqual(TGS_FPS_FALLBACKS, [60, 48, 30, 24, 20, 16]);
+assert.deepEqual(WEBM_FPS_FALLBACKS, [30, 24, 20, 16]);
+assert.equal(await probeWebmSourceFps(testWebmPath), 30);
+
+// Test 0: parseFrameRate helper
+assert.equal(parseFrameRate('30/1'), 30);
+assert.equal(parseFrameRate('24/1'), 24);
+assert.equal(parseFrameRate('25/1'), 25);
+assert.equal(parseFrameRate('30'), 30);
+assert.equal(parseFrameRate('29.97'), 29.97);
+assert.ok(Math.abs((parseFrameRate('30000/1001') ?? 0) - 29.97002997) < 0.0001);
+assert.ok(Math.abs((parseFrameRate('24000/1001') ?? 0) - 23.97602397) < 0.0001);
+assert.equal(parseFrameRate('0/0'), undefined);
+assert.equal(parseFrameRate('N/A'), undefined);
+assert.equal(parseFrameRate('invalid'), undefined);
+assert.equal(parseFrameRate(''), undefined);
+assert.equal(parseFrameRate(undefined), undefined);
+assert.equal(parseFrameRate(null as unknown as string), undefined);
+assert.equal(parseFrameRate(-24), undefined);
+assert.equal(parseFrameRate(0), undefined);
+
+// Test 1: TGS 60 FPS
+assert.deepEqual(buildFpsCandidates(60, 'tgs'), [60, 48, 30, 24, 20, 16]);
+
+// Test 1b: TGS fractional FPS preserves source timeline in JSON while flooring render target
+assert.deepEqual(buildFpsCandidates(29.97, 'tgs'), [29, 24, 20, 16]);
+assert.deepEqual(buildFpsCandidates(29.6, 'tgs'), [29, 24, 20, 16]);
+assert.deepEqual(buildFpsCandidates(12.5, 'tgs'), [12]);
+assert.throws(
+  () => extractTgsSourceFps({fr: 0.5}),
+  /Unsupported source frame rate.*0\.5 FPS/,
+);
+assert.equal(extractTgsSourceFps({fr: 0}), undefined);
+assert.equal(extractTgsSourceFps({fr: -10}), undefined);
+assert.equal(extractTgsSourceFps({fr: 'invalid'}), undefined);
+assert.equal(extractTgsSourceFps({}), undefined);
+assert.throws(
+  () => buildFpsCandidates(0.5, 'tgs'),
+  /Unsupported source frame rate.*0\.5 FPS/,
+);
+assert.throws(
+  () => buildFpsCandidates(0.5, 'webm'),
+  /Unsupported source frame rate.*0\.5 FPS/,
+);
+assert.throws(
+  () => buildFpsCandidates(0.1, 'webm'),
+  /Unsupported source frame rate.*0\.1 FPS/,
+);
+const fracTgsNorm = JSON.parse(
+  normalizeLottieJsonForConverter({fr: 29.6, ip: 0, op: 60}, 'frac-tgs.tgs'),
+);
+assert.equal(fracTgsNorm.fr, 29.6);
+assert.equal(fracTgsNorm.op, 59);
+// Test 3: TGS 30 FPS
+assert.deepEqual(buildFpsCandidates(30, 'tgs'), [30, 24, 20, 16]);
+
+// Test 4: TGS 24 FPS
+assert.deepEqual(buildFpsCandidates(24, 'tgs'), [24, 20, 16]);
+
+// Test 5: TGS low FPS (12)
+assert.deepEqual(buildFpsCandidates(12, 'tgs'), [12]);
+
+// Test 6: TGS > 60 FPS (120)
+assert.deepEqual(buildFpsCandidates(120, 'tgs'), [60, 48, 30, 24, 20, 16]);
+const tgs120Norm = JSON.parse(
+  normalizeLottieJsonForConverter({fr: 120, ip: 0, op: 360}, 'tgs-120.tgs'),
+);
+assert.equal(tgs120Norm.fr, 120);
+assert.equal(tgs120Norm.op, 359);
+// Test 7: WebM 60 FPS (capped at 30)
+assert.deepEqual(buildFpsCandidates(60, 'webm'), [30, 24, 20, 16]);
+
+// Test 8: WebM 30 FPS
+assert.deepEqual(buildFpsCandidates(30, 'webm'), [30, 24, 20, 16]);
+
+// Test 9: WebM 25 FPS
+assert.deepEqual(buildFpsCandidates(25, 'webm'), [25, 24, 20, 16]);
+
+// Test 10: WebM 24 FPS
+assert.deepEqual(buildFpsCandidates(24, 'webm'), [24, 20, 16]);
+
+// Test 11: WebM 15 FPS (no upsampling to 16/20/24/30)
+assert.deepEqual(buildFpsCandidates(15, 'webm'), [15]);
+
+// Test 12: WebM 29.97 FPS (30000/1001)
+const webm2997Candidates = buildFpsCandidates(
+  parseFrameRate('30000/1001'),
+  'webm',
+);
+assert.ok(Math.abs(webm2997Candidates[0] - 29.97002997) < 0.0001);
+assert.deepEqual(webm2997Candidates.slice(1), [24, 20, 16]);
+
+// Test 13: invalid ffprobe FPS uses 24 FPS fallback
+assert.deepEqual(
+  buildFpsCandidates(parseFrameRate('0/0'), 'webm'),
+  [24, 20, 16],
+);
+assert.deepEqual(
+  buildFpsCandidates(parseFrameRate('N/A'), 'webm'),
+  [24, 20, 16],
+);
+assert.deepEqual(
+  buildFpsCandidates(parseFrameRate('invalid'), 'webm'),
+  [24, 20, 16],
+);
+
+// Test 14: invalid TGS fr uses 24 FPS fallback
+assert.deepEqual(
+  buildFpsCandidates(extractTgsSourceFps({fr: 0}), 'tgs'),
+  [24, 20, 16],
+);
+assert.deepEqual(
+  buildFpsCandidates(extractTgsSourceFps({fr: -1}), 'tgs'),
+  [24, 20, 16],
+);
+assert.deepEqual(
+  buildFpsCandidates(extractTgsSourceFps({fr: null}), 'tgs'),
+  [24, 20, 16],
+);
+assert.deepEqual(
+  buildFpsCandidates(extractTgsSourceFps({fr: '60'}), 'tgs'),
+  [24, 20, 16],
+);
+
+// Test 15: no WebM upsampling invariant across wide range of sources
+for (const src of [12, 15, 18, 23.976, 24, 25, 29.97, 30, 60]) {
+  const cands = buildFpsCandidates(src, 'webm');
+  for (const c of cands) {
+    assert.ok(
+      c <= src + 0.001,
+      `Candidate ${c} must not exceed WebM source ${src}`,
+    );
+    assert.ok(c <= 30, `Candidate ${c} must not exceed WebM cap 30`);
+  }
+}
+
+// Test 16: no TGS upsampling invariant across wide range of sources
+for (const src of [10, 12, 20, 24, 25, 30, 48, 50, 60, 120]) {
+  const cands = buildFpsCandidates(src, 'tgs');
+  for (const c of cands) {
+    assert.ok(
+      c <= src + 0.001,
+      `Candidate ${c} must not exceed TGS source ${src}`,
+    );
+    assert.ok(c <= 60, `Candidate ${c} must not exceed TGS cap 60`);
+  }
+}
+
+// Test 17: Quality ladder profile generation from FPS candidates
+const tgs60Profiles = buildAvifEncodingProfiles([60, 48, 30, 24, 20, 16]);
+assert.equal(tgs60Profiles.length, 9);
+assert.deepEqual(
+  tgs60Profiles.map(p => ({fps: p.fps, crf: p.crf})),
+  [
+    {fps: 60, crf: 24},
+    {fps: 60, crf: 28},
+    {fps: 60, crf: 32},
+    {fps: 60, crf: 36},
+    {fps: 48, crf: 36},
+    {fps: 30, crf: 36},
+    {fps: 24, crf: 36},
+    {fps: 20, crf: 36},
+    {fps: 16, crf: 36},
+  ],
+);
+
+// Test 18: Fallback profile selection integration (60 FPS too large -> 48 FPS too large -> 30 FPS fits)
+const dynamicFallbackDir = await fsp.mkdtemp(
+  path.join(tempDir, 'dynamic-fallback-'),
+);
+const dynInput = path.join(dynamicFallbackDir, 'test.webm');
+const dynOutput = path.join(dynamicFallbackDir, 'test.avif');
+await fsp.writeFile(dynInput, 'dummy-webm');
+const attemptedFpsList: number[] = [];
+const dynamicFallbackEncoder: AvifEncoder = async (_in, candPath, prof) => {
+  attemptedFpsList.push(prof.fps);
+  await fsp.writeFile(candPath, '');
+  // Profiles with fps > 30 fail size check
+  if (prof.fps > 30) {
+    await fsp.truncate(candPath, AVIF_HARD_LIMIT_BYTES + 1);
+  } else {
+    await fsp.truncate(candPath, 2_000_000);
+  }
+};
+const customTgsProfiles = buildAvifEncodingProfiles([60, 48, 30, 24, 20, 16]);
+const dynResult = await convertToAvifWithEncoder(
+  dynInput,
+  dynOutput,
+  dynamicFallbackEncoder,
+  'TGS',
+  customTgsProfiles,
+);
+assert.equal(dynResult.profile.fps, 30);
+assert.equal(dynResult.sizeBytes, 2_000_000);
+assert.ok(attemptedFpsList.includes(60));
+assert.ok(attemptedFpsList.includes(48));
+assert.ok(attemptedFpsList.includes(30));
+await fsp.rm(dynamicFallbackDir, {recursive: true, force: true});
+
+// Test 19: Strict 3-second limit and frame count validation
+const strictCheckProfile60 = {maxDimension: 160, fps: 60, crf: 24, cpuUsed: 3};
+assert.equal(
+  Math.ceil(AVIF_MAX_DURATION_SECONDS * strictCheckProfile60.fps),
+  180,
+);
+assert.equal(
+  Math.ceil(AVIF_MAX_DURATION_SECONDS * strictCheckProfile60.fps) /
+    strictCheckProfile60.fps,
+  3.0,
+);
+const strictCheckProfile2997 = {
+  maxDimension: 160,
+  fps: 29.97002997,
+  crf: 24,
+  cpuUsed: 3,
+};
+assert.equal(AVIF_FPS_TOLERANCE, 0.01);
+assert.ok(
+  Math.abs(30 - strictCheckProfile2997.fps) > AVIF_FPS_TOLERANCE,
+  '30 FPS must be rejected for 29.97002997 profile under 0.01 tolerance',
+);
+assert.ok(
+  Math.abs(29.97 - strictCheckProfile2997.fps) <= AVIF_FPS_TOLERANCE,
+  '29.97 FPS must be accepted for 29.97002997 profile under 0.01 tolerance',
+);
+
+console.log('Verified: P0 - Source-dependent FPS tests passed');
 console.log('Testing StickerPack Metadata module...');
 assert.deepEqual(
   DEFAULT_STICKER_PACK_METADATA,
