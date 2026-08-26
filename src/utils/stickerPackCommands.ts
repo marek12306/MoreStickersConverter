@@ -282,7 +282,25 @@ export interface LastRefreshAllSummary {
 
 let refreshAllState: RefreshAllState | undefined;
 let lastRefreshAll: LastRefreshAllSummary | undefined;
+let activeRefreshAllPromise: Promise<void> | undefined;
+let refreshAllJobHookForTests: (() => void | Promise<void>) | undefined;
 
+export function setRefreshAllJobHookForTests(
+  hook: (() => void | Promise<void>) | undefined,
+): void {
+  refreshAllJobHookForTests = hook;
+}
+export function getActiveRefreshAllPromiseForTests():
+  | Promise<void>
+  | undefined {
+  return activeRefreshAllPromise;
+}
+
+export async function waitForRefreshAllCompletionForTests(): Promise<void> {
+  if (activeRefreshAllPromise) {
+    await activeRefreshAllPromise;
+  }
+}
 export function getRefreshAllStatus(): RefreshAllState {
   if (!refreshAllState) {
     return {
@@ -357,99 +375,43 @@ function sanitizeFailedPackError(
   return `${text.slice(0, MAX_FAILED_PACK_ERROR_LENGTH - 3)}...`;
 }
 
-export async function handleRefreshAllCommand(
+async function runRefreshAllJob(
   ctx: CommandContext,
-): Promise<boolean> {
-  if (!isAllowedTelegramUser(ctx.from?.id)) {
-    return false;
-  }
-
-  if (!ctx.telegram) {
-    await ctx.reply('Error: Telegram client is unavailable.');
-    return false;
-  }
-
-  if (refreshAllState?.running) {
-    await ctx.reply('Refresh all is already running.');
-    return false;
-  }
-
-  const startTime = Date.now();
-  refreshAllState = {
-    running: true,
-    cancelRequested: false,
-    total: 0,
-    processed: 0,
-    successful: 0,
-    failed: 0,
-    startedAt: startTime,
-  };
-
+  packNames: string[],
+  startTime: number,
+): Promise<void> {
+  const count = packNames.length;
+  let successful = 0;
+  const failedPacks: Array<{name: string; error: string}> = [];
   try {
-    let packNames: string[];
-    try {
-      packNames = await listLocalStickerPackNames();
-    } catch (err) {
-      console.error(
-        'Failed to list local sticker packs for /refresh_all:',
-        err,
-      );
-      lastRefreshAll = {
-        startedAt: startTime,
-        finishedAt: Date.now(),
-        durationMs: Date.now() - startTime,
-        total: 0,
-        refreshed: 0,
-        failed: 1,
-        skipped: 0,
-        outcome: 'failed',
-      };
-      await ctx.reply('Error: Unable to read local sticker packs.');
-      return false;
+    if (refreshAllJobHookForTests) {
+      await refreshAllJobHookForTests();
     }
-
-    if (packNames.length === 0) {
-      lastRefreshAll = {
-        startedAt: startTime,
-        finishedAt: Date.now(),
-        durationMs: Date.now() - startTime,
-        total: 0,
-        refreshed: 0,
-        failed: 0,
-        skipped: 0,
-        outcome: 'completed',
-      };
-      await ctx.reply('No local sticker packs to refresh.');
-      return true;
-    }
-    const count = packNames.length;
-    refreshAllState.total = count;
-
-    await ctx.reply(
-      `Refreshing ${count} sticker pack${count === 1 ? '' : 's'}...`,
-    );
-
-    let successful = 0;
-    const failedPacks: Array<{name: string; error: string}> = [];
 
     for (const packName of packNames) {
-      if (refreshAllState.cancelRequested) {
+      if (refreshAllState?.cancelRequested) {
         break;
       }
 
-      refreshAllState.currentPack = packName;
+      if (refreshAllState) {
+        refreshAllState.currentPack = packName;
+      }
       try {
-        const result = await refreshStickerPack(ctx.telegram, packName);
+        const result = await refreshStickerPack(ctx.telegram!, packName);
         if (result.success) {
           successful++;
-          refreshAllState.successful = successful;
+          if (refreshAllState) {
+            refreshAllState.successful = successful;
+          }
         } else {
           const cleanError = sanitizeFailedPackError(
             result.error,
             `Failed to refresh sticker pack "${packName}".`,
           );
           failedPacks.push({name: packName, error: cleanError});
-          refreshAllState.failed = failedPacks.length;
+          if (refreshAllState) {
+            refreshAllState.failed = failedPacks.length;
+          }
         }
       } catch (err) {
         console.error(`Unexpected failure refreshing pack "${packName}":`, err);
@@ -464,14 +426,19 @@ export async function handleRefreshAllCommand(
             `Failed to refresh sticker pack "${packName}".`,
           ),
         });
-        refreshAllState.failed = failedPacks.length;
+        if (refreshAllState) {
+          refreshAllState.failed = failedPacks.length;
+        }
       } finally {
-        refreshAllState.processed = successful + failedPacks.length;
-        refreshAllState.currentPack = undefined;
+        if (refreshAllState) {
+          refreshAllState.processed = successful + failedPacks.length;
+          refreshAllState.currentPack = undefined;
+        }
       }
     }
     const processed = successful + failedPacks.length;
-    const isCancelled = processed < count && refreshAllState.cancelRequested;
+    const isCancelled =
+      processed < count && (refreshAllState?.cancelRequested ?? false);
     const outcome = isCancelled ? 'cancelled' : 'completed';
 
     lastRefreshAll = {
@@ -526,23 +493,133 @@ export async function handleRefreshAllCommand(
       }
     }
 
-    await ctx.reply(lines.join('\n'));
-    return !isCancelled && failedPacks.length === 0;
+    try {
+      await ctx.reply(lines.join('\n'));
+    } catch (replyErr) {
+      console.error(
+        'Failed to send refresh all summary to Telegram:',
+        replyErr,
+      );
+    }
   } catch (err) {
+    console.error('Refresh all background job failed:', err);
     lastRefreshAll = {
       startedAt: startTime,
       finishedAt: Date.now(),
       durationMs: Date.now() - startTime,
-      total: refreshAllState?.total ?? 0,
-      refreshed: refreshAllState?.successful ?? 0,
-      failed: refreshAllState?.failed ?? 1,
-      skipped: 0,
+      total: count,
+      refreshed: successful,
+      failed: Math.max(1, failedPacks.length),
+      skipped: Math.max(0, count - (successful + failedPacks.length)),
       outcome: 'failed',
     };
-    throw err;
+    try {
+      await ctx.reply('Error: Refresh all operation failed unexpectedly.');
+    } catch (replyErr) {
+      console.error(
+        'Failed to send refresh all failure message to Telegram:',
+        replyErr,
+      );
+    }
   } finally {
     refreshAllState = undefined;
   }
+}
+
+function startRefreshAllJob(
+  ctx: CommandContext,
+  packNames: string[],
+  startTime: number,
+): void {
+  const promise = runRefreshAllJob(ctx, packNames, startTime)
+    .catch(err => {
+      console.error('Refresh all background job uncaught error:', err);
+    })
+    .finally(() => {
+      if (activeRefreshAllPromise === promise) {
+        activeRefreshAllPromise = undefined;
+      }
+    });
+  activeRefreshAllPromise = promise;
+}
+
+export async function handleRefreshAllCommand(
+  ctx: CommandContext,
+): Promise<boolean> {
+  if (!isAllowedTelegramUser(ctx.from?.id)) {
+    return false;
+  }
+
+  if (!ctx.telegram) {
+    await ctx.reply('Error: Telegram client is unavailable.');
+    return false;
+  }
+
+  if (refreshAllState?.running) {
+    await ctx.reply('Refresh all is already running.');
+    return false;
+  }
+
+  const startTime = Date.now();
+  refreshAllState = {
+    running: true,
+    cancelRequested: false,
+    total: 0,
+    processed: 0,
+    successful: 0,
+    failed: 0,
+    startedAt: startTime,
+  };
+
+  let packNames: string[];
+  try {
+    packNames = await listLocalStickerPackNames();
+  } catch (err) {
+    console.error('Failed to list local sticker packs for /refresh_all:', err);
+    lastRefreshAll = {
+      startedAt: startTime,
+      finishedAt: Date.now(),
+      durationMs: Date.now() - startTime,
+      total: 0,
+      refreshed: 0,
+      failed: 1,
+      skipped: 0,
+      outcome: 'failed',
+    };
+    refreshAllState = undefined;
+    await ctx.reply('Error: Unable to read local sticker packs.');
+    return false;
+  }
+
+  if (packNames.length === 0) {
+    lastRefreshAll = {
+      startedAt: startTime,
+      finishedAt: Date.now(),
+      durationMs: Date.now() - startTime,
+      total: 0,
+      refreshed: 0,
+      failed: 0,
+      skipped: 0,
+      outcome: 'completed',
+    };
+    refreshAllState = undefined;
+    await ctx.reply('No local sticker packs to refresh.');
+    return true;
+  }
+  const count = packNames.length;
+  refreshAllState.total = count;
+
+  try {
+    await ctx.reply(
+      `Refreshing ${count} sticker pack${count === 1 ? '' : 's'}...`,
+    );
+  } catch (err) {
+    refreshAllState = undefined;
+    throw err;
+  }
+
+  startRefreshAllJob(ctx, packNames, startTime);
+  return true;
 }
 
 export async function handleCheckCommand(

@@ -147,6 +147,8 @@ const {
   importOrGetStickerPack,
   refreshStickerPack,
   resetLastRefreshAllForTests,
+  setRefreshAllJobHookForTests,
+  waitForRefreshAllCompletionForTests,
 } = await import('../src/utils/stickerPackCommands.js');
 const {listLocalStickerPackNames} = await import(
   '../src/utils/stickerPackCatalog.js'
@@ -6806,6 +6808,9 @@ const mockTelegram = {
       ],
     };
   },
+  getFile: async () => ({
+    file_path: 'documents/file.webp',
+  }),
   getFileLink: async () => new URL('https://example.com/file.webp'),
 } as unknown as Telegram;
 // Case 1: Already downloaded local pack -> returns URL without downloading
@@ -9090,18 +9095,18 @@ try {
 
   const allPacksList = await listLocalStickerPackNames();
   const multiResult = await handleRefreshAllCommand(ctxMulti);
+  assert.equal(
+    multiResult,
+    true,
+    'handleRefreshAllCommand must return true after starting the batch job',
+  );
+  await waitForRefreshAllCompletionForTests();
 
   assert.equal(
     maxActiveRefreshes,
     1,
     'Pack-level refresh concurrency must be strictly 1 (sequential)',
   );
-  assert.equal(
-    multiResult,
-    false,
-    'handleRefreshAllCommand must return false when any pack fails',
-  );
-
   assert.ok(
     ctxMulti.replies.some(r => r.startsWith('Refreshing ')),
     'Must send initial refreshing notification',
@@ -9200,7 +9205,8 @@ try {
     telegram: mockGuardTg,
   });
 
-  const run1Promise = handleRefreshAllCommand(ctxGuard1);
+  const run1Handled = await handleRefreshAllCommand(ctxGuard1);
+  assert.equal(run1Handled, true, 'First /refresh_all must be accepted');
   await firstStickerSetStarted;
 
   const run2Handled = await handleRefreshAllCommand(ctxGuard2);
@@ -9215,7 +9221,7 @@ try {
   );
 
   releaseFirstStickerSetResolve!();
-  await run1Promise;
+  await waitForRefreshAllCompletionForTests();
 
   assert.ok(
     ctxGuard1.replies.some(r => r.includes('Refresh all finished.')),
@@ -9229,6 +9235,7 @@ try {
   });
   const run3Handled = await handleRefreshAllCommand(ctxGuard3);
   assert.equal(typeof run3Handled, 'boolean');
+  await waitForRefreshAllCompletionForTests();
   assert.equal(
     ctxGuard3.replies.some(r => r.includes('Refresh all is already running.')),
     false,
@@ -9352,8 +9359,8 @@ console.log(
       telegram: mockProgressTg,
     });
 
-    const batchPromise = handleRefreshAllCommand(ctxProgressBatch);
-
+    const batchHandled = await handleRefreshAllCommand(ctxProgressBatch);
+    assert.equal(batchHandled, true);
     // Wait until Pack B starts (after all packs before B have been processed)
     await packBStarted;
 
@@ -9413,14 +9420,9 @@ console.log(
 
     // Release Pack B (which throws an error)
     releasePackBResolve();
-    const batchResult = await batchPromise;
+    await waitForRefreshAllCompletionForTests();
 
     // Test 3: Pack B failed, but Pack C was still processed
-    assert.equal(
-      batchResult,
-      false,
-      'Batch must return false because Pack B failed',
-    );
     assert.ok(
       processedInOrder.includes(progPackC),
       'Pack C must be processed even though Pack B failed',
@@ -9527,7 +9529,8 @@ console.log(
       telegram: mockCancelTg,
     });
 
-    const batchPromise = handleRefreshAllCommand(ctxCancelBatch);
+    const batchHandled = await handleRefreshAllCommand(ctxCancelBatch);
+    assert.equal(batchHandled, true);
     await cancelPackBStarted;
 
     // While Pack B is active:
@@ -9597,9 +9600,7 @@ console.log(
 
     // Release Pack B
     releaseCancelPackBResolve();
-    const batchResult = await batchPromise;
-    assert.equal(batchResult, false, 'Cancelled batch must return false');
-
+    await waitForRefreshAllCompletionForTests();
     // Test 5: Verify Pack B completed and no subsequent packs started after cancellation
     assert.ok(
       finishedPacks.includes(cancelPackB),
@@ -9793,6 +9794,489 @@ console.log(
   }
 }
 
+// =========================================================================
+// Section: Detached /refresh_all asynchronous lifecycle, barrier tests, and safety invariants
+// =========================================================================
+console.log(
+  'Testing detached /refresh_all asynchronous lifecycle, barrier tests, and safety invariants...',
+);
+
+// Regression Test 1, 2, 3, 5, 8, 9:
+// Proves command handler resolves quickly with initial acknowledgement while bulk job is still pending on barrier
+{
+  const asyncPackA = 'AsyncLifecyclePackA';
+  const asyncPackB = 'AsyncLifecyclePackB';
+
+  for (const p of [asyncPackA, asyncPackB]) {
+    const pDir = generateStickerPackDirPath(p);
+    const pPath = generateStickerPackFilePath(p);
+    await fsp.mkdir(pDir, {recursive: true});
+    await fsp.writeFile(
+      pPath,
+      JSON.stringify({
+        id: `MoreStickers:Telegram:Pack:${p}`,
+        title: `Title ${p}`,
+        stickers: [],
+        dynamic: {
+          version: 1,
+          refreshUrl: `https://example.com/stickerpack/telegram/${p}`,
+        },
+      }),
+    );
+  }
+
+  let packAStartedResolve!: () => void;
+  const packAStarted = new Promise<void>(resolve => {
+    packAStartedResolve = resolve;
+  });
+  let releasePackAResolve!: () => void;
+  const releasePackA = new Promise<void>(resolve => {
+    releasePackAResolve = resolve;
+  });
+
+  const packsRefreshed: string[] = [];
+
+  const mockAsyncTg = {
+    getStickerSet: async (name: string) => {
+      packsRefreshed.push(name);
+      if (name === asyncPackA) {
+        packAStartedResolve();
+        await releasePackA;
+      }
+      return {
+        name,
+        title: `Refreshed ${name}`,
+        stickers: [
+          {
+            file_id: `file-${name}-async`,
+            file_unique_id: `uniq-${name}-async`,
+            emoji: '⚡',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    },
+    getFile: async () => ({
+      file_path: 'documents/file.webp',
+    }),
+    getFileLink: async () => new URL('https://example.com/file.webp'),
+  } as unknown as Telegram;
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    const ctxAsync = createMockContext({
+      userId: allowedUserId,
+      telegram: mockAsyncTg,
+    });
+
+    // 1. Invoke handleRefreshAllCommand - MUST resolve BEFORE bulk job completes
+    const handlerPromise = handleRefreshAllCommand(ctxAsync);
+    const handled = await handlerPromise;
+    assert.equal(
+      handled,
+      true,
+      'handleRefreshAllCommand must resolve true immediately after initial reply',
+    );
+
+    // 2. Initial acknowledgement MUST have been sent before handler resolved
+    assert.equal(
+      ctxAsync.replies.length,
+      1,
+      'Must have sent exactly 1 reply (initial notification)',
+    );
+    assert.ok(
+      ctxAsync.replies[0]?.startsWith('Refreshing '),
+      `Initial reply must start with "Refreshing ", got: ${ctxAsync.replies[0]}`,
+    );
+
+    // 3. Wait until Pack A hits the barrier in the background job
+    await packAStarted;
+
+    // 4. Invariant: While Pack A is blocked, the background job is RUNNING in process-local state
+    const runningStatus = getRefreshAllStatus();
+    assert.equal(
+      runningStatus.running,
+      true,
+      'Refresh all state must be running=true while job is pending in background',
+    );
+    assert.equal(
+      runningStatus.currentPack,
+      asyncPackA,
+      'currentPack must reflect the currently processing pack',
+    );
+
+    // 5. Invariant: /status command reports "Refresh all: running" while handler has already resolved
+    const ctxStatus = createMockContext({userId: allowedUserId});
+    await handleStatusCommand(ctxStatus);
+    const statusText = ctxStatus.replies[0] ?? '';
+    assert.ok(
+      statusText.includes('Refresh all: running'),
+      '/status must report running state while background job is pending',
+    );
+    assert.ok(
+      statusText.includes(`Current: ${asyncPackA}`),
+      '/status must show current pack in progress',
+    );
+
+    // 6. Invariant: Test 3 - Concurrent /refresh_all is rejected while detached job is active
+    const ctxConcurrent = createMockContext({
+      userId: allowedUserId,
+      telegram: mockAsyncTg,
+    });
+    const concurrentResult = await handleRefreshAllCommand(ctxConcurrent);
+    assert.equal(
+      concurrentResult,
+      false,
+      'Concurrent /refresh_all must be rejected while detached job is active',
+    );
+    assert.ok(
+      ctxConcurrent.replies.some(r =>
+        r.includes('Refresh all is already running.'),
+      ),
+      'Concurrent call must receive already running warning',
+    );
+
+    // 7. Release Pack A and await completion of the background job
+    releasePackAResolve();
+    await waitForRefreshAllCompletionForTests();
+
+    // 8. Post-completion invariants: running=false, summary sent, lastRefreshAll recorded
+    const completedStatus = getRefreshAllStatus();
+    assert.equal(
+      completedStatus.running,
+      false,
+      'running state must return to false after completion',
+    );
+
+    const lastRun = getLastRefreshAll();
+    assert.ok(lastRun !== undefined, 'lastRefreshAll must be recorded');
+    assert.equal(
+      lastRun.outcome,
+      'completed',
+      'lastRefreshAll outcome must be completed',
+    );
+    assert.ok(lastRun.refreshed >= 2, 'Must have refreshed at least 2 packs');
+    assert.ok(
+      packsRefreshed.includes(asyncPackA),
+      'Must have refreshed AsyncLifecyclePackA',
+    );
+    assert.ok(
+      packsRefreshed.includes(asyncPackB),
+      'Must have refreshed AsyncLifecyclePackB',
+    );
+    const summaryReply = ctxAsync.replies.find(r =>
+      r.includes('Refresh all finished.'),
+    );
+    assert.ok(summaryReply, 'Final summary reply must be delivered to chat');
+    assert.ok(
+      summaryReply.includes('Successful:'),
+      'Final summary must report successful count',
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+}
+
+// Regression Test 4: Immediate cancellation on detached background job
+{
+  const cancelDetachedA = 'CancelDetachedPackA';
+  const cancelDetachedB = 'CancelDetachedPackB';
+
+  for (const p of [cancelDetachedA, cancelDetachedB]) {
+    const pDir = generateStickerPackDirPath(p);
+    const pPath = generateStickerPackFilePath(p);
+    await fsp.mkdir(pDir, {recursive: true});
+    await fsp.writeFile(
+      pPath,
+      JSON.stringify({
+        id: `MoreStickers:Telegram:Pack:${p}`,
+        title: `Title ${p}`,
+        stickers: [],
+        dynamic: {
+          version: 1,
+          refreshUrl: `https://example.com/stickerpack/telegram/${p}`,
+        },
+      }),
+    );
+  }
+
+  let packAStartedResolve!: () => void;
+  const packAStarted = new Promise<void>(resolve => {
+    packAStartedResolve = resolve;
+  });
+  let releasePackAResolve!: () => void;
+  const releasePackA = new Promise<void>(resolve => {
+    releasePackAResolve = resolve;
+  });
+
+  const startedPacks: string[] = [];
+
+  const mockCancelTg = {
+    getStickerSet: async (name: string) => {
+      startedPacks.push(name);
+      if (name === cancelDetachedA) {
+        packAStartedResolve();
+        await releasePackA;
+      }
+      return {
+        name,
+        title: `Refreshed ${name}`,
+        stickers: [
+          {
+            file_id: `file-${name}-cd`,
+            file_unique_id: `uniq-${name}-cd`,
+            emoji: '🛑',
+            is_animated: false,
+            is_video: false,
+          },
+        ],
+      };
+    },
+    getFile: async () => ({
+      file_path: 'documents/file.webp',
+    }),
+    getFileLink: async () => new URL('https://example.com/file.webp'),
+  } as unknown as Telegram;
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    const ctxBatch = createMockContext({
+      userId: allowedUserId,
+      telegram: mockCancelTg,
+    });
+
+    const handled = await handleRefreshAllCommand(ctxBatch);
+    assert.equal(handled, true);
+
+    await packAStarted;
+
+    // Immediately request cancellation while Pack A is still running
+    const ctxCancel = createMockContext({userId: allowedUserId});
+    const cancelHandled = await handleRefreshAllCancelCommand(ctxCancel);
+    assert.equal(cancelHandled, true);
+    assert.ok(
+      ctxCancel.replies[0]?.includes('Refresh all cancellation requested.'),
+    );
+    assert.equal(getRefreshAllStatus().cancelRequested, true);
+
+    // Release Pack A
+    releasePackAResolve();
+    await waitForRefreshAllCompletionForTests();
+
+    // Verification
+    assert.equal(getRefreshAllStatus().running, false);
+    const lastCancelRun = getLastRefreshAll();
+    assert.ok(lastCancelRun !== undefined);
+    assert.equal(lastCancelRun.outcome, 'cancelled');
+    assert.ok(!startedPacks.includes(cancelDetachedB));
+
+    const cancelSummary = ctxBatch.replies.find(r =>
+      r.includes('Refresh all cancelled.'),
+    );
+    assert.ok(cancelSummary, 'Must deliver cancellation summary');
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+}
+
+// Regression Test 6: Final reply failure does not crash job or leave state dirty
+{
+  const packReplyTest = 'ReplyFailPack';
+  const pDir = generateStickerPackDirPath(packReplyTest);
+  const pPath = generateStickerPackFilePath(packReplyTest);
+  await fsp.mkdir(pDir, {recursive: true});
+  await fsp.writeFile(
+    pPath,
+    JSON.stringify({
+      id: `MoreStickers:Telegram:Pack:${packReplyTest}`,
+      title: `Title ${packReplyTest}`,
+      stickers: [],
+      dynamic: {
+        version: 1,
+        refreshUrl: `https://example.com/stickerpack/telegram/${packReplyTest}`,
+      },
+    }),
+  );
+
+  const mockTg = {
+    getStickerSet: async (name: string) => ({
+      name,
+      title: `Refreshed ${name}`,
+      stickers: [
+        {
+          file_id: `file-${name}-rf`,
+          file_unique_id: `uniq-${name}-rf`,
+          emoji: '📨',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+    getFile: async () => ({
+      file_path: 'documents/file.webp',
+    }),
+    getFileLink: async () => new URL('https://example.com/file.webp'),
+  } as unknown as Telegram;
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    let replyCount = 0;
+    const ctxThrowingFinalReply = {
+      from: {id: allowedUserId},
+      telegram: mockTg,
+      reply: async () => {
+        replyCount++;
+        if (replyCount > 1) {
+          throw new Error('Simulated Telegram network drop on final summary');
+        }
+        return {};
+      },
+    };
+
+    const handled = await handleRefreshAllCommand(ctxThrowingFinalReply);
+    assert.equal(handled, true, 'Handler must resolve true');
+
+    // Wait for detached job to complete despite final reply error
+    await waitForRefreshAllCompletionForTests();
+
+    assert.equal(
+      getRefreshAllStatus().running,
+      false,
+      'running must be false even if final reply fails',
+    );
+    const lastRun = getLastRefreshAll();
+    assert.ok(lastRun !== undefined);
+    assert.equal(
+      lastRun.outcome,
+      'completed',
+      'lastRefreshAll outcome must be completed despite final reply failure',
+    );
+  } finally {
+    globalThis.fetch = savedFetch;
+  }
+}
+
+// Regression Test 7: Unexpected fatal outer error inside background job sets outcome failed and cleans up
+{
+  const packFatalTest = 'FatalFailPack';
+  const pDir = generateStickerPackDirPath(packFatalTest);
+  const pPath = generateStickerPackFilePath(packFatalTest);
+  await fsp.mkdir(pDir, {recursive: true});
+  await fsp.writeFile(
+    pPath,
+    JSON.stringify({
+      id: `MoreStickers:Telegram:Pack:${packFatalTest}`,
+      title: `Title ${packFatalTest}`,
+      stickers: [],
+      dynamic: {
+        version: 1,
+        refreshUrl: `https://example.com/stickerpack/telegram/${packFatalTest}`,
+      },
+    }),
+  );
+
+  const mockFatalTg = {
+    getStickerSet: async (name: string) => ({
+      name,
+      title: `Refreshed ${name}`,
+      stickers: [
+        {
+          file_id: `file-${name}-ff`,
+          file_unique_id: `uniq-${name}-ff`,
+          emoji: '💥',
+          is_animated: false,
+          is_video: false,
+        },
+      ],
+    }),
+    getFile: async () => ({file_path: 'documents/file.webp'}),
+    getFileLink: async () => new URL('https://example.com/file.webp'),
+  } as unknown as Telegram;
+
+  const savedFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(sampleWebpBuffer, {
+      status: 200,
+      headers: {'Content-Type': 'image/webp'},
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    // Inject a fatal outer error escaping per-pack try/catch inside runRefreshAllJob
+    setRefreshAllJobHookForTests(() => {
+      throw new Error('Fatal unexpected outer exception in background job');
+    });
+
+    const ctxFatal = createMockContext({
+      userId: allowedUserId,
+      telegram: mockFatalTg,
+    });
+
+    const handled = await handleRefreshAllCommand(ctxFatal);
+    assert.equal(
+      handled,
+      true,
+      'Handler must resolve true and start detached job',
+    );
+
+    // Wait for the background job to complete its failure lifecycle
+    await waitForRefreshAllCompletionForTests();
+
+    // Invariants:
+    // 1. Process-local running state must be cleaned up to false
+    assert.equal(
+      getRefreshAllStatus().running,
+      false,
+      'State must be cleared after fatal background job failure',
+    );
+
+    // 2. lastRefreshAll must record outcome 'failed'
+    const lastRun = getLastRefreshAll();
+    assert.ok(lastRun !== undefined, 'lastRefreshAll must be recorded');
+    assert.equal(
+      lastRun.outcome,
+      'failed',
+      'lastRefreshAll outcome must be "failed" upon outer background job failure',
+    );
+    assert.ok(
+      lastRun.failed >= 1,
+      'lastRefreshAll failed count must be at least 1',
+    );
+
+    // 3. Bot sends failure notification to chat
+    assert.ok(
+      ctxFatal.replies.some(r =>
+        r.includes('Error: Refresh all operation failed unexpectedly.'),
+      ),
+      'Must notify user of unexpected bulk failure',
+    );
+  } finally {
+    setRefreshAllJobHookForTests(undefined);
+    globalThis.fetch = savedFetch;
+  }
+}
 // =========================================================================
 // Comprehensive test suite for /gc, /gc_dry, /gc_stats and unified GC engine
 // =========================================================================
@@ -11748,6 +12232,7 @@ console.log(
     telegram: mockTelegram as unknown as Telegram,
   });
   await handleRefreshAllCommand(ctxEmptyRefresh);
+  await waitForRefreshAllCompletionForTests();
   const lastRefresh = getLastRefreshAll();
   assert.ok(lastRefresh !== undefined);
   assert.equal(lastRefresh.outcome, 'completed');

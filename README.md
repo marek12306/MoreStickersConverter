@@ -94,6 +94,8 @@ Refreshes a single sticker pack from Telegram. It re-downloads the source sticke
 
 #### `/refresh_all`
 An administrative command that reads all locally known sticker packs from local manifests and refreshes them sequentially (`pack-level concurrency = 1`) using the exact same core pipeline as `/refresh`.
+* Bulk refresh runs as a process-local asynchronous job after the initial Telegram acknowledgement, so long refreshes are not tied to the lifetime of a single Telegram update handler.
+* `/status` and `/refresh_all_cancel` remain available while the job is running.
 * Refreshes run one pack at a time; an error in one pack does not stop processing of the remaining packs.
 * When finished, it replies with a summary showing total, successful, and failed packs.
 * Concurrent `/refresh_all` invocations are rejected with `Refresh all is already running.`.
