@@ -108,7 +108,15 @@ export async function importOrGetStickerPack(
     try {
       await downloadStickerPack(telegram, stickerSet);
     } catch (e) {
-      await ctx.reply('StickerPack download error.');
+      console.error(
+        `Sticker pack "${stickerSet.name}" download/conversion failed:`,
+        e,
+      );
+      await ctx.reply(
+        `StickerPack download error: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
       return false;
     }
 

@@ -638,6 +638,10 @@ async function downloadWorker(
     try {
       await downloadSingleSticker(sticker, telegram, stickerSet);
     } catch (err) {
+      console.error(
+        `Sticker "${sticker.file_unique_id}" from pack "${stickerSet.name}" failed:`,
+        err,
+      );
       if (state.error === undefined) {
         state.error = err;
       }
