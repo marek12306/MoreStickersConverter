@@ -58,8 +58,8 @@ export async function probeWebmSourceFps(
     const stream = parsed.streams?.[0];
     if (!stream) return undefined;
     return (
-      parseFrameRate(stream.avg_frame_rate) ??
-      parseFrameRate(stream.r_frame_rate)
+      parseFrameRate(stream.r_frame_rate) ??
+      parseFrameRate(stream.avg_frame_rate)
     );
   } catch {
     return undefined;
