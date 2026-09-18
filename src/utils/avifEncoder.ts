@@ -77,7 +77,11 @@ function getDuration(
   frameCount: number,
   fps: number,
 ): number {
-  return parsePositiveNumber(stream.duration) || frameCount / fps;
+  if (frameCount > 0 && fps > 0) {
+    return frameCount / fps;
+  }
+
+  return parsePositiveNumber(stream.duration);
 }
 
 export function buildAvifFilter(
