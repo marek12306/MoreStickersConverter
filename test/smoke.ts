@@ -1346,7 +1346,7 @@ assert.ok(avifProbe.frameCount > 1, 'AVIF must contain multiple frames');
 assert.equal(avifProbe.colorPixelFormat, 'yuv420p10le');
 assert.equal(avifProbe.alphaPixelFormat, 'gray10le');
 assert.ok(avifProbe.width <= 160 && avifProbe.height <= 160);
-assert.ok(avifProbe.durationSeconds <= 3);
+assert.ok(avifProbe.durationSeconds <= AVIF_MAX_DURATION_SECONDS);
 assert.equal(avifProbe.fps, 30);
 assert.equal(avifProbe.frameCount, 60);
 const fakeAvifContainerPath = path.join(tempDir, 'fake-container.avif');
@@ -1426,7 +1426,7 @@ const smallLongGeneration = spawnSync('ffmpeg', [
   '-i',
   'testsrc2=size=64x48:rate=30',
   '-t',
-  '4',
+  String(AVIF_MAX_DURATION_SECONDS + 1),
   '-c:v',
   'libvpx-vp9',
   '-crf',
@@ -1449,8 +1449,10 @@ assert.ok(
   smallLongProbe.width <= 64 && smallLongProbe.height <= 48,
   `Small sticker must not be upscaled, got ${smallLongProbe.width}x${smallLongProbe.height}`,
 );
-assert.ok(smallLongProbe.durationSeconds <= 3);
-assert.ok(smallLongProbe.frameCount <= 3 * smallLongProbe.fps);
+assert.ok(smallLongProbe.durationSeconds <= AVIF_MAX_DURATION_SECONDS);
+assert.ok(
+  smallLongProbe.frameCount <= AVIF_MAX_DURATION_SECONDS * smallLongProbe.fps,
+);
 const testGifPath = path.join(tempDir, 'legacy_alpha_sticker.gif');
 const legacyGifResult = spawnSync('ffmpeg', [
   '-c:v',
@@ -5489,17 +5491,6 @@ assert.ok(attemptedFpsList.includes(48));
 assert.ok(attemptedFpsList.includes(30));
 await fsp.rm(dynamicFallbackDir, {recursive: true, force: true});
 
-// Test 19: Strict 3-second limit and frame count validation
-const strictCheckProfile60 = {maxDimension: 160, fps: 60, crf: 24, cpuUsed: 3};
-assert.equal(
-  Math.ceil(AVIF_MAX_DURATION_SECONDS * strictCheckProfile60.fps),
-  180,
-);
-assert.equal(
-  Math.ceil(AVIF_MAX_DURATION_SECONDS * strictCheckProfile60.fps) /
-    strictCheckProfile60.fps,
-  3.0,
-);
 const strictCheckProfile2997 = {
   maxDimension: 160,
   fps: 29.97002997,

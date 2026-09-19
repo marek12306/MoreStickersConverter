@@ -89,9 +89,10 @@ export function buildAvifFilter(
   branch: AvifFilterBranch,
 ): string {
   const timed = [
-    `trim=duration=${AVIF_MAX_DURATION_SECONDS}`,
     'setpts=PTS-STARTPTS',
-    `fps=${profile.fps}`,
+    `fps=${profile.fps}:start_time=0`,
+    `trim=end=${AVIF_MAX_DURATION_SECONDS}`,
+    'setpts=PTS-STARTPTS',
   ].join(',');
   const scale = `scale=w='min(${profile.maxDimension},iw)':h='min(${profile.maxDimension},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos`;
   return branch === 'color'
