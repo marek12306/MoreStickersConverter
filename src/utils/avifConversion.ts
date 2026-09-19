@@ -10,8 +10,8 @@ export interface AvifEncodingProfile {
 }
 
 export const AVIF_HARD_LIMIT_BYTES = 5 * 1024 * 1024;
-export const AVIF_MAX_DURATION_SECONDS = 3;
-export const AVIF_DEFAULT_FPS = 24;
+export const AVIF_MAX_DURATION_SECONDS = 4;
+export const AVIF_DEFAULT_FPS = 30;
 export const TGS_MAX_FPS = 60;
 export const WEBM_MAX_FPS = 30;
 export const TGS_FPS_FALLBACKS: readonly number[] = [60, 48, 30, 24, 20, 16];
