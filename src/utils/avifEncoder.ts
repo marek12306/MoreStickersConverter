@@ -206,38 +206,105 @@ export function buildAvifMuxArgs(
   ];
 }
 
+export function buildDirectAnimatedAvifArgs(
+  inputArgs: readonly string[],
+  outputPath: string,
+  profile: AvifEncodingProfile,
+): string[] {
+  return [
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-filter_threads',
+    '1',
+
+    ...inputArgs,
+
+    // Map the same source twice:
+    // stream 0 = color
+    // stream 1 = alpha mask
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:v:0',
+
+    // Color stream
+    '-filter:v:0',
+    buildAvifFilter(profile, 'color'),
+
+    // Alpha stream
+    '-filter:v:1',
+    buildAvifFilter(profile, 'alpha'),
+
+    '-an',
+
+    // Color AV1 encoder
+    '-c:v:0',
+    'libaom-av1',
+    '-b:v:0',
+    '0',
+    '-cpu-used:v:0',
+    String(profile.cpuUsed),
+    '-usage:v:0',
+    'good',
+    '-tune:v:0',
+    'ssim',
+    '-threads:v:0',
+    '1',
+    '-row-mt:v:0',
+    '0',
+    '-tiles:v:0',
+    '1x1',
+    '-crf:v:0',
+    String(profile.crf),
+
+    // Alpha AV1 encoder
+    '-c:v:1',
+    'libaom-av1',
+    '-b:v:1',
+    '0',
+    '-cpu-used:v:1',
+    String(profile.cpuUsed),
+    '-usage:v:1',
+    'good',
+    '-tune:v:1',
+    'ssim',
+    '-threads:v:1',
+    '1',
+    '-row-mt:v:1',
+    '0',
+    '-tiles:v:1',
+    '1x1',
+    '-crf:v:1',
+    '0',
+    '-aq-mode:v:1',
+    '0',
+    '-enable-restoration:v:1',
+    '0',
+    '-aom-params:v:1',
+    'lossless=1',
+
+    '-loop',
+    '0',
+    '-f',
+    'avif',
+    '-y',
+    outputPath,
+  ];
+}
+
 export async function encodeAnimatedAvif(
   input: AvifInput,
   outputPath: string,
   profile: AvifEncodingProfile,
 ): Promise<void> {
-  const conversionId = randomUUID();
-  const outputDir = path.dirname(outputPath);
-  const colorPath = path.join(outputDir, `.avif-color-${conversionId}.ivf`);
-  const alphaPath = path.join(outputDir, `.avif-alpha-${conversionId}.ivf`);
-
-  try {
-    await runMediaProcess(
-      'ffmpeg',
-      buildColorFfmpegArgs(input.args, colorPath, profile),
-      `${input.description} color encode (profile: ${JSON.stringify(profile)})`,
-    );
-    await runMediaProcess(
-      'ffmpeg',
-      buildAlphaFfmpegArgs(input.args, alphaPath, profile),
-      `${input.description} alpha encode (profile: ${JSON.stringify(profile)})`,
-    );
-    await runMediaProcess(
-      'ffmpeg',
-      buildAvifMuxArgs(colorPath, alphaPath, outputPath),
-      `${input.description} AVIF mux`,
-    );
-  } finally {
-    await Promise.all([
-      fsp.unlink(colorPath).catch(() => undefined),
-      fsp.unlink(alphaPath).catch(() => undefined),
-    ]);
-  }
+  await runMediaProcess(
+    'ffmpeg',
+    buildDirectAnimatedAvifArgs(input.args, outputPath, profile),
+    `${input.description} animated AVIF encode (profile: ${JSON.stringify(
+      profile,
+    )})`,
+  );
 }
 
 interface AnimatedAvifInspection {
