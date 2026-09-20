@@ -349,19 +349,36 @@ async function inspectAnimatedAvif(
   const majorBrand = document.format?.tags?.major_brand ?? '';
   const compatibleBrands = document.format?.tags?.compatible_brands ?? '';
 
-  const avifStreams = (document.streams ?? []).filter(
-    stream =>
-      stream.codec_type === 'video' &&
-      stream.codec_name === 'av1' &&
-      getFrameCount(stream) >= 1,
-  );
+  if (
+    !formatName.split(',').includes('mov') ||
+    !compatibleBrands.includes('avif') ||
+    (majorBrand !== 'avis' && majorBrand !== 'avif')
+  ) {
+    throw new Error(
+      `AVIF "${outputPath}" has invalid container format=${formatName}, major_brand=${majorBrand}, compatible_brands=${compatibleBrands}`,
+    );
+  }
+
+  const isAnimatedContainer = majorBrand === 'avis';
+
+  const avifStreams = (document.streams ?? []).filter(stream => {
+    if (stream.codec_type !== 'video' || stream.codec_name !== 'av1') {
+      return false;
+    }
+
+    const frameCount = getFrameCount(stream);
+
+    return isAnimatedContainer ? frameCount > 1 : frameCount === 1;
+  });
 
   const color = avifStreams.find(stream => !stream.pix_fmt?.startsWith('gray'));
   const alpha = avifStreams.find(stream => stream.pix_fmt?.startsWith('gray'));
 
   if (!color || !alpha) {
     throw new Error(
-      `AVIF "${outputPath}" must contain separate AV1 color and alpha streams`,
+      isAnimatedContainer
+        ? `Animated AVIF "${outputPath}" must contain separate animated AV1 color and alpha streams`
+        : `Static AVIF "${outputPath}" must contain separate single-frame AV1 color and alpha streams`,
     );
   }
 
