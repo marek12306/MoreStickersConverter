@@ -33,7 +33,7 @@ export function extractTgsSourceFps(rawJson: unknown): number | undefined {
   if (typeof data.fr === 'number' && Number.isFinite(data.fr)) {
     if (data.fr > 0 && data.fr < 1) {
       throw new Error(
-        `Unsupported source frame rate (${data.fr} FPS): animated AVIF conversion requires >= 1 FPS to satisfy the 3-second duration limit`,
+        `Unsupported source frame rate (${data.fr} FPS): animated AVIF conversion requires >= 1 FPS to satisfy the ${AVIF_MAX_DURATION_SECONDS}-second duration limit`,
       );
     }
     if (data.fr >= 1) {

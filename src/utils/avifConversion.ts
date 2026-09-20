@@ -60,7 +60,7 @@ export function buildFpsCandidates(
     sourceFps < 1
   ) {
     throw new Error(
-      `Unsupported source frame rate (${sourceFps} FPS): animated AVIF conversion requires >= 1 FPS to satisfy the 3-second duration limit`,
+      `Unsupported source frame rate (${sourceFps} FPS): animated AVIF conversion requires >= 1 FPS to satisfy the ${AVIF_MAX_DURATION_SECONDS}-second duration limit`,
     );
   }
 
@@ -123,9 +123,10 @@ export function buildAvifEncodingProfiles(
 }
 
 export const AVIF_ENCODING_PROFILES: readonly AvifEncodingProfile[] = [
-  {maxDimension: 160, fps: 24, crf: 24, cpuUsed: 3},
-  {maxDimension: 160, fps: 24, crf: 28, cpuUsed: 3},
-  {maxDimension: 160, fps: 24, crf: 32, cpuUsed: 3},
+  {maxDimension: 160, fps: 30, crf: 24, cpuUsed: 3},
+  {maxDimension: 160, fps: 30, crf: 28, cpuUsed: 3},
+  {maxDimension: 160, fps: 30, crf: 32, cpuUsed: 3},
+  {maxDimension: 160, fps: 30, crf: 36, cpuUsed: 3},
   {maxDimension: 160, fps: 24, crf: 36, cpuUsed: 3},
   {maxDimension: 160, fps: 20, crf: 36, cpuUsed: 3},
   {maxDimension: 160, fps: 16, crf: 36, cpuUsed: 3},

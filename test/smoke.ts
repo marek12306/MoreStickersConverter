@@ -268,14 +268,15 @@ console.log('Verified: createEtag and ifNoneMatchMatches contract passed');
 assert.deepEqual(
   AVIF_ENCODING_PROFILES,
   [
-    {maxDimension: 160, fps: 24, crf: 24, cpuUsed: 3},
-    {maxDimension: 160, fps: 24, crf: 28, cpuUsed: 3},
-    {maxDimension: 160, fps: 24, crf: 32, cpuUsed: 3},
+    {maxDimension: 160, fps: 30, crf: 24, cpuUsed: 3},
+    {maxDimension: 160, fps: 30, crf: 28, cpuUsed: 3},
+    {maxDimension: 160, fps: 30, crf: 32, cpuUsed: 3},
+    {maxDimension: 160, fps: 30, crf: 36, cpuUsed: 3},
     {maxDimension: 160, fps: 24, crf: 36, cpuUsed: 3},
     {maxDimension: 160, fps: 20, crf: 36, cpuUsed: 3},
     {maxDimension: 160, fps: 16, crf: 36, cpuUsed: 3},
   ],
-  'AVIF profiles must exhaust 24 fps quality before FPS fallbacks',
+  'AVIF profiles must exhaust 30 fps quality before FPS fallbacks',
 );
 assert.equal(
   PREVIEW_TARGET_BYTES,
@@ -5289,7 +5290,7 @@ console.log(
 console.log('Testing P0 — Source-dependent FPS ladder and rational parsing...');
 
 // Verify constants
-assert.equal(AVIF_DEFAULT_FPS, 24);
+assert.equal(AVIF_DEFAULT_FPS, 30);
 assert.equal(TGS_MAX_FPS, 60);
 assert.equal(WEBM_MAX_FPS, 30);
 assert.deepEqual(TGS_FPS_FALLBACKS, [60, 48, 30, 24, 20, 16]);
@@ -5384,36 +5385,36 @@ const webm2997Candidates = buildFpsCandidates(
 assert.ok(Math.abs(webm2997Candidates[0] - 29.97002997) < 0.0001);
 assert.deepEqual(webm2997Candidates.slice(1), [24, 20, 16]);
 
-// Test 13: invalid ffprobe FPS uses 24 FPS fallback
+// Test 13: invalid ffprobe FPS uses default FPS fallback
 assert.deepEqual(
   buildFpsCandidates(parseFrameRate('0/0'), 'webm'),
-  [24, 20, 16],
+  [30, 24, 20, 16],
 );
 assert.deepEqual(
   buildFpsCandidates(parseFrameRate('N/A'), 'webm'),
-  [24, 20, 16],
+  [30, 24, 20, 16],
 );
 assert.deepEqual(
   buildFpsCandidates(parseFrameRate('invalid'), 'webm'),
-  [24, 20, 16],
+  [30, 24, 20, 16],
 );
 
-// Test 14: invalid TGS fr uses 24 FPS fallback
+// Test 14: invalid TGS fr uses default FPS fallback
 assert.deepEqual(
   buildFpsCandidates(extractTgsSourceFps({fr: 0}), 'tgs'),
-  [24, 20, 16],
+  [30, 24, 20, 16],
 );
 assert.deepEqual(
   buildFpsCandidates(extractTgsSourceFps({fr: -1}), 'tgs'),
-  [24, 20, 16],
+  [30, 24, 20, 16],
 );
 assert.deepEqual(
   buildFpsCandidates(extractTgsSourceFps({fr: null}), 'tgs'),
-  [24, 20, 16],
+  [30, 24, 20, 16],
 );
 assert.deepEqual(
   buildFpsCandidates(extractTgsSourceFps({fr: '60'}), 'tgs'),
-  [24, 20, 16],
+  [30, 24, 20, 16],
 );
 
 // Test 15: no WebM upsampling invariant across wide range of sources
