@@ -348,35 +348,41 @@ async function inspectAnimatedAvif(
   const formatName = document.format?.format_name ?? '';
   const majorBrand = document.format?.tags?.major_brand ?? '';
   const compatibleBrands = document.format?.tags?.compatible_brands ?? '';
-  if (
-    !formatName.split(',').includes('mov') ||
-    majorBrand !== 'avis' ||
-    !compatibleBrands.includes('avif')
-  ) {
-    throw new Error(
-      `Animated AVIF "${outputPath}" has invalid container format=${formatName}, major_brand=${majorBrand}, compatible_brands=${compatibleBrands}`,
-    );
-  }
 
-  const animatedStreams = (document.streams ?? []).filter(
+  const avifStreams = (document.streams ?? []).filter(
     stream =>
       stream.codec_type === 'video' &&
       stream.codec_name === 'av1' &&
-      getFrameCount(stream) > 1,
+      getFrameCount(stream) >= 1,
   );
-  const color = animatedStreams.find(
-    stream => !stream.pix_fmt?.startsWith('gray'),
-  );
-  const alpha = animatedStreams.find(stream =>
-    stream.pix_fmt?.startsWith('gray'),
-  );
+
+  const color = avifStreams.find(stream => !stream.pix_fmt?.startsWith('gray'));
+  const alpha = avifStreams.find(stream => stream.pix_fmt?.startsWith('gray'));
+
   if (!color || !alpha) {
     throw new Error(
-      `Animated AVIF "${outputPath}" must contain separate animated AV1 color and alpha streams`,
+      `AVIF "${outputPath}" must contain separate AV1 color and alpha streams`,
     );
   }
 
   const colorFrames = getFrameCount(color);
+  const alphaFrames = getFrameCount(alpha);
+
+  const isSingleFrame = colorFrames === 1 && alphaFrames === 1;
+
+  const hasValidBrand = isSingleFrame
+    ? majorBrand === 'avif'
+    : majorBrand === 'avis';
+
+  if (
+    !formatName.split(',').includes('mov') ||
+    !hasValidBrand ||
+    !compatibleBrands.includes('avif')
+  ) {
+    throw new Error(
+      `AVIF "${outputPath}" has invalid container format=${formatName}, major_brand=${majorBrand}, compatible_brands=${compatibleBrands}, frames=${colorFrames}/${alphaFrames}`,
+    );
+  }
   const fps = getFrameRate(color);
   const width = color.width ?? 0;
   const height = color.height ?? 0;
@@ -395,7 +401,7 @@ async function inspectAnimatedAvif(
     },
     alphaWidth: alpha.width ?? 0,
     alphaHeight: alpha.height ?? 0,
-    alphaFrameCount: getFrameCount(alpha),
+    alphaFrameCount: alphaFrames,
     alphaFps: getFrameRate(alpha),
   };
 }
@@ -454,24 +460,29 @@ export async function validateAnimatedAvif(
       `Animated AVIF "${outputPath}" has mismatched color/alpha frame counts ${frameCount}/${alphaFrameCount}`,
     );
   }
+  const isSingleFrame = frameCount === 1 && alphaFrameCount === 1;
+
   if (
-    Math.abs(fps - profile.fps) > AVIF_FPS_TOLERANCE ||
-    Math.abs(alphaFps - profile.fps) > AVIF_FPS_TOLERANCE
+    !isSingleFrame &&
+    (Math.abs(fps - profile.fps) > AVIF_FPS_TOLERANCE ||
+      Math.abs(alphaFps - profile.fps) > AVIF_FPS_TOLERANCE)
   ) {
     throw new Error(
       `Animated AVIF "${outputPath}" has unexpected color/alpha FPS ${fps}/${alphaFps}; expected ${profile.fps}`,
     );
   }
-  const maxFrameCount = Math.ceil(AVIF_MAX_DURATION_SECONDS * profile.fps);
-  const maxRepresentableDuration = maxFrameCount / profile.fps;
-  if (
-    durationSeconds <= 0 ||
-    durationSeconds > maxRepresentableDuration + 0.001 ||
-    frameCount > maxFrameCount
-  ) {
-    throw new Error(
-      `Animated AVIF "${outputPath}" duration ${durationSeconds}s or frame count ${frameCount} exceeds ${AVIF_MAX_DURATION_SECONDS}s`,
-    );
+  if (!isSingleFrame) {
+    const maxFrameCount = Math.ceil(AVIF_MAX_DURATION_SECONDS * profile.fps);
+    const maxRepresentableDuration = maxFrameCount / profile.fps;
+    if (
+      durationSeconds <= 0 ||
+      durationSeconds > maxRepresentableDuration + 0.001 ||
+      frameCount > maxFrameCount
+    ) {
+      throw new Error(
+        `Animated AVIF "${outputPath}" duration ${durationSeconds}s or frame count ${frameCount} exceeds ${AVIF_MAX_DURATION_SECONDS}s`,
+      );
+    }
   }
   if (enforceSizeLimit && sizeBytes > AVIF_HARD_LIMIT_BYTES) {
     throw new Error(
