@@ -95,9 +95,10 @@ export function buildAvifFilter(
     'setpts=PTS-STARTPTS',
   ].join(',');
   const scale = `scale=w='min(${profile.maxDimension},iw)':h='min(${profile.maxDimension},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos`;
+  const pad = `pad=${profile.maxDimension}:${profile.maxDimension}:(ow-iw)/2:(oh-ih)/2:color=black`;
   return branch === 'color'
-    ? `${timed},format=rgba,premultiply=inplace=1,${scale},unpremultiply=inplace=1,format=yuv420p10le`
-    : `${timed},${scale},format=rgba,alphaextract,format=gray10le,geq=lum='if(gte(lum(X,Y),1016),1023,round(lum(X,Y)*1023/1020))'`;
+    ? `${timed},format=rgba,premultiply=inplace=1,${scale},unpremultiply=inplace=1,${pad},format=yuv420p10le`
+    : `${timed},${scale},format=rgba,alphaextract,${pad},format=gray10le,geq=lum='if(gte(lum(X,Y),1016),1023,round(lum(X,Y)*1023/1020))'`;
 }
 
 function commonEncoderArgs(profile: AvifEncodingProfile): string[] {
