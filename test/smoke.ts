@@ -4974,14 +4974,18 @@ const cappedTgs = JSON.parse(
     'long-duration.tgs',
   ),
 );
-assert.equal(cappedTgs.op, 179, 'TGS render input must be capped at 3 seconds');
+assert.equal(
+  cappedTgs.op,
+  60 * AVIF_MAX_DURATION_SECONDS - 1,
+  `TGS render input must be capped at ${AVIF_MAX_DURATION_SECONDS} seconds`,
+);
 const cappedOffsetTgs = JSON.parse(
   normalizeLottieJsonForConverter(
-    {fr: 30, ip: 15, op: 120},
+    {fr: 30, ip: 15, op: 180},
     'offset-long-duration.tgs',
   ),
 );
-assert.equal(cappedOffsetTgs.op, 104);
+assert.equal(cappedOffsetTgs.op, 15 + 30 * AVIF_MAX_DURATION_SECONDS - 1);
 const fractionalDurationTgs = JSON.parse(
   normalizeLottieJsonForConverter(
     {fr: 30, ip: 0, op: 75},
@@ -4991,7 +4995,7 @@ const fractionalDurationTgs = JSON.parse(
 assert.equal(
   fractionalDurationTgs.op,
   74,
-  'Sub-three-second duration must only receive rlottie inclusive-op normalization',
+  'Duration below configured limit must only receive rlottie inclusive-op normalization',
 );
 
 // Error cases for normalization
@@ -5007,7 +5011,7 @@ assert.throws(
   () => normalizeLottieJsonForConverter([], 'array-root.tgs'),
   /Invalid TGS content in "array-root\.tgs"/,
 );
-// Test 14: invalid or missing TGS fr falls back gracefully to 24 FPS
+// Test 14: invalid or missing TGS fr falls back gracefully to default FPS
 for (const badFr of [0, -10, '60', 'invalid', null, undefined]) {
   const parsedNorm = JSON.parse(
     normalizeLottieJsonForConverter(
@@ -5015,7 +5019,7 @@ for (const badFr of [0, -10, '60', 'invalid', null, undefined]) {
       `bad-fr-${String(badFr)}.tgs`,
     ),
   );
-  assert.equal(parsedNorm.fr, 24);
+  assert.equal(parsedNorm.fr, AVIF_DEFAULT_FPS);
   assert.equal(extractTgsSourceFps({fr: badFr}), undefined);
 }
 assert.throws(
