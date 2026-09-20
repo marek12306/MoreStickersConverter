@@ -146,7 +146,9 @@ async function writeJsonAtomically(
 
 async function hashFile(filePath: string): Promise<string> {
   const hash = createHash('sha256');
-  for await (const chunk of fs.createReadStream(filePath)) {
+  for await (const chunk of fs.createReadStream(filePath, {
+    highWaterMark: 256 * 1024,
+  })) {
     hash.update(chunk);
   }
   return hash.digest('hex');
@@ -163,36 +165,27 @@ export async function storeStickerAsset(
 
   const assetsDir = generateStickerAssetsDirPath(stickerSetName);
   await fsp.mkdir(assetsDir, {recursive: true});
-  const tempPath = path.join(assetsDir, `.asset-${randomUUID()}.tmp`);
-  const hash = createHash('sha256');
+  const digest = await hashFile(sourcePath);
+  const assetFilename = `${digest}${extension}`;
+  const assetPath = path.join(assetsDir, assetFilename);
   try {
-    await pipeline(
-      fs.createReadStream(sourcePath),
-      new Transform({
-        transform(chunk: Buffer, _encoding, callback) {
-          hash.update(chunk);
-          callback(null, chunk);
-        },
-      }),
-      fs.createWriteStream(tempPath, {flags: 'wx'}),
-    );
-    const digest = hash.digest('hex');
-    const assetFilename = `${digest}${extension}`;
-    const assetPath = path.join(assetsDir, assetFilename);
-    try {
-      if ((await hashFile(assetPath)) === digest) {
-        return assetFilename;
-      }
-    } catch (err: unknown) {
-      if (getErrorCode(err) !== 'ENOENT') {
-        throw err;
-      }
+    if ((await hashFile(assetPath)) === digest) {
+      return assetFilename;
     }
+  } catch (err: unknown) {
+    if (getErrorCode(err) !== 'ENOENT') {
+      throw err;
+    }
+  }
+
+  const tempPath = path.join(assetsDir, `.asset-${randomUUID()}.tmp`);
+  try {
+    await fsp.copyFile(sourcePath, tempPath);
     await fsp.rename(tempPath, assetPath);
-    return assetFilename;
   } finally {
     await fsp.unlink(tempPath).catch(() => undefined);
   }
+  return assetFilename;
 }
 export async function readStickerVersionIndex(
   stickerSetName: string,
@@ -415,9 +408,23 @@ async function verifyReferencedAssets(
   stickerSetName: string,
   assets: Set<string>,
 ): Promise<void> {
-  for (const asset of assets) {
-    if (!(await verifyStoredStickerAsset(stickerSetName, asset))) {
-      throw new Error(`Retained asset "${asset}" is missing or corrupt`);
+  const filenames = [...assets];
+  const concurrency = 4;
+
+  for (let i = 0; i < filenames.length; i += concurrency) {
+    const batch = filenames.slice(i, i + concurrency);
+    const results = await Promise.all(
+      batch.map(async asset => ({
+        asset,
+        valid: await verifyStoredStickerAsset(stickerSetName, asset),
+      })),
+    );
+    for (const result of results) {
+      if (!result.valid) {
+        throw new Error(
+          `Retained asset "${result.asset}" is missing or corrupt`,
+        );
+      }
     }
   }
 }
@@ -425,8 +432,10 @@ async function verifyReferencedAssets(
 async function buildValidatedStickerRetentionPlan(
   stickerSetName: string,
   retention = STICKER_PACK_VERSION_RETENTION,
+  knownVersions?: number[],
 ): Promise<StickerRetentionPlan> {
-  const versions = await listStickerPackVersions(stickerSetName);
+  const versions =
+    knownVersions ?? (await listStickerPackVersions(stickerSetName));
   const currentManifest =
     await readCurrentStickerStorageManifest(stickerSetName);
   const retentionPlan = getStickerVersionRetention(
@@ -437,11 +446,18 @@ async function buildValidatedStickerRetentionPlan(
   const preservedVersions = new Set(retentionPlan.publishedVersions);
   const retainedIndexes = new Map<number, StickerVersionIndex>();
   const referencedAssets = new Set<string>();
-  for (const version of retentionPlan.publishedVersions) {
-    const index = await readStickerVersionIndex(stickerSetName, version);
-    if (!index) {
-      throw new Error(`Missing retained sticker version index ${version}`);
-    }
+  const retainedIndexEntries = await Promise.all(
+    retentionPlan.publishedVersions.map(async version => {
+      const index = await readStickerVersionIndex(stickerSetName, version);
+
+      if (!index) {
+        throw new Error(`Missing retained sticker version index ${version}`);
+      }
+      return [version, index] as const;
+    }),
+  );
+
+  for (const [version, index] of retainedIndexEntries) {
     retainedIndexes.set(version, index);
     addIndexAssets(index, referencedAssets);
   }
@@ -664,6 +680,7 @@ export interface PackGcPlan {
   totalVersionCount: number;
   staleVersions: number[];
   staleVersionIndexBytes: number;
+  staleVersionIndexSizes: Record<number, number>;
   totalAssetCount: number;
   totalAssetBytes: number;
   referencedAssetCount: number;
@@ -729,7 +746,11 @@ async function analyzeStickerPackForGc(
   let analysisErrors = 0;
   let plan: StickerRetentionPlan | undefined;
   try {
-    plan = await buildValidatedStickerRetentionPlan(stickerSetName, retention);
+    plan = await buildValidatedStickerRetentionPlan(
+      stickerSetName,
+      retention,
+      versions,
+    );
   } catch (err) {
     analysisErrors++;
     console.warn(`Sticker pack "${stickerSetName}" GC analysis skipped:`, err);
@@ -738,18 +759,25 @@ async function analyzeStickerPackForGc(
   const referencedAssetSet = plan ? plan.referencedAssets : undefined;
 
   let staleVersionIndexBytes = 0;
-  for (const version of staleVersions) {
-    try {
-      const indexPath = generateStickerVersionIndexPath(
-        stickerSetName,
-        version,
-      );
-      const stat = await fsp.stat(indexPath);
-      staleVersionIndexBytes += stat.size;
-    } catch {
-      // ignore stat errors on stale version index
-    }
-  }
+  const staleVersionIndexSizes: Record<number, number> = {};
+
+  await Promise.all(
+    staleVersions.map(async version => {
+      try {
+        const indexPath = generateStickerVersionIndexPath(
+          stickerSetName,
+          version,
+        );
+
+        const stat = await fsp.stat(indexPath);
+
+        staleVersionIndexSizes[version] = stat.size;
+        staleVersionIndexBytes += stat.size;
+      } catch {
+        // ignore stat errors on stale version index
+      }
+    }),
+  );
 
   const assetsDir = generateStickerAssetsDirPath(stickerSetName);
   let dirents: fs.Dirent[] = [];
@@ -768,31 +796,37 @@ async function analyzeStickerPackForGc(
   const orphanedAssetFilenames: string[] = [];
   let orphanedAssetBytes = 0;
 
-  for (const dirent of dirents) {
-    if (!dirent.isFile() || !isSafeAssetFilename(dirent.name)) {
-      continue;
-    }
-    let fileSize = 0;
-    try {
-      const assetPath = path.join(assetsDir, dirent.name);
-      const stat = await fsp.stat(assetPath);
-      fileSize = stat.size;
-    } catch {
-      continue;
-    }
+  const assetInfos = await Promise.all(
+    dirents
+      .filter(dirent => dirent.isFile() && isSafeAssetFilename(dirent.name))
+      .map(async dirent => {
+        try {
+          const stat = await fsp.stat(path.join(assetsDir, dirent.name));
+          return {
+            filename: dirent.name,
+            size: stat.size,
+          };
+        } catch {
+          return undefined;
+        }
+      }),
+  );
+
+  for (const info of assetInfos) {
+    if (!info) continue;
 
     totalAssetCount++;
-    totalAssetBytes += fileSize;
+    totalAssetBytes += info.size;
 
     if (
       referencedAssetSet === undefined ||
-      referencedAssetSet.has(dirent.name)
+      referencedAssetSet.has(info.filename)
     ) {
       referencedAssetCount++;
-      referencedAssetBytes += fileSize;
+      referencedAssetBytes += info.size;
     } else {
-      orphanedAssetFilenames.push(dirent.name);
-      orphanedAssetBytes += fileSize;
+      orphanedAssetFilenames.push(info.filename);
+      orphanedAssetBytes += info.size;
     }
   }
 
@@ -801,6 +835,7 @@ async function analyzeStickerPackForGc(
     totalVersionCount,
     staleVersions,
     staleVersionIndexBytes,
+    staleVersionIndexSizes,
     totalAssetCount,
     totalAssetBytes,
     referencedAssetCount,
@@ -892,12 +927,9 @@ export async function runGarbageCollection(
                 version,
               );
               try {
-                const stat = await fsp.stat(indexPath).catch(() => undefined);
                 await fsp.rm(indexPath, {force: true});
                 versionsRemoved++;
-                if (stat) {
-                  bytesFreed += stat.size;
-                }
+                bytesFreed += plan.staleVersionIndexSizes[version] ?? 0;
               } catch (err) {
                 staleIndexDeletionFailed = true;
                 totalErrors++;
